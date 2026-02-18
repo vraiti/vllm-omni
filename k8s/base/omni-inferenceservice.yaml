@@ -1,0 +1,31 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: vllm-omni-turbo
+  annotations:
+    opendatahub.io/hardware-profile-namespace: opendatahub
+    opendatahub.io/legacy-hardware-profile-name: migrated-gpu-mglzi-serving
+    openshift.io/display-name: llama-3.1-8b
+    serving.kserve.io/autoscalerClass: external
+    serving.kserve.io/deploymentMode: RawDeployment
+    prometheus.io/scrape: "true"  # enable Prometheus scraping
+    prometheus.io/path: "/metrics"  # specify the endpoint
+    prometheus.io/port: "8000"  # specify the port
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: vllm-omni
+      runtime: vllm-omni-runtime
+      env:
+        - name: MODEL_NAME
+          value: "Tongyi-MAI/Z-Image-Turbo"
+        - name: EXTRA_ARGS
+          value: ""
+      resources:
+        requests:
+          memory: "16Gi"
+          nvidia.com/gpu: "1"
+        limits:
+          memory: "32Gi"
+          nvidia.com/gpu: "1"
