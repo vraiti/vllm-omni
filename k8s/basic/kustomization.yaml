@@ -10,9 +10,3 @@ resources:
   - 03-referencegrant.yaml
   - 04-httproute.yaml
   - 05-gateway-service.yaml
-
-# Common labels to add to all resources
-labels:
-  - pairs:
-      app.kubernetes.io/name: vllm-omni
-      app.kubernetes.io/component: inference

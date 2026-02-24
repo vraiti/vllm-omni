@@ -14,8 +14,3 @@ resources:
   - 07-referencegrant.yaml
   - 08-httproute.yaml
   - 09-gateway-service.yaml
-
-labels:
-  - pairs:
-      app.kubernetes.io/name: omni-keda-demo
-      app.kubernetes.io/component: inference

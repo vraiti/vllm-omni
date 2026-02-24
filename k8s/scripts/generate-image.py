@@ -16,7 +16,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def discover_gateway_endpoint(namespace: str = "openshift-ingress",
                              gateway_name: str = "data-science-gateway",
-                             httproute_name: str = "omni-keda-demo-route") -> str:
+                             httproute_name: str = "omni-demo-route") -> str:
     """
     Discover the Gateway endpoint URL programmatically.
 
@@ -146,8 +146,8 @@ def main():
                        default='data-science-gateway',
                        help='Gateway name (default: data-science-gateway)')
     parser.add_argument('--httproute-name',
-                       default='omni-keda-demo-route',
-                       help='HTTPRoute name (default: omni-keda-demo-route)')
+                       default='omni-demo-route',
+                       help='HTTPRoute name (default: omni-demo-route)')
 
     args = parser.parse_args()
 
