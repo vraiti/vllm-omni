@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: omni-keda-demo-gateway-svc
+  namespace: omni-demo
+  labels:
+    app.kubernetes.io/name: omni-keda-demo
+    app.kubernetes.io/component: inference
+spec:
+  type: ClusterIP
+  selector:
+    serving.kserve.io/inferenceservice: omni-keda-demo
+  ports:
+  - name: http
+    port: 80
+    protocol: TCP
+    targetPort: 8000

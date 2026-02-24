@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: omni-demo
+
+resources:
+  - 00-operator-subscription.yaml
+  - 01-kedacontroller.yaml
+  - 02-servingruntime.yaml
+  - 03-inferenceservice.yaml
+  - 04-keda-rbac.yaml
+  - 05-keda-auth.yaml
+  - 06-scaledobject.yaml
+  - 07-referencegrant.yaml
+  - 08-httproute.yaml
+  - 09-gateway-service.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: omni-keda-demo
+      app.kubernetes.io/component: inference

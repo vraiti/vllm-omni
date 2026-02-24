@@ -1,0 +1,28 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: omni-keda-demo-scaler
+  namespace: omni-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: omni-keda-demo-predictor
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  pollingInterval: 5
+  cooldownPeriod: 60
+  triggers:
+  - type: prometheus
+    authenticationRef:
+      name: keda-trigger-auth-prometheus
+    metadata:
+      # Thanos Querier endpoint for cluster monitoring
+      serverAddress: https://thanos-querier.openshift-monitoring.svc.cluster.local:9092
+      # Scale based on HTTP request rate (requests per second)
+      # Note: vLLM diffusion models don't expose vllm:num_requests_waiting
+      query: 'sum(rate(http_requests_total{namespace="omni-demo",pod=~"omni-keda-demo-predictor.*",handler="/v1/images/generations"}[1m]))'
+      # Scale up when request rate > 0.5 requests/sec
+      threshold: '0.1'
+      authModes: "bearer"
+      namespace: omni-demo

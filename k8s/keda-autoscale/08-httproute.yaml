@@ -1,0 +1,29 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: omni-keda-demo-route
+  namespace: openshift-ingress
+  labels:
+    app.kubernetes.io/name: omni-keda-demo
+    app.kubernetes.io/component: inference
+  annotations:
+    openshift.io/display-name: vLLM-Omni KEDA Demo Gateway Route
+spec:
+  parentRefs:
+  - name: data-science-gateway
+    namespace: openshift-ingress
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /omni-keda-demo
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /
+    backendRefs:
+    - name: omni-keda-demo-gateway-svc
+      namespace: omni-demo
+      port: 80

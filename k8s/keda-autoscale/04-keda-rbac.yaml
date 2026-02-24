@@ -1,0 +1,45 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keda-prometheus-sa
+  namespace: omni-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: omni-demo
+  name: keda-prometheus-role
+rules:
+- apiGroups: ["metrics.k8s.io", "custom.metrics.k8s.io", "external.metrics.k8s.io"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keda-prometheus-rolebinding
+  namespace: omni-demo
+subjects:
+- kind: ServiceAccount
+  name: keda-prometheus-sa
+  namespace: omni-demo
+roleRef:
+  kind: Role
+  name: keda-prometheus-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# ClusterRoleBinding for accessing cluster monitoring metrics via Thanos
+# Allows KEDA to query DCGM and other cluster-level metrics
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keda-prometheus-monitoring-view
+subjects:
+- kind: ServiceAccount
+  name: keda-prometheus-sa
+  namespace: omni-demo
+roleRef:
+  kind: ClusterRole
+  name: cluster-monitoring-view
+  apiGroup: rbac.authorization.k8s.io
