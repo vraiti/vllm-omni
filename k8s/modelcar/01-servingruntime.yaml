@@ -1,0 +1,60 @@
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: vllm-omni-modelcar-runtime
+  namespace: omni-demo
+  annotations:
+    opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'
+    openshift.io/display-name: vLLM-Omni ModelCar Runtime
+  labels:
+    app.kubernetes.io/component: inference
+    app.kubernetes.io/name: omni-demo
+spec:
+  annotations:
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8000"
+  supportedModelFormats:
+  - name: vllm-omni
+    autoSelect: true
+  containers:
+  - name: kserve-container
+    # Use vLLM-Omni runtime image
+    # The model is extracted from the ModelCar OCI image by KServe storage initializer
+    image: docker.io/vllm/vllm-omni:v0.14.0
+    command:
+    - /bin/sh
+    - -c
+    args:
+    - |
+      # KServe storage initializer extracts model from OCI image to /mnt/models
+      # Start vLLM server pointing to the extracted model
+      vllm serve /mnt/models --omni --host 0.0.0.0 --port 8000 ${EXTRA_ARGS}
+    env:
+    - name: HF_HOME
+      value: /tmp/huggingface
+    - name: HOME
+      value: /tmp
+    - name: EXTRA_ARGS
+      value: ""
+    ports:
+    - name: http
+      containerPort: 8000
+      protocol: TCP
+    resources:
+      requests:
+        memory: 16Gi
+        cpu: "4"
+        nvidia.com/gpu: "1"
+      limits:
+        memory: 32Gi
+        cpu: "8"
+        nvidia.com/gpu: "1"
+    volumeMounts:
+    - name: shm
+      mountPath: /dev/shm
+  volumes:
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 8Gi
+  multiModel: false

@@ -1,0 +1,32 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: z-image-turbo
+  namespace: omni-demo
+  annotations:
+    # KEDA autoscaling - disable default KServe HPA
+    serving.kserve.io/autoscalerClass: external
+    # Use RawDeployment mode (required for KEDA)
+    serving.kserve.io/deploymentMode: RawDeployment
+    # Prometheus metrics scraping
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "8000"
+    # Storage initializer UID (namespace UID range + 1)
+    serving.kserve.io/storage-initializer-uid: "1001550001"
+    # Display name
+    openshift.io/display-name: Z-Image-Turbo ModelCar
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: vllm-omni
+      runtime: vllm-omni-modelcar-runtime
+      # ModelCar approach: Reference the OCI image containing the model
+      # The storageUri with oci:// prefix tells KServe to use the container image
+      storageUri: oci://quay.io/vraiti/z-image-turbo:v1
+      env:
+        - name: EXTRA_ARGS
+          value: ""
+    minReplicas: 1
+    maxReplicas: 1  # KEDA will manage scaling, not KServe

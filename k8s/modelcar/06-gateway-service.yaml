@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: z-image-turbo-gateway-svc
+  namespace: omni-demo
+  labels:
+    app.kubernetes.io/name: z-image-turbo
+    app.kubernetes.io/component: inference
+  annotations:
+    # Prevent kustomize commonLabels from being added to selector
+    kustomize.config.k8s.io/behavior: replace
+spec:
+  type: ClusterIP
+  selector:
+    # Only use inferenceservice label - KServe pods don't have commonLabels
+    serving.kserve.io/inferenceservice: z-image-turbo
+  ports:
+  - name: http
+    port: 80
+    protocol: TCP
+    targetPort: 8000

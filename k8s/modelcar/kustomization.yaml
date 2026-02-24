@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: omni-demo
+
+resources:
+  - 00-namespace.yaml
+  - 01-servingruntime.yaml
+  - 02-inferenceservice.yaml
+  - 03-keda-rbac.yaml
+  - 04-keda-auth.yaml
+  - 05-scaledobject.yaml
+  - 06-gateway-service.yaml
+  - 07-referencegrant.yaml
+  # Note: 08-httproute.yaml is deployed in openshift-ingress namespace
+  # Apply it separately after applying this kustomization

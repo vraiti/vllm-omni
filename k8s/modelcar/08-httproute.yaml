@@ -1,0 +1,29 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: omni-demo-route
+  namespace: openshift-ingress
+  labels:
+    app.kubernetes.io/name: z-image-turbo
+    app.kubernetes.io/component: inference
+  annotations:
+    openshift.io/display-name: Z-Image-Turbo Gateway Route
+spec:
+  parentRefs:
+  - name: data-science-gateway
+    namespace: openshift-ingress
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /z-image-turbo
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /
+    backendRefs:
+    - name: z-image-turbo-gateway-svc
+      namespace: omni-demo
+      port: 80

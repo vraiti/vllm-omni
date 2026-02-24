@@ -1,0 +1,14 @@
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-gateway-to-modelcar
+  namespace: omni-demo
+spec:
+  # Allow HTTPRoutes from openshift-ingress to reference Services in omni-demo
+  from:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    namespace: openshift-ingress
+  to:
+  - group: ""
+    kind: Service

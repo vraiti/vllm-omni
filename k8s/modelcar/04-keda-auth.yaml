@@ -1,0 +1,23 @@
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-trigger-auth-prometheus
+  namespace: omni-demo
+spec:
+  secretTargetRef:
+  - parameter: bearerToken
+    name: keda-prometheus-secret
+    key: bearerToken
+  - parameter: ca
+    name: keda-prometheus-secret
+    key: ca
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keda-prometheus-secret
+  namespace: omni-demo
+type: Opaque
+stringData:
+  bearerToken: ""  # Will be populated by service account token
+  ca: ""  # Will be populated by cluster CA
