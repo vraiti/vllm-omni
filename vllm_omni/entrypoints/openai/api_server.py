@@ -84,6 +84,7 @@ from vllm.tool_parsers import ToolParserManager
 from vllm.utils.system_utils import decorate_logs
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.k8s.k8s_omni_orchestrator import K8sOmniOrchestrator
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
@@ -390,11 +391,40 @@ async def build_async_omni_from_stage_config(
     async_omni: EngineClient | None = None
 
     try:
-        # Convert args Namespace to kwargs dict for AsyncOmni to use
-        kwargs = vars(args).copy()
-        # Remove model as it will be passed separately
-        kwargs.pop("model", None)
-        async_omni = AsyncOmni(model=args.model, **kwargs)
+        # Check if K8s orchestrator mode is enabled
+        use_k8s_orchestrator = os.getenv("VLLM_USE_K8S_ORCHESTRATOR", "false").lower() == "true"
+
+        if use_k8s_orchestrator:
+            logger.info("Using K8sOmniOrchestrator for Kubernetes-native deployment")
+
+            # Create K8sOmniOrchestrator
+            namespace = os.getenv("NAMESPACE", "default")
+            label_selector = os.getenv("LABEL_SELECTOR", "app=vllm-omni")
+            num_stages = getattr(args, "num_stages", 3)
+
+            async_omni = K8sOmniOrchestrator(
+                model=args.model,
+                namespace=namespace,
+                label_selector=label_selector,
+                num_stages=num_stages,
+            )
+
+            # Start orchestrator (begin watching pods)
+            await async_omni.start()
+
+            logger.info(
+                f"K8sOmniOrchestrator started: namespace={namespace}, "
+                f"label_selector={label_selector}, num_stages={num_stages}"
+            )
+
+        else:
+            logger.info("Using AsyncOmni for standard deployment")
+
+            # Convert args Namespace to kwargs dict for AsyncOmni to use
+            kwargs = vars(args).copy()
+            # Remove model as it will be passed separately
+            kwargs.pop("model", None)
+            async_omni = AsyncOmni(model=args.model, **kwargs)
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
@@ -402,7 +432,10 @@ async def build_async_omni_from_stage_config(
         yield async_omni
     finally:
         if async_omni:
-            async_omni.shutdown()
+            if isinstance(async_omni, K8sOmniOrchestrator):
+                await async_omni.shutdown()
+            else:
+                async_omni.shutdown()
 
 
 async def omni_init_app_state(
@@ -418,10 +451,13 @@ async def omni_init_app_state(
     handles it appropriately.
 
     Args:
-        engine_client: Engine client instance (AsyncOmni)
+        engine_client: Engine client instance (AsyncOmni or K8sOmniOrchestrator)
         state: FastAPI application state object to initialize
         args: Parsed command-line arguments
     """
+    # Check if using K8s orchestrator
+    is_k8s_orchestrator = isinstance(engine_client, K8sOmniOrchestrator)
+
     # Get vllm_config from engine_client (following 0.14.0 pattern)
     vllm_config = await engine_client.get_vllm_config()
 
@@ -516,13 +552,17 @@ async def omni_init_app_state(
     lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
 
     # Ensure input_processor, io_processor, and model_config exist for OpenAIServingModels compatibility
+    # Skip this for K8s orchestrator as it doesn't have processors
     if (
-        not hasattr(engine_client, "input_processor")
-        or engine_client.input_processor is None
-        or not hasattr(engine_client, "io_processor")
-        or engine_client.io_processor is None
-        or not hasattr(engine_client, "model_config")
-        or engine_client.model_config is None
+        not is_k8s_orchestrator
+        and (
+            not hasattr(engine_client, "input_processor")
+            or engine_client.input_processor is None
+            or not hasattr(engine_client, "io_processor")
+            or engine_client.io_processor is None
+            or not hasattr(engine_client, "model_config")
+            or engine_client.model_config is None
+        )
     ):
         if vllm_config is not None:
             # Try to initialize processors if vllm_config is available

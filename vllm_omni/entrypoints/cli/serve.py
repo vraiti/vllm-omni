@@ -74,7 +74,10 @@ class OmniServeCommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
-        if args.headless:
+        # Handle K8s stage worker mode
+        if hasattr(args, "k8s_stage_worker") and args.k8s_stage_worker:
+            run_k8s_stage_worker(args)
+        elif args.headless:
             run_headless(args)
         else:
             uvloop.run(omni_run_server(args))
@@ -132,6 +135,11 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help="Select and launch a single stage by stage_id.",
+        )
+        omni_config_group.add_argument(
+            "--k8s-stage-worker",
+            action="store_true",
+            help="Run as Kubernetes stage worker with REST API (requires STAGE_ID and STAGE_CONFIG_PATH env vars)",
         )
         omni_config_group.add_argument(
             "--stage-init-timeout",
@@ -374,6 +382,43 @@ class OmniServeCommand(CLISubcommand):
 def _create_default_diffusion_stage_cfg(args: argparse.Namespace) -> list[dict[str, Any]]:
     omni_base = OmniBase.__new__(OmniBase)
     return omni_base._create_default_diffusion_stage_cfg(vars(args))
+
+
+def run_k8s_stage_worker(args: argparse.Namespace) -> None:
+    """Run as Kubernetes stage worker with REST API."""
+    from vllm_omni.entrypoints.k8s.stage_config_loader import get_stage_config_path, get_stage_id
+    from vllm_omni.entrypoints.k8s.stage_worker_server import create_stage_worker_app
+
+    # Get configuration from environment
+    stage_id = get_stage_id()
+    stage_config_path = get_stage_config_path()
+    pod_ip = os.getenv("POD_IP", "127.0.0.1")
+
+    logger.info(f"Starting K8s stage worker: stage_id={stage_id}, config={stage_config_path}, pod_ip={pod_ip}")
+
+    # Create FastAPI app
+    app = create_stage_worker_app(
+        model=args.model,
+        stage_config_path=stage_config_path,
+        stage_id=stage_id,
+        pod_ip=pod_ip,
+    )
+
+    # Run with uvicorn
+    import uvicorn
+
+    host = os.getenv("STAGE_WORKER_HOST", "0.0.0.0")
+    port = int(os.getenv("STAGE_WORKER_PORT", "8080"))
+
+    logger.info(f"Stage worker listening on {host}:{port}")
+
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=True,
+    )
 
 
 def run_headless(args: argparse.Namespace) -> None:
