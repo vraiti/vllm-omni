@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import lru_cache
 from math import prod
 from typing import TYPE_CHECKING, Any
@@ -47,6 +48,26 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class QwenPreprocessedState:
+    """Preprocessed state produced by QwenImageTransformer2DModel._preprocess.
+
+    Holds all intermediate tensors needed by _run_blocks and _postprocess,
+    so that both the model's forward() and the TeaCache extractor can share
+    the same preprocessing code path.
+    """
+
+    hidden_states: torch.Tensor
+    encoder_hidden_states: torch.Tensor
+    temb: torch.Tensor
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor]
+    modulate_index: torch.Tensor | None
+    hidden_states_mask: torch.Tensor | None
+    encoder_hidden_states_mask: torch.Tensor | None
+    attention_kwargs: dict[str, Any] | None
+    return_dict: bool
 
 
 class ImageRopePrepare(nn.Module):
@@ -1018,49 +1039,23 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Only active when zero_cond_t=True (image editing models)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
 
-    def forward(
+    def _preprocess(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor = None,
-        encoder_hidden_states_mask: torch.Tensor = None,
-        timestep: torch.LongTensor = None,
-        img_shapes: list[tuple[int, int, int]] | None = None,
-        txt_seq_lens: list[int] | None = None,
-        guidance: torch.Tensor = None,  # TODO: this should probably be removed
-        attention_kwargs: dict[str, Any] | None = None,
-        additional_t_cond=None,
-        return_dict: bool = True,
-    ) -> torch.Tensor | Transformer2DModelOutput:
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor | None,
+        timestep: torch.Tensor,
+        img_shapes: list[tuple[int, int, int]] | None,
+        txt_seq_lens: list[int] | None,
+        guidance: torch.Tensor | None,
+        additional_t_cond: torch.Tensor | None,
+        attention_kwargs: dict[str, Any] | None,
+        return_dict: bool,
+    ) -> QwenPreprocessedState:
+        """Run all preprocessing before the transformer block loop.
+
+        Produces embeddings, RoPE, timestep conditioning, and attention masks.
         """
-        The [`QwenTransformer2DModel`] forward method.
-
-        Args:
-            hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
-                Input `hidden_states`.
-            encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
-                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
-            encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
-                Mask of the input conditions.
-            timestep ( `torch.LongTensor`):
-                Used to indicate denoising step.
-            attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
-                tuple.
-
-        Returns:
-            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
-            `tuple` where the first element is the sample tensor.
-        """
-        # if attention_kwargs is not None:
-        #     attention_kwargs = attention_kwargs.copy()
-        #     lora_scale = attention_kwargs.pop("scale", 1.0)
-        # else:
-        #     lora_scale = 1.0
-
         # Set split_text_embed_in_sp = False for dual-stream attention
         # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
         # Text embeddings must be replicated across SP ranks for correctness.
@@ -1117,28 +1112,101 @@ class QwenImageTransformer2DModel(CachedTransformer):
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
 
-        for index_block, block in enumerate(self.transformer_blocks):
+        return QwenPreprocessedState(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb=temb,
+            image_rotary_emb=image_rotary_emb,
+            modulate_index=modulate_index,
+            hidden_states_mask=hidden_states_mask,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            attention_kwargs=attention_kwargs,
+            return_dict=return_dict,
+        )
+
+    def _run_blocks(
+        self,
+        state: QwenPreprocessedState,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run all transformer blocks. Returns (hidden_states, encoder_hidden_states)."""
+        hidden_states = state.hidden_states
+        encoder_hidden_states = state.encoder_hidden_states
+        for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=attention_kwargs,
-                modulate_index=modulate_index,
-                hidden_states_mask=hidden_states_mask,
+                encoder_hidden_states_mask=state.encoder_hidden_states_mask,
+                temb=state.temb,
+                image_rotary_emb=state.image_rotary_emb,
+                joint_attention_kwargs=state.attention_kwargs,
+                modulate_index=state.modulate_index,
+                hidden_states_mask=state.hidden_states_mask,
             )
+        return hidden_states, encoder_hidden_states
 
+    def _postprocess(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        return_dict: bool = True,
+    ) -> torch.Tensor | Transformer2DModelOutput:
+        """Apply final normalization and projection."""
         if self.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
-        # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
         # Note: SP gather is handled automatically by _sp_plan's SequenceParallelGatherHook
         # on proj_out output. No manual all_gather needed here.
 
+        if not return_dict:
+            return (output,)
         return Transformer2DModelOutput(sample=output)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_shapes: list[tuple[int, int, int]] | None = None,
+        txt_seq_lens: list[int] | None = None,
+        guidance: torch.Tensor = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        additional_t_cond=None,
+        return_dict: bool = True,
+    ) -> torch.Tensor | Transformer2DModelOutput:
+        """
+        The [`QwenTransformer2DModel`] forward method.
+
+        Args:
+            hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
+                Input `hidden_states`.
+            encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
+                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+            encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
+                Mask of the input conditions.
+            timestep ( `torch.LongTensor`):
+                Used to indicate denoising step.
+            attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
+                tuple.
+
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+        state = self._preprocess(
+            hidden_states, encoder_hidden_states, encoder_hidden_states_mask,
+            timestep, img_shapes, txt_seq_lens, guidance, additional_t_cond,
+            attention_kwargs, return_dict,
+        )
+        hidden_states, _ = self._run_blocks(state)
+        return self._postprocess(hidden_states, state.temb, state.return_dict)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

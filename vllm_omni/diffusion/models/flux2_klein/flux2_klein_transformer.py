@@ -16,6 +16,7 @@
 # limitations under the License.
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -734,6 +735,22 @@ class Flux2Modulation(nn.Module):
         return tuple(mod_params[3 * i : 3 * (i + 1)] for i in range(self.mod_param_sets))
 
 
+@dataclass
+class Flux2KleinPreprocessedState:
+    """Preprocessed state produced by Flux2Transformer2DModel._preprocess (Klein variant)."""
+
+    hidden_states: torch.Tensor
+    encoder_hidden_states: torch.Tensor
+    temb: torch.Tensor
+    double_stream_mod_img: Any
+    double_stream_mod_txt: Any
+    single_stream_mod: Any
+    concat_rotary_emb: tuple[torch.Tensor, torch.Tensor]
+    joint_attention_kwargs: dict[str, Any]
+    num_txt_tokens: int
+    return_dict: bool
+
+
 class Flux2Transformer2DModel(nn.Module):
     """
     The Transformer model introduced in Flux 2.
@@ -869,17 +886,18 @@ class Flux2Transformer2DModel(nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    def forward(
+    def _preprocess(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        timestep: torch.LongTensor,
+        timestep: torch.Tensor,
         img_ids: torch.Tensor,
         txt_ids: torch.Tensor,
-        guidance: torch.Tensor | None = None,
-        joint_attention_kwargs: dict[str, Any] | None = None,
-        return_dict: bool = True,
-    ) -> torch.Tensor | Transformer2DModelOutput:
+        guidance: torch.Tensor | None,
+        joint_attention_kwargs: dict[str, Any] | None,
+        return_dict: bool,
+    ) -> Flux2KleinPreprocessedState:
+        """Run all preprocessing: embeddings, modulation, RoPE, and SP masks."""
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         num_txt_tokens = encoder_hidden_states.shape[1]
@@ -936,14 +954,31 @@ class Flux2Transformer2DModel(nn.Module):
         if encoder_hidden_states_mask is not None:
             joint_attention_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
 
+        return Flux2KleinPreprocessedState(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb=temb,
+            double_stream_mod_img=double_stream_mod_img,
+            double_stream_mod_txt=double_stream_mod_txt,
+            single_stream_mod=single_stream_mod,
+            concat_rotary_emb=concat_rotary_emb,
+            joint_attention_kwargs=joint_attention_kwargs,
+            num_txt_tokens=num_txt_tokens,
+            return_dict=return_dict,
+        )
+
+    def _run_blocks(self, state: Flux2KleinPreprocessedState) -> torch.Tensor:
+        """Run dual-stream and single-stream transformer blocks. Returns image hidden states."""
+        hidden_states = state.hidden_states
+        encoder_hidden_states = state.encoder_hidden_states
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
-                temb_mod_params_img=double_stream_mod_img,
-                temb_mod_params_txt=double_stream_mod_txt,
-                image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
+                temb_mod_params_img=state.double_stream_mod_img,
+                temb_mod_params_txt=state.double_stream_mod_txt,
+                image_rotary_emb=state.concat_rotary_emb,
+                joint_attention_kwargs=state.joint_attention_kwargs,
             )
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -952,19 +987,44 @@ class Flux2Transformer2DModel(nn.Module):
             hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
-                temb_mod_params=single_stream_mod,
-                image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
-                text_seq_len=num_txt_tokens,
+                temb_mod_params=state.single_stream_mod,
+                image_rotary_emb=state.concat_rotary_emb,
+                joint_attention_kwargs=state.joint_attention_kwargs,
+                text_seq_len=state.num_txt_tokens,
             )
 
-        hidden_states = hidden_states[:, num_txt_tokens:, ...]
+        return hidden_states[:, state.num_txt_tokens:, ...]
+
+    def _postprocess(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        return_dict: bool = True,
+    ) -> torch.Tensor | Transformer2DModelOutput:
+        """Apply final normalization and projection."""
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
-
         if not return_dict:
             return (output,)
         return Transformer2DModelOutput(sample=output)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        guidance: torch.Tensor | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+        return_dict: bool = True,
+    ) -> torch.Tensor | Transformer2DModelOutput:
+        state = self._preprocess(
+            hidden_states, encoder_hidden_states, timestep,
+            img_ids, txt_ids, guidance, joint_attention_kwargs, return_dict,
+        )
+        hidden_states = self._run_blocks(state)
+        return self._postprocess(hidden_states, state.temb, state.return_dict)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

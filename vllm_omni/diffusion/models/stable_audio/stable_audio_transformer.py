@@ -7,6 +7,8 @@ Stable Audio DiT Model for vLLM-Omni.
 
 import math
 from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -357,6 +359,16 @@ class StableAudioDiTBlock(nn.Module):
         return hidden_states
 
 
+@dataclass
+class StableAudioPreprocessedState:
+    hidden_states: torch.Tensor
+    cross_attention_hidden_states: torch.Tensor
+    rotary_embedding: tuple[torch.Tensor, torch.Tensor] | None
+    attention_mask: torch.Tensor | None
+    encoder_attention_mask: torch.Tensor | None
+    return_dict: bool
+
+
 class StableAudioDiTModel(nn.Module):
     """
     Optimized Stable Audio DiT model using vLLM layers.
@@ -482,33 +494,17 @@ class StableAudioDiTModel(nn.Module):
         """Return the dtype of the model parameters."""
         return next(self.parameters()).dtype
 
-    def forward(
+    def _preprocess(
         self,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        global_hidden_states: torch.Tensor | None = None,
-        rotary_embedding: tuple[torch.Tensor, torch.Tensor] | None = None,
-        return_dict: bool = True,
-        attention_mask: torch.Tensor | None = None,
-        encoder_attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor | Transformer2DModelOutput:
-        """
-        Forward pass of the Stable Audio DiT model.
-
-        Args:
-            hidden_states: Input latent tensor [B, C, L] (C=in_channels=64)
-            timestep: Timestep tensor [B] or [1]
-            encoder_hidden_states: Text/condition embeddings [B, S, D]
-            global_hidden_states: Global conditioning (duration) [B, 1, D]
-            rotary_embedding: Precomputed rotary embeddings (cos, sin)
-            return_dict: Whether to return a dataclass or tuple
-            attention_mask: Attention mask for self-attention
-            encoder_attention_mask: Attention mask for cross-attention
-
-        Returns:
-            Denoised latent tensor
-        """
+        global_hidden_states: torch.Tensor | None,
+        rotary_embedding: tuple[torch.Tensor, torch.Tensor] | None,
+        return_dict: bool,
+        attention_mask: torch.Tensor | None,
+        encoder_attention_mask: torch.Tensor | None,
+    ) -> StableAudioPreprocessedState:
         # Project cross-attention inputs
         cross_attention_hidden_states = self.cross_attention_proj(encoder_hidden_states)
 
@@ -542,16 +538,34 @@ class StableAudioDiTModel(nn.Module):
             )
             attention_mask = torch.cat([prepend_mask, attention_mask], dim=-1)
 
-        # Transformer blocks
+        return StableAudioPreprocessedState(
+            hidden_states=hidden_states,
+            cross_attention_hidden_states=cross_attention_hidden_states,
+            rotary_embedding=rotary_embedding,
+            attention_mask=attention_mask,
+            encoder_attention_mask=encoder_attention_mask,
+            return_dict=return_dict,
+        )
+
+    def _run_blocks(
+        self, state: StableAudioPreprocessedState,
+    ) -> torch.Tensor:
+        hidden_states = state.hidden_states
         for block in self.transformer_blocks:
             hidden_states = block(
                 hidden_states,
-                cross_attention_hidden_states,
-                rotary_embedding=rotary_embedding,
-                attention_mask=attention_mask,
-                encoder_attention_mask=encoder_attention_mask,
+                state.cross_attention_hidden_states,
+                rotary_embedding=state.rotary_embedding,
+                attention_mask=state.attention_mask,
+                encoder_attention_mask=state.encoder_attention_mask,
             )
+        return hidden_states
 
+    def _postprocess(
+        self,
+        hidden_states: torch.Tensor,
+        return_dict: bool,
+    ) -> torch.Tensor | Transformer2DModelOutput:
         # Project back to out_channels: [B, 1+L, inner_dim] -> [B, 1+L, out_channels]
         hidden_states = self.proj_out(hidden_states)
 
@@ -564,6 +578,25 @@ class StableAudioDiTModel(nn.Module):
         if return_dict:
             return Transformer2DModelOutput(sample=hidden_states)
         return (hidden_states,)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        global_hidden_states: torch.Tensor | None = None,
+        rotary_embedding: tuple[torch.Tensor, torch.Tensor] | None = None,
+        return_dict: bool = True,
+        attention_mask: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | Transformer2DModelOutput:
+        state = self._preprocess(
+            hidden_states, timestep, encoder_hidden_states,
+            global_hidden_states, rotary_embedding, return_dict,
+            attention_mask, encoder_attention_mask,
+        )
+        hidden_states = self._run_blocks(state)
+        return self._postprocess(hidden_states, state.return_dict)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """

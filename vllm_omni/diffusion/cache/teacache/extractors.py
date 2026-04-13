@@ -20,9 +20,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.forward_context import get_forward_context
-from vllm_omni.platforms import current_omni_platform
-
 
 @dataclass
 class CacheContext:
@@ -90,7 +87,7 @@ class CacheContext:
     modulated_input: torch.Tensor
     hidden_states: torch.Tensor
     encoder_hidden_states: torch.Tensor | None
-    temb: torch.Tensor
+    temb: torch.Tensor | None
     run_transformer_blocks: Callable[[], tuple[torch.Tensor, ...]]
     postprocess: Callable[[torch.Tensor], Any]
     extra_states: dict[str, Any] | None = None
@@ -119,8 +116,8 @@ class CacheContext:
                 f"encoder_hidden_states must be torch.Tensor or None, got {type(self.encoder_hidden_states)}"
             )
 
-        if not isinstance(self.temb, torch.Tensor):
-            raise TypeError(f"temb must be torch.Tensor, got {type(self.temb)}")
+        if self.temb is not None and not isinstance(self.temb, torch.Tensor):
+            raise TypeError(f"temb must be torch.Tensor or None, got {type(self.temb)}")
 
         # Validate callables
         if not callable(self.run_transformer_blocks):
@@ -161,9 +158,10 @@ def extract_qwen_context(
     """
     Extract cache context for QwenImageTransformer2DModel.
 
-    This is the ONLY Qwen-specific code needed for TeaCache support.
-    It encapsulates preprocessing, modulated input extraction, transformer execution,
-    and postprocessing logic.
+    Delegates preprocessing, block execution, and postprocessing to the model's
+    own private methods (_preprocess, _run_blocks, _postprocess) so that logic
+    is not duplicated here. The only TeaCache-specific logic is the extraction
+    of the modulated input from the first transformer block.
 
     Args:
         module: QwenImageTransformer2DModel instance
@@ -181,112 +179,36 @@ def extract_qwen_context(
     Returns:
         CacheContext with all information needed for generic caching
     """
-    from diffusers.models.modeling_outputs import Transformer2DModelOutput
-
     if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
         raise ValueError("Module must have transformer_blocks")
 
-    # ============================================================================
-    # PREPROCESSING (Qwen-specific)
-    # ============================================================================
-    # Call image_rope_prepare instead of img_in + pos_embed directly.
-    # This ensures the SequenceParallelSplitHook registered on image_rope_prepare
-    # fires when SP is enabled, correctly sharding hidden_states and vid_freqs.
-    hidden_states, vid_freqs, txt_freqs = module.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
-    image_rotary_emb = (vid_freqs, txt_freqs)
-
-    timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
-
-    # Call modulate_index_prepare instead of handling timestep directly.
-    # For zero_cond_t=False: timestep unchanged, modulate_index=None.
-    # For zero_cond_t=True: timestep is doubled, modulate_index is created and
-    # sharded by the SequenceParallelSplitHook on modulate_index_prepare so that
-    # its sequence dimension matches the already-sharded hidden_states.
-    timestep, modulate_index = module.modulate_index_prepare(timestep, img_shapes)
-
-    encoder_hidden_states = module.txt_norm(encoder_hidden_states)
-    encoder_hidden_states = module.txt_in(encoder_hidden_states)
-
-    if guidance is not None:
-        guidance = guidance.to(hidden_states.dtype) * 1000
-
-    temb = (
-        module.time_text_embed(timestep, hidden_states, additional_t_cond)
-        if guidance is None
-        else module.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
-    )
-
-    # ============================================================================
-    # EXTRACT MODULATED INPUT (for cache decision)
-    # ============================================================================
-    block = module.transformer_blocks[0]
-    img_mod_params = block.img_mod(temb)
-    img_mod1, _ = img_mod_params.chunk(2, dim=-1)
-    img_modulated, _ = block.img_norm1(hidden_states, img_mod1)
-
-    # ============================================================================
-    # DEFINE TRANSFORMER EXECUTION (Qwen-specific)
-    # ============================================================================
-    def run_transformer_blocks():
-        """Execute all Qwen transformer blocks."""
-        h = hidden_states
-        e = encoder_hidden_states
-        encoder_mask = encoder_hidden_states_mask
-        hidden_states_mask = None  # default
-        if module.parallel_config is not None and module.parallel_config.sequence_parallel_size > 1:
-            ctx = get_forward_context()
-            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
-                # Create mask for the full (padded) sequence
-                # valid positions = True, padding positions = False
-                batch_size = hidden_states.shape[0]
-                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-                hidden_states_mask = torch.ones(
-                    batch_size,
-                    padded_seq_len,
-                    dtype=torch.bool,
-                    device=hidden_states.device,
-                )
-                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-
-        # if mask is all true, set it to None
-        if hidden_states_mask is not None and hidden_states_mask.all():
-            hidden_states_mask = None
-        if encoder_mask is not None and encoder_mask.all():
-            encoder_mask = None
-        for block in module.transformer_blocks:
-            e, h = block(
-                hidden_states=h,
-                encoder_hidden_states=e,
-                encoder_hidden_states_mask=encoder_mask,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=attention_kwargs,
-                modulate_index=modulate_index,
-                hidden_states_mask=hidden_states_mask,
-            )
-        return (h, e)
-
-    # ============================================================================
-    # DEFINE POSTPROCESSING (Qwen-specific)
-    # ============================================================================
     return_dict = kwargs.get("return_dict", True)
 
-    def postprocess(h):
-        """Apply Qwen-specific output postprocessing."""
-        h = module.norm_out(h, temb)
-        output = module.proj_out(h)
-        if not return_dict:
-            return (output,)
-        return Transformer2DModelOutput(sample=output)
+    # Delegate all preprocessing to the model
+    state = module._preprocess(
+        hidden_states, encoder_hidden_states, encoder_hidden_states_mask,
+        timestep, img_shapes, txt_seq_lens, guidance, additional_t_cond,
+        attention_kwargs, return_dict,
+    )
 
-    # ============================================================================
-    # RETURN CONTEXT
-    # ============================================================================
+    # Extract modulated input from the first transformer block (TeaCache-specific)
+    block = module.transformer_blocks[0]
+    img_mod_params = block.img_mod(state.temb)
+    img_mod1, _ = img_mod_params.chunk(2, dim=-1)
+    img_modulated, _ = block.img_norm1(state.hidden_states, img_mod1, state.modulate_index)
+
+    def run_transformer_blocks():
+        h, e = module._run_blocks(state)
+        return (h, e)
+
+    def postprocess(h):
+        return module._postprocess(h, state.temb, state.return_dict)
+
     return CacheContext(
         modulated_input=img_modulated,
-        hidden_states=hidden_states,
-        encoder_hidden_states=encoder_hidden_states,
-        temb=temb,
+        hidden_states=state.hidden_states,
+        encoder_hidden_states=state.encoder_hidden_states,
+        temb=state.temb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
     )
@@ -311,6 +233,9 @@ def extract_bagel_context(
     """
     Extract cache context for Bagel model.
 
+    Delegates preprocessing to the model's _preprocess method. Uses _run_blocks
+    for the single non-CFG forward path and _postprocess for output projection.
+
     Args:
         module: Bagel instance
         x_t: Latent image input
@@ -330,64 +255,32 @@ def extract_bagel_context(
     Returns:
         CacheContext with all information needed for generic caching
     """
-
-    # 1. Embed text
-    packed_text_embedding = module.language_model.model.embed_tokens(packed_text_ids)
-    packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), module.hidden_size))
-    packed_sequence[packed_text_indexes] = packed_text_embedding
-
-    # 2. Embed timestep
     if not isinstance(timestep, torch.Tensor):
         timestep = torch.tensor([timestep], device=x_t.device)
     if timestep.dim() == 0:
         timestep = timestep.unsqueeze(0)
 
-    # 3. Embed image (x_t)
-    packed_pos_embed = module.latent_pos_embed(packed_vae_position_ids)
-    packed_timestep_embeds = module.time_embedder(timestep)
-
-    x_t_emb = module.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
-    if x_t_emb.dtype != packed_sequence.dtype:
-        x_t_emb = x_t_emb.to(packed_sequence.dtype)
-
-    packed_sequence[packed_vae_token_indexes] = x_t_emb
-
-    # Use the full packed sequence as modulated input to match hidden_states size
-    modulated_input = packed_sequence
+    state = module._preprocess(
+        x_t, timestep, packed_vae_token_indexes, packed_vae_position_ids,
+        packed_text_ids, packed_text_indexes, packed_seqlens,
+    )
 
     def run_transformer_blocks():
-        extra_inputs = {}
-        if module.use_moe:
-            extra_inputs = {
-                "mode": "gen",
-                "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes,
-            }
-
-        output = module.language_model.forward(
-            packed_query_sequence=packed_sequence,
-            query_lens=packed_seqlens,
-            packed_query_position_ids=packed_position_ids,
-            packed_query_indexes=packed_indexes,
-            past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes,
-            update_past_key_values=False,
-            is_causal=False,
-            **extra_inputs,
+        h = module._run_blocks(
+            state, packed_seqlens, packed_position_ids, packed_indexes,
+            past_key_values, key_values_lens, packed_key_value_indexes,
+            packed_vae_token_indexes, packed_text_indexes,
         )
-        return (output.packed_query_sequence,)
+        return (h,)
 
     def postprocess(h):
-        v_t = module.llm2vae(h)
-        v_t = v_t[packed_vae_token_indexes]
-        return v_t
+        return module._postprocess(h, packed_vae_token_indexes)
 
     return CacheContext(
-        modulated_input=modulated_input,
-        hidden_states=packed_sequence,  # Use full packed sequence
+        modulated_input=state.packed_sequence,
+        hidden_states=state.packed_sequence,
         encoder_hidden_states=None,
-        temb=packed_timestep_embeds,  # Approximate
+        temb=state.packed_timestep_embeds,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
     )
@@ -405,9 +298,9 @@ def extract_zimage_context(
     """
     Extract cache context for ZImageTransformer2DModel.
 
-    This is the ONLY Z-Image-specific code needed for TeaCache support.
-    It encapsulates preprocessing, modulated input extraction, transformer execution,
-    and postprocessing logic.
+    Delegates preprocessing to the model's _preprocess method. The only
+    TeaCache-specific logic is the modulated input extraction from the first
+    main transformer block.
 
     Args:
         module: ZImageTransformer2DModel instance
@@ -421,161 +314,31 @@ def extract_zimage_context(
     Returns:
         CacheContext with all information needed for generic caching
     """
-    from torch.nn.utils.rnn import pad_sequence
-
     if not hasattr(module, "layers") or len(module.layers) == 0:
         raise ValueError("Module must have main transformer layers")
 
-    bsz = len(x)
-    device = x[0].device
+    state = module._preprocess(x, t, cap_feats, patch_size, f_patch_size)
 
-    # ============================================================================
-    # PREPROCESSING (Z-Image specific)
-    # ============================================================================
-    # Scale timestep and create timestep embedding
-    t_scaled = t * module.t_scale
-    adaln_input = module.t_embedder(t_scaled)
-
-    # Patchify and embed inputs
-    (
-        x_patches,
-        cap_feats_processed,
-        x_size,
-        x_pos_ids,
-        cap_pos_ids,
-        x_inner_pad_mask,
-        cap_inner_pad_mask,
-    ) = module.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
-
-    # Process image patches through embedder and noise refiner
-    x_item_seqlens = [len(_) for _ in x_patches]
-    x_max_item_seqlen = max(x_item_seqlens)
-
-    x_embedded = torch.cat(x_patches, dim=0)
-    x_embedded = module.all_x_embedder[f"{patch_size}-{f_patch_size}"](x_embedded)
-
-    # Match adaln_input dtype to x_embedded
-    adaln_input = adaln_input.type_as(x_embedded)
-
-    # Apply pad token
-    x_embedded[torch.cat(x_inner_pad_mask)] = module.x_pad_token
-    x_list = list(x_embedded.split(x_item_seqlens, dim=0))
-
-    # Compute rope embeddings for image patches
-    x_cos, x_sin = module.rope_embedder(torch.cat(x_pos_ids, dim=0))
-    x_cos = list(x_cos.split(x_item_seqlens, dim=0))
-    x_sin = list(x_sin.split(x_item_seqlens, dim=0))
-
-    # Pad sequences for batch processing
-    x_batched = pad_sequence(x_list, batch_first=True, padding_value=0.0)
-    x_cos_batched = pad_sequence(x_cos, batch_first=True, padding_value=0.0)
-    x_sin_batched = pad_sequence(x_sin, batch_first=True, padding_value=0.0)
-    x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
-    for i, seq_len in enumerate(x_item_seqlens):
-        x_attn_mask[i, :seq_len] = 1
-
-    # Run noise refiner blocks
-    for layer in module.noise_refiner:
-        x_batched = layer(x_batched, x_attn_mask, x_cos_batched, x_sin_batched, adaln_input)
-
-    # Process caption features through embedder and context refiner
-    cap_item_seqlens = [len(_) for _ in cap_feats_processed]
-    cap_max_item_seqlen = max(cap_item_seqlens)
-
-    cap_embedded = torch.cat(cap_feats_processed, dim=0)
-    cap_embedded = module.cap_embedder(cap_embedded)
-    cap_embedded[torch.cat(cap_inner_pad_mask)] = module.cap_pad_token
-    cap_list = list(cap_embedded.split(cap_item_seqlens, dim=0))
-
-    # Compute rope embeddings for caption
-    cap_cos, cap_sin = module.rope_embedder(torch.cat(cap_pos_ids, dim=0))
-    cap_cos = list(cap_cos.split(cap_item_seqlens, dim=0))
-    cap_sin = list(cap_sin.split(cap_item_seqlens, dim=0))
-
-    # Pad sequences for batch processing
-    cap_batched = pad_sequence(cap_list, batch_first=True, padding_value=0.0)
-    cap_cos_batched = pad_sequence(cap_cos, batch_first=True, padding_value=0.0)
-    cap_sin_batched = pad_sequence(cap_sin, batch_first=True, padding_value=0.0)
-    cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
-    for i, seq_len in enumerate(cap_item_seqlens):
-        cap_attn_mask[i, :seq_len] = 1
-
-    # Run context refiner blocks
-    for layer in module.context_refiner:
-        cap_batched = layer(cap_batched, cap_attn_mask, cap_cos_batched, cap_sin_batched)
-
-    # Create unified sequence (image + caption)
-    unified_list = []
-    unified_cos_list = []
-    unified_sin_list = []
-    for i in range(bsz):
-        x_len = x_item_seqlens[i]
-        cap_len = cap_item_seqlens[i]
-        unified_list.append(torch.cat([x_batched[i][:x_len], cap_batched[i][:cap_len]]))
-        unified_cos_list.append(torch.cat([x_cos_batched[i][:x_len], cap_cos_batched[i][:cap_len]]))
-        unified_sin_list.append(torch.cat([x_sin_batched[i][:x_len], cap_sin_batched[i][:cap_len]]))
-
-    unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
-    unified_max_item_seqlen = max(unified_item_seqlens)
-
-    unified = pad_sequence(unified_list, batch_first=True, padding_value=0.0)
-    unified_cos = pad_sequence(unified_cos_list, batch_first=True, padding_value=0.0)
-    unified_sin = pad_sequence(unified_sin_list, batch_first=True, padding_value=0.0)
-    unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
-    for i, seq_len in enumerate(unified_item_seqlens):
-        unified_attn_mask[i, :seq_len] = 1
-
-    # ============================================================================
-    # EXTRACT MODULATED INPUT (for cache decision)
-    # ============================================================================
-    # Use the first main transformer block's modulation
-    # The main layers have modulation=True and process the unified sequence
+    # Extract modulated input from the first main transformer block (TeaCache-specific)
     block = module.layers[0]
-    # Get modulation parameters: scale_msa, gate_msa, scale_mlp, gate_mlp
-    mod_params = block.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
+    mod_params = block.adaLN_modulation(state.adaln_input).unsqueeze(1).chunk(4, dim=2)
     scale_msa = 1.0 + mod_params[0]
-    # Extract modulated input: normalized hidden states scaled by modulation
-    modulated_input = block.attention_norm1(unified) * scale_msa
+    modulated_input = block.attention_norm1(state.unified) * scale_msa
 
-    # ============================================================================
-    # DEFINE TRANSFORMER EXECUTION (Z-Image specific)
-    # ============================================================================
     def run_transformer_blocks():
-        """Execute all Z-Image main transformer blocks."""
-        h = unified
-        for layer in module.layers:
-            h = layer(h, unified_attn_mask, unified_cos, unified_sin, adaln_input)
+        h = module._run_blocks(state)
         return (h,)
 
-    # ============================================================================
-    # DEFINE POSTPROCESSING (Z-Image specific)
-    # ============================================================================
     def postprocess(h):
-        """Apply Z-Image specific output postprocessing."""
-        h = module.all_final_layer[f"{patch_size}-{f_patch_size}"](h, adaln_input)
-        h = list(h.unbind(dim=0))
-        output = module.unpatchify(h, x_size, patch_size, f_patch_size)
-        return output, {}
+        return module._postprocess(h, state)
 
-    # ============================================================================
-    # RETURN CONTEXT
-    # ============================================================================
     return CacheContext(
         modulated_input=modulated_input,
-        hidden_states=unified,
-        encoder_hidden_states=None,  # Z-Image uses unified sequence, no separate encoder states
-        temb=adaln_input,
+        hidden_states=state.unified,
+        encoder_hidden_states=None,
+        temb=state.adaln_input,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
-        extra_states={
-            "unified_attn_mask": unified_attn_mask,
-            "unified_cos": unified_cos,
-            "unified_sin": unified_sin,
-            "x_size": x_size,
-            "x_item_seqlens": x_item_seqlens,
-            "patch_size": patch_size,
-            "f_patch_size": f_patch_size,
-        },
     )
 
 
@@ -593,11 +356,11 @@ def extract_flux2_klein_context(
     """
     Extract cache context for Flux2Klein model.
 
-    Caches the full transformer output (including single_transformer_blocks).
-    When cache is reused, single_transformer_blocks is skipped to achieve maximum speedup.
+    Delegates preprocessing to the model's _preprocess method. Uses _run_blocks
+    for the full dual+single stream execution path.
 
     Args:
-        module: Flux2Transformer2DModel instance
+        module: Flux2Transformer2DModel instance (Klein variant)
         hidden_states: Input image hidden states tensor
         encoder_hidden_states: Input text hidden states tensor
         timestep: Current diffusion timestep
@@ -609,112 +372,34 @@ def extract_flux2_klein_context(
     Returns:
         CacheContext with all information needed for generic caching
     """
-    from diffusers.models.modeling_outputs import Transformer2DModelOutput
-
     if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
         raise ValueError("Module must have transformer_blocks")
 
-    # ============================================================================
-    # PREPROCESSING (Flux2-specific)
-    # ============================================================================
-    dtype = hidden_states.dtype
-
-    num_txt_tokens = encoder_hidden_states.shape[1]
-
-    timestep = timestep.to(dtype=dtype) * 1000
-    if guidance is not None:
-        guidance = guidance.to(dtype=dtype) * 1000
-
-    temb = module.time_guidance_embed(timestep, guidance)
-
-    double_stream_mod_img = module.double_stream_modulation_img(temb)
-    double_stream_mod_txt = module.double_stream_modulation_txt(temb)
-    single_stream_mod = module.single_stream_modulation(temb)[0]
-
-    hidden_states = module.x_embedder(hidden_states)
-    encoder_hidden_states = module.context_embedder(encoder_hidden_states)
-
-    if img_ids.ndim == 3:
-        img_ids = img_ids[0]
-    if txt_ids.ndim == 3:
-        txt_ids = txt_ids[0]
-
-    image_rotary_emb = module.pos_embed(img_ids)
-    text_rotary_emb = module.pos_embed(txt_ids)
-    concat_rotary_emb = (
-        torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
-        torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
-    )
-
-    # ============================================================================
-    # EXTRACT MODULATED INPUT (for cache decision)
-    # ============================================================================
-    block = module.transformer_blocks[0]
-
-    norm_hidden_states = block.norm1(hidden_states)
-    norm_hidden_states = (1 + double_stream_mod_img[0][1]) * norm_hidden_states + double_stream_mod_img[0][0]
-
-    modulated_input = norm_hidden_states
-
-    # ============================================================================
-    # DEFINE TRANSFORMER EXECUTION (Flux2-specific)
-    # ============================================================================
-    def run_flux2_transformer_blocks():
-        h = hidden_states
-        c = encoder_hidden_states
-        for block in module.transformer_blocks:
-            c, h = block(
-                hidden_states=h,
-                encoder_hidden_states=c,
-                temb_mod_params_img=double_stream_mod_img,
-                temb_mod_params_txt=double_stream_mod_txt,
-                image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-        return (h, c)
-
-    def run_flux2_full_transformer_with_single(ori_h, ori_c):
-        h = ori_h
-        c = ori_c
-        for block in module.transformer_blocks:
-            c, h = block(
-                hidden_states=h,
-                encoder_hidden_states=c,
-                temb_mod_params_img=double_stream_mod_img,
-                temb_mod_params_txt=double_stream_mod_txt,
-                image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-        h_concat = torch.cat([c, h], dim=1)
-        for block in module.single_transformer_blocks:
-            h_concat = block(
-                hidden_states=h_concat,
-                encoder_hidden_states=None,
-                temb_mod_params=single_stream_mod,
-                image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-        final_hidden_states = h_concat[:, num_txt_tokens:, ...]
-        return final_hidden_states, c
-
-    # ============================================================================
-    # DEFINE POSTPROCESSING (Flux2-specific)
-    # ============================================================================
     return_dict = kwargs.get("return_dict", True)
 
+    state = module._preprocess(
+        hidden_states, encoder_hidden_states, timestep,
+        img_ids, txt_ids, guidance, joint_attention_kwargs, return_dict,
+    )
+
+    # Extract modulated input from the first dual-stream block (TeaCache-specific)
+    block = module.transformer_blocks[0]
+    norm_hidden_states = block.norm1(state.hidden_states)
+    modulated_input = (1 + state.double_stream_mod_img[0][1]) * norm_hidden_states + state.double_stream_mod_img[0][0]
+
+    def run_flux2_full_transformer_with_single(ori_h, ori_c):
+        h = module._run_blocks(state)
+        return h, ori_c
+
     def postprocess(h):
-        h = module.norm_out(h, temb)
-        h = module.proj_out(h)
-        if not return_dict:
-            return (h,)
-        return Transformer2DModelOutput(sample=h)
+        return module._postprocess(h, state.temb, state.return_dict)
 
     return CacheContext(
         modulated_input=modulated_input,
-        hidden_states=hidden_states,
-        encoder_hidden_states=encoder_hidden_states,
-        temb=temb,
-        run_transformer_blocks=run_flux2_transformer_blocks,
+        hidden_states=state.hidden_states,
+        encoder_hidden_states=state.encoder_hidden_states,
+        temb=state.temb,
+        run_transformer_blocks=lambda: None,
         postprocess=postprocess,
         extra_states={
             "run_flux2_full_transformer_with_single": run_flux2_full_transformer_with_single,
@@ -734,95 +419,36 @@ def extract_stable_audio_context(
     encoder_attention_mask: torch.Tensor | None = None,
     **kwargs: Any,
 ) -> CacheContext:
-    """
-    Extract cache context for Stable Audio DiT model.
-
-    Architecture Notes:
-        - Stable Audio uses standard LayerNorm
-        - Timestep conditioning via global_hidden_states prepended to sequence
-        - Single-stream model (cross-attention handled separately)
-        - Input: [B, C, L] (C=in_channels) -> transpose -> [B, L, C] -> project -> [B, L, inner_dim]
-        - Global states prepended: [B, 1+L, inner_dim]
-    """
-    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
-        raise ValueError("Module must have transformer_blocks attribute with at least one block")
-
     # Cast inputs to match model weights dtype
     hidden_states = hidden_states.to(module.dtype)
     encoder_hidden_states = encoder_hidden_states.to(module.dtype)
     if global_hidden_states is not None:
         global_hidden_states = global_hidden_states.to(module.dtype)
 
-    cross_attention_hidden_states = module.cross_attention_proj(encoder_hidden_states)
-    global_hidden_states = module.global_proj(global_hidden_states)
-    time_hidden_states = module.timestep_proj(module.time_proj(timestep.to(module.dtype)))
-
-    # Combine global and time embeddings → [B, 1, inner_dim]
-    temb = global_hidden_states + time_hidden_states.unsqueeze(1)
-
-    hidden_states = module.preprocess_conv(hidden_states) + hidden_states
-    hidden_states = hidden_states.transpose(1, 2)
-
-    # Capture the original sequence length for safe post-processing slicing
-    original_seq_len = hidden_states.shape[1]
-
-    hidden_states = module.proj_in(hidden_states)
-    hidden_states = torch.cat([temb, hidden_states], dim=1)
-
-    # attention_mask is not used in the standard Stable Audio Open inference path.
-    assert attention_mask is None, (
-        "attention_mask is not supported in extract_stable_audio_context; expected None for Stable Audio Open."
+    state = module._preprocess(
+        hidden_states, timestep, encoder_hidden_states,
+        global_hidden_states, rotary_embedding, return_dict,
+        attention_mask, encoder_attention_mask,
     )
 
-    # Stable Audio prepends the combined global+time embedding (`temb`) to the sequence.
-    # Therefore, the standard LayerNorm applied here still captures the timestep signal
-    # within the first token of the output, giving the cache discriminator the info it needs.
+    # Stable Audio prepends the combined global+time embedding to the sequence.
+    # The standard LayerNorm captures the timestep signal within the first token,
+    # giving the cache discriminator the information it needs.
     first_block = module.transformer_blocks[0]
-    modulated_input = first_block.norm1(hidden_states)
+    modulated_input = first_block.norm1(state.hidden_states)
 
     def run_transformer_blocks() -> tuple[torch.Tensor]:
-        """
-        Execute all Stable Audio transformer blocks.
-
-        Returns:
-            Tuple containing only hidden_states (single-stream model).
-            Format: (hidden_states,)
-        """
-        h = hidden_states
-        for block in module.transformer_blocks:
-            h = block(
-                hidden_states=h,
-                encoder_hidden_states=cross_attention_hidden_states,
-                rotary_embedding=rotary_embedding,
-                attention_mask=attention_mask,
-                encoder_attention_mask=encoder_attention_mask,
-            )
+        h = module._run_blocks(state)
         return (h,)
 
     def postprocess(h: torch.Tensor) -> Any:
-        """
-        Apply Stable Audio-specific output postprocessing.
-
-        Args:
-            h: Hidden states from transformer blocks [B, 1+L, inner_dim]
-
-        Returns:
-            Transformer2DModelOutput or tuple based on return_dict
-        """
-        from diffusers.models.modeling_outputs import Transformer2DModelOutput
-
-        h = module.proj_out(h)
-        h = h.transpose(1, 2)[:, :, -original_seq_len:]
-        output = module.postprocess_conv(h) + h
-        if return_dict:
-            return Transformer2DModelOutput(sample=output)
-        return (output,)
+        return module._postprocess(h, state.return_dict)
 
     return CacheContext(
         modulated_input=modulated_input,
-        hidden_states=hidden_states,
+        hidden_states=state.hidden_states,
         encoder_hidden_states=None,
-        temb=temb,
+        temb=None,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
     )
@@ -840,127 +466,28 @@ def extract_flux2_context(
     return_dict: bool = True,
     **kwargs: Any,
 ) -> CacheContext:
-    """
-    Extract cache context for Flux2Transformer2DModel.
-
-    This is the ONLY Flux2-specific code needed for TeaCache support.
-    It encapsulates preprocessing, modulated input extraction, transformer execution,
-    and postprocessing logic.
-
-    Args:
-        module: Flux2Transformer2DModel instance
-        hidden_states: Input hidden states tensor
-        encoder_hidden_states: Text encoder outputs
-        timestep: Current diffusion timestep
-        img_ids: Image inputs for position embedding
-        txt_ids: Text inputs for position embedding
-        guidance: Optional guidance scale for CFG
-        joint_attention_kwargs: Additional attention arguments
-        return_dict: Whether to return a Transformer2DModelOutput instead of a plain tensor
-        **kwargs: Additional keyword arguments ignored by this extractor
-
-    Returns:
-        CacheContext with all information needed for generic caching
-    """
-
-    from diffusers.models.modeling_outputs import Transformer2DModelOutput
-
-    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
-        raise ValueError("Module must have transformer_blocks")
-
-    # ============================================================================
-    # PREPROCESSING (Flux2-specific)
-    # ============================================================================
-    num_txt_tokens = encoder_hidden_states.shape[1]
-
-    timestep = timestep.to(hidden_states.dtype) * 1000
-    if guidance is not None:
-        guidance = guidance.to(hidden_states.dtype) * 1000
-
-    temb = module.time_guidance_embed(timestep, guidance)
-
-    double_stream_mod_img = module.double_stream_modulation_img(temb)
-    double_stream_mod_txt = module.double_stream_modulation_txt(temb)
-    single_stream_mod = module.single_stream_modulation(temb)[0]
-
-    hidden_states = module.x_embedder(hidden_states)
-    encoder_hidden_states = module.context_embedder(encoder_hidden_states)
-
-    if img_ids.ndim == 3:
-        img_ids = img_ids[0]
-    if txt_ids.ndim == 3:
-        txt_ids = txt_ids[0]
-
-    if current_omni_platform.is_npu():
-        freqs_cos_image, freqs_sin_image = module.pos_embed(img_ids.cpu())
-        image_rotary_emb = (freqs_cos_image.npu(), freqs_sin_image.npu())
-        freqs_cos_text, freqs_sin_text = module.pos_embed(txt_ids.cpu())
-        text_rotary_emb = (freqs_cos_text.npu(), freqs_sin_text.npu())
-    else:
-        image_rotary_emb = module.pos_embed(img_ids)
-        text_rotary_emb = module.pos_embed(txt_ids)
-    concat_rotary_emb = (
-        torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
-        torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
+    state = module._preprocess(
+        hidden_states, encoder_hidden_states, timestep,
+        img_ids, txt_ids, guidance, joint_attention_kwargs, return_dict,
     )
 
-    # ============================================================================
-    # EXTRACT MODULATED INPUT (for cache decision)
-    # ============================================================================
     block = module.transformer_blocks[0]
-    (shift_msa, scale_msa, gate_msa), _ = double_stream_mod_img
-    modulated_input = block.norm1(hidden_states)
+    (shift_msa, scale_msa, gate_msa), _ = state.double_stream_mod_img
+    modulated_input = block.norm1(state.hidden_states)
     modulated_input = (1 + scale_msa) * modulated_input + shift_msa
 
-    # ============================================================================
-    # DEFINE TRANSFORMER EXECUTION (Flux2-specific)
-    # ============================================================================
-    def run_transformer_blocks():
-        """Execute all Flux2 transformer blocks."""
-        h = hidden_states
-        e = encoder_hidden_states
-
-        for transformer_block in module.transformer_blocks:
-            e, h = transformer_block(
-                hidden_states=h,
-                encoder_hidden_states=e,
-                temb_mod_params_img=double_stream_mod_img,
-                temb_mod_params_txt=double_stream_mod_txt,
-                image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-        h = torch.cat([e, h], dim=1)
-
-        for single_transformer_block in module.single_transformer_blocks:
-            h = single_transformer_block(
-                hidden_states=h,
-                encoder_hidden_states=None,
-                temb_mod_params=single_stream_mod,
-                image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-
-        h = h[:, num_txt_tokens:, ...]
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        h = module._run_blocks(state)
         return (h,)
 
-    # ============================================================================
-    # DEFINE POSTPROCESSING
-    # ============================================================================
-    def postprocess(h):
-        h = module.norm_out(h, temb)
-        output = module.proj_out(h)
-        if not return_dict:
-            return (output,)
-        return Transformer2DModelOutput(sample=output)
+    def postprocess(h: torch.Tensor) -> Any:
+        return module._postprocess(h, state.temb, state.return_dict)
 
-    # ============================================================================
-    # RETURN CONTEXT
-    # ============================================================================
     return CacheContext(
         modulated_input=modulated_input,
-        hidden_states=hidden_states,
-        encoder_hidden_states=encoder_hidden_states,
-        temb=temb,
+        hidden_states=state.hidden_states,
+        encoder_hidden_states=state.encoder_hidden_states,
+        temb=state.temb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
     )

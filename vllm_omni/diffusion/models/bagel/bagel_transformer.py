@@ -1075,6 +1075,14 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
     return pos_ids
 
 
+@dataclass
+class BagelPreprocessedState:
+    """Preprocessed state produced by Bagel._preprocess."""
+
+    packed_sequence: torch.Tensor
+    packed_timestep_embeds: torch.Tensor
+
+
 class Bagel(nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
@@ -2365,6 +2373,79 @@ class Bagel(nn.Module):
         v_t = v_t[packed_vae_token_indexes]
         return v_t
 
+    def _preprocess(
+        self,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        packed_vae_token_indexes: torch.LongTensor,
+        packed_vae_position_ids: torch.LongTensor,
+        packed_text_ids: torch.LongTensor,
+        packed_text_indexes: torch.LongTensor,
+        packed_seqlens: torch.IntTensor,
+    ) -> BagelPreprocessedState:
+        """Build the packed query sequence with text, image, timestep, and position embeddings."""
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        assert timestep.unique().shape[0] == 1
+        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
+        packed_timestep_embeds = self.time_embedder(timestep)
+        x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+        if x_t.dtype != packed_sequence.dtype:
+            x_t = x_t.to(packed_sequence.dtype)
+        packed_sequence[packed_vae_token_indexes] = x_t
+
+        return BagelPreprocessedState(
+            packed_sequence=packed_sequence,
+            packed_timestep_embeds=packed_timestep_embeds,
+        )
+
+    def _run_blocks(
+        self,
+        state: BagelPreprocessedState,
+        packed_seqlens: torch.IntTensor,
+        packed_position_ids: torch.LongTensor,
+        packed_indexes: torch.LongTensor,
+        past_key_values: NaiveCache,
+        key_values_lens: torch.IntTensor,
+        packed_key_value_indexes: torch.LongTensor,
+        packed_vae_token_indexes: torch.LongTensor,
+        packed_text_indexes: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Run language model forward (single non-CFG path). Returns packed output sequence."""
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs = {
+                "mode": "gen",
+                "packed_vae_token_indexes": packed_vae_token_indexes,
+                "packed_text_indexes": packed_text_indexes,
+            }
+
+        output = self.language_model.forward(
+            packed_query_sequence=state.packed_sequence,
+            query_lens=packed_seqlens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=False,
+            is_causal=False,
+            **extra_inputs,
+        )
+        return output.packed_query_sequence
+
+    def _postprocess(
+        self,
+        hidden_states: torch.Tensor,
+        packed_vae_token_indexes: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Project hidden states back to VAE latent space and extract VAE tokens."""
+        v_t = self.llm2vae(hidden_states)
+        v_t = v_t[packed_vae_token_indexes]
+        return v_t
+
     def forward(
         self,
         x_t: torch.Tensor,
@@ -2385,18 +2466,11 @@ class Bagel(nn.Module):
         cfg_img_scale: float = 1.0,
         cfg_batched: dict | None = None,
     ):
-        # Build query sequence (identical for all CFG branches)
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
-        packed_sequence[packed_text_indexes] = packed_text_embedding
-
-        assert timestep.unique().shape[0] == 1
-        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
-        packed_timestep_embeds = self.time_embedder(timestep)
-        x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
-        if x_t.dtype != packed_sequence.dtype:
-            x_t = x_t.to(packed_sequence.dtype)
-        packed_sequence[packed_vae_token_indexes] = x_t
+        state = self._preprocess(
+            x_t, timestep, packed_vae_token_indexes, packed_vae_position_ids,
+            packed_text_ids, packed_text_indexes, packed_seqlens,
+        )
+        packed_sequence = state.packed_sequence
 
         extra_inputs = {}
         if self.use_moe:
@@ -2449,24 +2523,12 @@ class Bagel(nn.Module):
                 ]
         else:
             # ── Single forward (no CFG or outside cfg_interval) ──
-            if self.use_moe:
-                extra_inputs["packed_vae_token_indexes"] = packed_vae_token_indexes
-                extra_inputs["packed_text_indexes"] = packed_text_indexes
-
-            output = self.language_model.forward(
-                packed_query_sequence=packed_sequence,
-                query_lens=packed_seqlens,
-                packed_query_position_ids=packed_position_ids,
-                packed_query_indexes=packed_indexes,
-                past_key_values=past_key_values,
-                key_values_lens=key_values_lens,
-                packed_key_value_indexes=packed_key_value_indexes,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
+            hidden = self._run_blocks(
+                state, packed_seqlens, packed_position_ids, packed_indexes,
+                past_key_values, key_values_lens, packed_key_value_indexes,
+                packed_vae_token_indexes, packed_text_indexes,
             )
-            v_t = self.llm2vae(output.packed_query_sequence)
-            v_t = v_t[packed_vae_token_indexes]
+            v_t = self._postprocess(hidden, packed_vae_token_indexes)
 
         # ── CFG combination ──
         if use_cfg:

@@ -18,7 +18,8 @@
 
 import math
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -556,6 +557,21 @@ class RopeEmbedder:
         return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
 
 
+@dataclass
+class ZImagePreprocessedState:
+    """Preprocessed state produced by ZImageTransformer2DModel._preprocess."""
+
+    unified: torch.Tensor
+    unified_cos: torch.Tensor
+    unified_sin: torch.Tensor
+    unified_attn_mask: torch.Tensor
+    adaln_input: torch.Tensor
+    x_size: Any
+    x_item_seqlens: list[int]
+    patch_size: int
+    f_patch_size: int
+
+
 class ZImageTransformer2DModel(CachedTransformer):
     """Z-Image Transformer model for image generation.
 
@@ -877,14 +893,15 @@ class ZImageTransformer2DModel(CachedTransformer):
             all_cap_pad_mask,
         )
 
-    def forward(
+    def _preprocess(
         self,
         x: list[torch.Tensor],
-        t,
+        t: torch.Tensor,
         cap_feats: list[torch.Tensor],
-        patch_size=2,
-        f_patch_size=1,
-    ):
+        patch_size: int = 2,
+        f_patch_size: int = 1,
+    ) -> ZImagePreprocessedState:
+        """Run all preprocessing: patchify, embed, refine, and unify sequences."""
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
@@ -970,17 +987,48 @@ class ZImageTransformer2DModel(CachedTransformer):
             x, x_cos, x_sin, cap_feats, cap_cos, cap_sin, x_item_seqlens, cap_item_seqlens
         )
 
-        # Main transformer blocks
+        return ZImagePreprocessedState(
+            unified=unified,
+            unified_cos=unified_cos,
+            unified_sin=unified_sin,
+            unified_attn_mask=unified_attn_mask,
+            adaln_input=adaln_input,
+            x_size=x_size,
+            x_item_seqlens=x_item_seqlens,
+            patch_size=patch_size,
+            f_patch_size=f_patch_size,
+        )
+
+    def _run_blocks(self, state: ZImagePreprocessedState) -> torch.Tensor:
+        """Run all main transformer blocks. Returns unified hidden states."""
+        unified = state.unified
         for layer in self.layers:
-            unified = layer(unified, unified_attn_mask, unified_cos, unified_sin, adaln_input)
+            unified = layer(
+                unified, state.unified_attn_mask, state.unified_cos,
+                state.unified_sin, state.adaln_input,
+            )
+        return unified
 
-        # Final layer
-        unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
-
+    def _postprocess(self, unified: torch.Tensor, state: ZImagePreprocessedState):
+        """Apply final layer and unpatchify."""
+        unified = self.all_final_layer[f"{state.patch_size}-{state.f_patch_size}"](
+            unified, state.adaln_input,
+        )
         unified = list(unified.unbind(dim=0))
-        x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
-
+        x = self.unpatchify(unified, state.x_size, state.patch_size, state.f_patch_size)
         return x, {}
+
+    def forward(
+        self,
+        x: list[torch.Tensor],
+        t,
+        cap_feats: list[torch.Tensor],
+        patch_size=2,
+        f_patch_size=1,
+    ):
+        state = self._preprocess(x, t, cap_feats, patch_size, f_patch_size)
+        unified = self._run_blocks(state)
+        return self._postprocess(unified, state)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
