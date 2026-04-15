@@ -1,0 +1,94 @@
+# Stage config for running FLUX.2-dev with 2-stage architecture
+# Stage 0: Mistral text encoder (vLLM model executor) - encodes prompts to hidden states
+# Stage 1: Diffusion (Flux2 DiT + VAE) - denoising and image decoding
+#
+# This separates text encoding from diffusion so that Mistral runs through
+# the vLLM model executor with KV cache, TP, and scheduling support,
+# while the DiT+VAE runs through the diffusion engine.
+#
+# Stage 0 uses MistralDiffusionEncoder, a wrapper around MistralForCausalLM
+# that collects intermediate layer hidden states (layers 10, 20, 30) and
+# returns them via OmniOutput.multimodal_outputs["prompt_embeds"].
+# See vllm_omni/model_executor/models/mistral_diffusion_encoder/.
+
+stage_args:
+  # Stage 0: Pixtral Text Encoder (vLLM model executor)
+  # ~11.3 GiB/GPU with TP=4. DiT uses ~16.8 GiB/GPU.
+  # gpu_memory_utilization=0.48 budgets ~19 GiB for vLLM (model + KV cache),
+  # fitting within the ~19.8 GiB left after DiT loading.
+  #
+  # The Mistral encoder expects prompts wrapped in a chat template with a
+  # specific system message (matching the reference diffusers pipeline).
+  # MistralDiffusionPreprocessor applies the chat template during tokenization.
+  - stage_id: 0
+    input_preprocessor_cls: vllm_omni.model_executor.models.mistral_diffusion_encoder.preprocessor.MistralDiffusionPreprocessor
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+    engine_args:
+      model_stage: text_encoder
+      max_num_seqs: 1
+      model_arch: MistralDiffusionEncoder
+      model_subdir: text_encoder
+      tokenizer_subdir: tokenizer
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.48
+      max_model_len: 2048
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 2048
+    final_output: false
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+  # Stage 1: Diffusion (Flux2 DiT + VAE)
+  # ~6 GiB/GPU with TP=4 (sharded transformer + replicated VAE).
+  # Both stages share all 4 GPUs.
+  - stage_id: 1
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+    engine_args:
+      model_stage: dit
+      max_num_seqs: 1
+      model_arch: Flux2Pipeline
+      parallel_config:
+        tensor_parallel_size: 4
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.flux2.encoder2diffusion
+    final_output: true
+    final_output_type: image
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 50
+      guidance_scale: 4.0
+      height: 1024
+      width: 1024
+
+# Top-level runtime config
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1  # Trigger downstream only after full upstream completion
+    max_inflight: 1  # Process serially within each stage
+
+  edges:
+    - from: 0  # Encoder → Diffusion: trigger after encoder completes
+      to: 1
+      window_size: -1

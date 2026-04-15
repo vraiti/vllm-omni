@@ -163,6 +163,12 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    ## mistral_diffusion_encoder (Stage 0 text encoder for FLUX.2-dev)
+    "MistralDiffusionEncoder": (
+        "mistral_diffusion_encoder",
+        "mistral_diffusion_encoder",
+        "MistralDiffusionEncoder",
+    ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
         "dynin_omni",

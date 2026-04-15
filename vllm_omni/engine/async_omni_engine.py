@@ -631,7 +631,10 @@ class AsyncOmniEngine:
                 # Use omni preprocessor so text-only prompts with
                 # mm_processor_kwargs (e.g. GLM-Image t2i target_h/target_w)
                 # still go through multimodal processor path.
-                input_processor.input_preprocessor = OmniInputPreprocessor(
+                # Stage configs may specify input_preprocessor_cls for
+                # model-specific tokenization (e.g. chat template wrapping).
+                preprocessor_cls = started.metadata.input_preprocessor_cls or OmniInputPreprocessor
+                input_processor.input_preprocessor = preprocessor_cls(
                     vllm_config=started.vllm_config,
                     renderer=input_processor.renderer,
                 )

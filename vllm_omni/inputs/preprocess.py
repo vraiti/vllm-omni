@@ -23,6 +23,10 @@ class OmniInputPreprocessor(InputPreprocessor):
     Extends the base InputPreprocessor to handle omni-specific input
     types including prompt embeddings and additional information payloads.
     Supports processing tokens, embeddings, text, and multimodal inputs.
+
+    Stage configs may specify ``input_preprocessor_cls`` to use a
+    model-specific subclass (e.g. ``MistralDiffusionPreprocessor``)
+    for custom tokenization such as chat template wrapping.
     """
 
     def _process_text(

@@ -13,15 +13,8 @@ import PIL.Image
 import torch
 from diffusers import AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.pipelines.flux2.pipeline_flux2 import UPSAMPLING_MAX_IMAGE_SIZE
-from diffusers.pipelines.flux2.system_messages import (
-    SYSTEM_MESSAGE,
-    SYSTEM_MESSAGE_UPSAMPLING_I2I,
-    SYSTEM_MESSAGE_UPSAMPLING_T2I,
-)
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoProcessor, Mistral3ForConditionalGeneration, PixtralProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -152,98 +145,6 @@ def get_flux2_post_process_func(
     return post_process_func
 
 
-# Copied from diffusers.pipelines.flux2.pipeline_flux2.format_input
-def format_input(
-    prompts: list[str],
-    system_message: str = SYSTEM_MESSAGE,
-    images: list[PIL.Image.Image] | list[list[PIL.Image.Image]] = None,
-) -> list[list[dict[str, Any]]]:
-    """
-    Format a batch of text prompts into the conversation format expected by apply_chat_template. Optionally, add images
-    to the input.
-
-    Args:
-        prompts: List of text prompts
-        system_message: System message to use (default: CREATIVE_SYSTEM_MESSAGE)
-        images (optional): List of images to add to the input.
-
-    Returns:
-        `list[list[dict[str, Any]]]`: List of conversations, where each conversation is a list of message dicts
-    """
-    # Remove [IMG] tokens from prompts to avoid Pixtral validation issues
-    # when truncation is enabled. The processor counts [IMG] tokens and fails
-    # if the count changes after truncation.
-    cleaned_txt = [prompt.replace("[IMG]", "") for prompt in prompts]
-
-    if images is None or len(images) == 0:
-        return [
-            [
-                {
-                    "role": "system",
-                    "content": [{"type": "text", "text": system_message}],
-                },
-                {"role": "user", "content": [{"type": "text", "text": prompt}]},
-            ]
-            for prompt in cleaned_txt
-        ]
-    else:
-        assert len(images) == len(prompts), "Number of images must match number of prompts"
-        messages = [
-            [
-                {
-                    "role": "system",
-                    "content": [{"type": "text", "text": system_message}],
-                },
-            ]
-            for _ in cleaned_txt
-        ]
-
-        for i, (el, batch_images) in enumerate(zip(messages, images)):
-            # optionally add the images per batch element.
-            if batch_images is not None:
-                el.append(
-                    {
-                        "role": "user",
-                        "content": [{"type": "image", "image": image_obj} for image_obj in batch_images],
-                    }
-                )
-            # add the text.
-            el.append(
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": cleaned_txt[i]}],
-                }
-            )
-
-        return messages
-
-
-# Copied from diffusers.pipelines.flux2.pipeline_flux2._validate_and_process_images
-def _validate_and_process_images(
-    images: list[list[PIL.Image.Image]] | list[PIL.Image.Image],
-    image_processor: Flux2ImageProcessor,
-    upsampling_max_image_size: int,
-) -> list[list[PIL.Image.Image]]:
-    # Simple validation: ensure it's a list of PIL images or list of lists of PIL images
-    if not images:
-        return []
-
-    # Check if it's a list of lists or a list of images
-    if isinstance(images[0], PIL.Image.Image):
-        # It's a list of images, convert to list of lists
-        images = [[im] for im in images]
-
-    # potentially concatenate multiple images to reduce the size
-    images = [[image_processor.concatenate_images(img_i)] if len(img_i) > 1 else img_i for img_i in images]
-
-    # cap the pixels
-    images = [
-        [image_processor._resize_if_exceeds_area(img_i, upsampling_max_image_size) for img_i in img_i]
-        for img_i in images
-    ]
-    return images
-
-
 # Copied from diffusers.pipelines.flux2.pipeline_flux2.compute_empirical_mu
 def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     a1, b1 = 8.73809524e-05, 1.89833333
@@ -357,7 +258,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
                 revision=None,
                 prefix="transformer.",
                 fall_back_to_pt=True,
-            )
+            ),
         ]
 
         self._execution_device = get_local_device()
@@ -368,12 +269,6 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self._execution_device)
-        self.tokenizer = PixtralProcessor.from_pretrained(
-            model, subfolder="tokenizer", local_files_only=local_files_only
-        )
         self.vae = AutoencoderKLFlux2.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self._execution_device
         )
@@ -382,13 +277,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = Flux2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
-        self.tokenizer_max_length = 512
         self.default_sample_size = 128
-
-        self.system_message = SYSTEM_MESSAGE
-        self.system_message_upsampling_t2i = SYSTEM_MESSAGE_UPSAMPLING_T2I
-        self.system_message_upsampling_i2i = SYSTEM_MESSAGE_UPSAMPLING_I2I
-        self.upsampling_max_image_size = UPSAMPLING_MAX_IMAGE_SIZE
 
         self._guidance_scale = None
         self._attention_kwargs = None
@@ -399,58 +288,6 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
         )
         self._current_timestep = None
         self._interrupt = False
-
-    @staticmethod
-    def _get_mistral_3_small_prompt_embeds(
-        text_encoder: Mistral3ForConditionalGeneration,
-        tokenizer: AutoProcessor,
-        prompt: str | list[str],
-        dtype: torch.dtype | None = None,
-        device: torch.device | None = None,
-        max_sequence_length: int = 512,
-        system_message: str = SYSTEM_MESSAGE,
-        hidden_states_layers: list[int] = (10, 20, 30),
-    ):
-        dtype = text_encoder.dtype if dtype is None else dtype
-        device = text_encoder.device if device is None else device
-
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-
-        # Format input messages
-        messages_batch = format_input(prompts=prompt, system_message=system_message)
-
-        # Process all messages at once
-        inputs = tokenizer.apply_chat_template(
-            messages_batch,
-            add_generation_prompt=False,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=max_sequence_length,
-        )
-
-        # Move to device
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
-
-        # Forward pass through the model
-        output = text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-
-        # Only use outputs from intermediate layers and stack them
-        out = torch.stack([output.hidden_states[k] for k in hidden_states_layers], dim=1)
-        out = out.to(dtype=dtype, device=device)
-
-        batch_size, num_channels, seq_len, hidden_dim = out.shape
-        prompt_embeds = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_channels * hidden_dim)
-
-        return prompt_embeds
 
     @staticmethod
     # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._prepare_text_ids
@@ -613,96 +450,31 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
 
         return torch.stack(x_list, dim=0)
 
-    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline.upsample_prompt
-    def upsample_prompt(
-        self,
-        prompt: str | list[str],
-        images: list[PIL.Image.Image] | list[list[PIL.Image.Image]] = None,
-        temperature: float = 0.15,
-        device: torch.device = None,
-    ) -> list[str]:
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-        device = self.text_encoder.device if device is None else device
-
-        # Set system message based on whether images are provided
-        if images is None or len(images) == 0 or images[0] is None:
-            system_message = SYSTEM_MESSAGE_UPSAMPLING_T2I
-        else:
-            system_message = SYSTEM_MESSAGE_UPSAMPLING_I2I
-
-        # Validate and process the input images
-        if images:
-            images = _validate_and_process_images(images, self.image_processor, self.upsampling_max_image_size)
-
-        # Format input messages
-        messages_batch = format_input(prompts=prompt, system_message=system_message, images=images)
-
-        # Process all messages at once
-        # with image processing a too short max length can throw an error in here.
-        inputs = self.tokenizer.apply_chat_template(
-            messages_batch,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=2048,
-        )
-
-        # Move to device
-        inputs["input_ids"] = inputs["input_ids"].to(device)
-        inputs["attention_mask"] = inputs["attention_mask"].to(device)
-
-        if "pixel_values" in inputs:
-            inputs["pixel_values"] = inputs["pixel_values"].to(device, self.text_encoder.dtype)
-
-        # Generate text using the model's generate method
-        generated_ids = self.text_encoder.generate(
-            **inputs,
-            max_new_tokens=512,
-            do_sample=True,
-            temperature=temperature,
-            use_cache=True,
-        )
-
-        # Decode only the newly generated tokens (skip input tokens)
-        # Extract only the generated portion
-        input_length = inputs["input_ids"].shape[1]
-        generated_tokens = generated_ids[:, input_length:]
-
-        upsampled_prompt = self.tokenizer.tokenizer.batch_decode(
-            generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True
-        )
-        return upsampled_prompt
-
     def encode_prompt(
         self,
-        prompt: str | list[str],
         device: torch.device | None = None,
         num_images_per_prompt: int = 1,
         prompt_embeds: torch.Tensor | None = None,
-        max_sequence_length: int = 512,
-        text_encoder_out_layers: tuple[int, ...] = (10, 20, 30),
     ):
+        """Prepare prompt embeddings and text IDs for the transformer.
+
+        In the two-stage pipeline, prompt_embeds are provided by Stage 0
+        (MistralDiffusionEncoder via the vLLM model executor). This method
+        handles tiling for num_images_per_prompt and text ID generation.
+        """
         device = device or self._execution_device
 
-        if prompt is None:
-            prompt = ""
-
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-
         if prompt_embeds is None:
-            prompt_embeds = self._get_mistral_3_small_prompt_embeds(
-                text_encoder=self.text_encoder,
-                tokenizer=self.tokenizer,
-                prompt=prompt,
-                device=device,
-                max_sequence_length=max_sequence_length,
-                system_message=self.system_message,
-                hidden_states_layers=text_encoder_out_layers,
+            # Generate dummy prompt_embeds for warmup/dummy runs.
+            # In normal operation, Stage 0 (MistralDiffusionEncoder)
+            # provides prompt_embeds via the stage input processor.
+            joint_attention_dim = self.transformer.config.joint_attention_dim
+            prompt_embeds = torch.zeros(
+                1, 1, joint_attention_dim,
+                device=device, dtype=self.transformer.dtype,
             )
 
+        prompt_embeds = prompt_embeds.to(device)
         batch_size, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
@@ -824,17 +596,8 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
                 f"but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
             )
 
-        if prompt is not None and prompt_embeds is not None:
-            raise ValueError(
-                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
-                " only forward one of the two."
-            )
-        elif prompt is None and prompt_embeds is None:
-            raise ValueError(
-                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
-            )
-        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+        # prompt_embeds is None during dummy/warmup runs — allowed.
+        # In normal operation, prompt_embeds come from Stage 0.
 
     @property
     def guidance_scale(self):
@@ -871,211 +634,29 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
             return False
         return True
 
-    def forward(
+    def _stage2_denoise(
         self,
-        req: OmniDiffusionRequest,
-        image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
-        prompt: str | list[str] | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int = 50,
-        sigmas: list[float] | None = None,
-        guidance_scale: float | None = 4.0,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        output_type: str | None = "pil",
-        return_dict: bool = True,
-        attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
-        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
-        text_encoder_out_layers: tuple[int, ...] = (10, 20, 30),
-        caption_upsample_temperature: float = None,
-    ) -> DiffusionOutput:
-        if len(req.prompts) > 1:
-            logger.warning(
-                """This model only supports a single prompt, not a batched request.""",
-                """Taking only the first image for now.""",
-            )
-        first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        latents: torch.Tensor,
+        latent_ids: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        text_ids: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_text_ids: torch.Tensor | None,
+        do_true_cfg: bool,
+        timesteps: torch.Tensor,
+        guidance_tensor: torch.Tensor | None,
+        image_latents: torch.Tensor | None,
+        image_latent_ids: torch.Tensor | None,
+        callback_on_step_end: Callable[[int, int, dict], None] | None,
+        callback_on_step_end_tensor_inputs: list[str],
+    ) -> torch.Tensor:
+        """Stage 2: Run the denoising loop through Flux2Transformer2DModel.
 
-        if (
-            raw_image := None
-            if isinstance(first_prompt, str)
-            else first_prompt.get("multi_modal_data", {}).get("image")
-        ) is None:
-            pass  # use image from param list
-        elif isinstance(raw_image, list):
-            image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
-        else:
-            image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
-
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        sigmas = req.sampling_params.sigmas or sigmas
-        guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
-        )
-        generator = req.sampling_params.generator or generator
-        num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
-            else num_images_per_prompt
-        )
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        text_encoder_out_layers = req.sampling_params.extra_args.get("text_encoder_out_layers", text_encoder_out_layers)
-
-        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
-        if any(p is not None for p in req_prompt_embeds):
-            # If at list one prompt is provided as an embedding,
-            # Then assume that the user wants to provide embeddings for all prompts, and enter this if block
-            # If the user in fact provides mixed input format, req_prompt_embeds will have some None's
-            # And `torch.stack` automatically raises an exception for us
-            prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
-
-        req_negative_prompt_embeds = [
-            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
-        ]
-        if all(p is not None for p in req_negative_prompt_embeds):
-            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
-
-        req_negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
-
-        # 1. Check inputs. Raise error if not correct
-        self.check_inputs(
-            prompt=prompt,
-            height=height,
-            width=width,
-            prompt_embeds=prompt_embeds,
-            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
-        )
-
-        self._guidance_scale = guidance_scale
-        self._attention_kwargs = attention_kwargs
-        self._current_timestep = None
-        self._interrupt = False
-        guidance_tensor = None
-
-        # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
-        device = self._execution_device
-
-        # 3. prepare text embeddings
-        if caption_upsample_temperature:
-            prompt = self.upsample_prompt(prompt, images=image, temperature=caption_upsample_temperature, device=device)
-        prompt_embeds, text_ids = self.encode_prompt(
-            prompt=prompt,
-            prompt_embeds=prompt_embeds,
-            device=device,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
-            text_encoder_out_layers=text_encoder_out_layers,
-        )
-
-        has_neg_prompt = negative_prompt_embeds is not None or any(req_negative_prompt)
-        do_true_cfg = self.guidance_scale > 1 and has_neg_prompt
-
-        self.check_cfg_parallel_validity(self.guidance_scale, has_neg_prompt)
-        negative_text_ids = None
-        if do_true_cfg:
-            negative_prompt = req_negative_prompt
-            negative_prompt_embeds, negative_text_ids = self.encode_prompt(
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
-                device=device,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-                text_encoder_out_layers=text_encoder_out_layers,
-            )
-
-        # 4. process images
-        if image is not None and not isinstance(image, list):
-            image = [image]
-
-        condition_images = None
-        if image is not None:
-            for img in image:
-                self.image_processor.check_image_input(img)
-
-            condition_images = []
-            for img in image:
-                image_width, image_height = img.size
-                if image_width * image_height > 1024 * 1024:
-                    img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
-                    image_width, image_height = img.size
-
-                multiple_of = self.vae_scale_factor * 2
-                image_width = (image_width // multiple_of) * multiple_of
-                image_height = (image_height // multiple_of) * multiple_of
-                img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
-                condition_images.append(img)
-                height = height or image_height
-                width = width or image_width
-
-        height = height or self.default_sample_size * self.vae_scale_factor
-        width = width or self.default_sample_size * self.vae_scale_factor
-
-        # 5. prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels // 4
-        latents, latent_ids = self.prepare_latents(
-            batch_size=batch_size * num_images_per_prompt,
-            num_latents_channels=num_channels_latents,
-            height=height,
-            width=width,
-            dtype=prompt_embeds.dtype,
-            device=device,
-            generator=generator,
-            latents=latents,
-        )
-
-        image_latents = None
-        image_latent_ids = None
-        if condition_images is not None:
-            image_latents, image_latent_ids = self.prepare_image_latents(
-                images=condition_images,
-                batch_size=batch_size * num_images_per_prompt,
-                generator=generator,
-                device=device,
-                dtype=self.vae.dtype,
-            )
-
-        # 6. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
-            sigmas = None
-        image_seq_len = latents.shape[1]
-        mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
-            sigmas=sigmas,
-            mu=mu,
-        )
-        self._num_timesteps = len(timesteps)
-
-        # handle guidance
-        if self.transformer.guidance_embeds is not None:
-            guidance_tensor = torch.full([1], self.guidance_scale, device=device, dtype=torch.float32)
-            guidance_tensor = guidance_tensor.expand(latents.shape[0])
-
-        # For editing pipelines, we need to slice the output to remove condition latents
+        Returns:
+            Denoised latents tensor.
+        """
         output_slice = latents.size(1) if image_latents is not None else None
 
-        # 7. Denoising loop
-        # We set the index here to remove DtoH sync, helpful especially during compilation.
-        # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
         self.scheduler.set_begin_index(0)
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
@@ -1125,7 +706,6 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
                     output_slice=output_slice,
                 )
 
-                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
                 if callback_on_step_end is not None:
@@ -1140,7 +720,19 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
                 pbar.update()
 
         self._current_timestep = None
+        return latents
 
+    def _stage3_decode(
+        self,
+        latents: torch.Tensor,
+        latent_ids: torch.Tensor,
+        output_type: str,
+    ) -> torch.Tensor:
+        """Stage 3: Unpack latents and decode through the VAE.
+
+        Returns:
+            Decoded image tensor.
+        """
         latents = self._unpack_latents_with_ids(latents, latent_ids)
 
         latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
@@ -1149,12 +741,210 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
         )
         latents = latents * latents_bn_std + latents_bn_mean
         latents = self._unpatchify_latents(latents)
+
         if output_type == "latent":
-            image = latents
+            return latents
+
+        if latents.dtype != self.vae.dtype:
+            latents = latents.to(self.vae.dtype)
+        return self.vae.decode(latents, return_dict=False)[0]
+
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
+        prompt: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int = 50,
+        sigmas: list[float] | None = None,
+        guidance_scale: float | None = 4.0,
+        num_images_per_prompt: int = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        output_type: str | None = "pil",
+        return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+    ) -> DiffusionOutput:
+        """Forward pass for the diffusion-only stage.
+
+        Text encoding is handled by Stage 0 (MistralDiffusionEncoder).
+        This method expects prompt_embeds to be provided via the request
+        (from the stage input processor encoder2diffusion).
+        """
+        if len(req.prompts) > 1:
+            logger.warning(
+                """This model only supports a single prompt, not a batched request.""",
+                """Taking only the first image for now.""",
+            )
+        first_prompt = req.prompts[0]
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+
+        if (
+            raw_image := None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("multi_modal_data", {}).get("image")
+        ) is None:
+            pass  # use image from param list
+        elif isinstance(raw_image, list):
+            image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
         else:
-            if latents.dtype != self.vae.dtype:
-                latents = latents.to(self.vae.dtype)
-            image = self.vae.decode(latents, return_dict=False)[0]
+            image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
+
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+        )
+        generator = req.sampling_params.generator or generator
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
+
+        # prompt_embeds from Stage 0 via encoder2diffusion stage input processor
+        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
+        if any(p is not None for p in req_prompt_embeds):
+            prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
+
+        req_negative_prompt_embeds = [
+            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
+        ]
+        if all(p is not None for p in req_negative_prompt_embeds):
+            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
+
+        self.check_inputs(
+            prompt=prompt,
+            height=height,
+            width=width,
+            prompt_embeds=prompt_embeds,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
+
+        # prompt_embeds is None during warmup/dummy runs — encode_prompt
+        # will generate a zero dummy tensor in that case.
+        batch_size = prompt_embeds.shape[0] if prompt_embeds is not None else 1
+        device = self._execution_device
+
+        # Prepare prompt embeddings and text IDs
+        prompt_embeds, text_ids = self.encode_prompt(
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            prompt_embeds=prompt_embeds,
+        )
+
+        # Handle negative prompt for true CFG
+        has_neg_prompt = negative_prompt_embeds is not None
+        do_true_cfg = self.guidance_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(self.guidance_scale, has_neg_prompt)
+        negative_text_ids = None
+        if do_true_cfg:
+            negative_prompt_embeds, negative_text_ids = self.encode_prompt(
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                prompt_embeds=negative_prompt_embeds,
+            )
+
+        # ---- Prepare latents and images ----
+        if image is not None and not isinstance(image, list):
+            image = [image]
+
+        condition_images = None
+        if image is not None:
+            for img in image:
+                self.image_processor.check_image_input(img)
+
+            condition_images = []
+            for img in image:
+                image_width, image_height = img.size
+                if image_width * image_height > 1024 * 1024:
+                    img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
+                    image_width, image_height = img.size
+
+                multiple_of = self.vae_scale_factor * 2
+                image_width = (image_width // multiple_of) * multiple_of
+                image_height = (image_height // multiple_of) * multiple_of
+                img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
+                condition_images.append(img)
+                height = height or image_height
+                width = width or image_width
+
+        height = height or self.default_sample_size * self.vae_scale_factor
+        width = width or self.default_sample_size * self.vae_scale_factor
+
+        num_channels_latents = self.transformer.config.in_channels // 4
+        latents, latent_ids = self.prepare_latents(
+            batch_size=batch_size * num_images_per_prompt,
+            num_latents_channels=num_channels_latents,
+            height=height,
+            width=width,
+            dtype=prompt_embeds.dtype,
+            device=device,
+            generator=generator,
+            latents=latents,
+        )
+
+        image_latents = None
+        image_latent_ids = None
+        if condition_images is not None:
+            image_latents, image_latent_ids = self.prepare_image_latents(
+                images=condition_images,
+                batch_size=batch_size * num_images_per_prompt,
+                generator=generator,
+                device=device,
+                dtype=self.vae.dtype,
+            )
+
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+            sigmas = None
+        image_seq_len = latents.shape[1]
+        mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        self._num_timesteps = len(timesteps)
+
+        guidance_tensor = None
+        if self.transformer.guidance_embeds is not None:
+            guidance_tensor = torch.full([1], self.guidance_scale, device=device, dtype=torch.float32)
+            guidance_tensor = guidance_tensor.expand(latents.shape[0])
+
+        # ---- Diffusion denoising via Flux2Transformer2DModel ----
+        latents = self._stage2_denoise(
+            latents=latents,
+            latent_ids=latent_ids,
+            prompt_embeds=prompt_embeds,
+            text_ids=text_ids,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_text_ids=negative_text_ids,
+            do_true_cfg=do_true_cfg,
+            timesteps=timesteps,
+            guidance_tensor=guidance_tensor,
+            image_latents=image_latents,
+            image_latent_ids=image_latent_ids,
+            callback_on_step_end=callback_on_step_end,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+        )
+
+        # ---- VAE decode ----
+        image = self._stage3_decode(latents, latent_ids, output_type)
 
         return DiffusionOutput(output=image)
 

@@ -147,6 +147,7 @@ class StageMetadata:
     runtime_cfg: Any
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    input_preprocessor_cls: type | None = None
 
 
 @dataclass
@@ -208,6 +209,12 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
+    input_preprocessor_cls: type | None = None
+    _ipc_path = getattr(stage_config, "input_preprocessor_cls", None)
+    if _ipc_path:
+        _mod, _cls = _ipc_path.rsplit(".", 1)
+        input_preprocessor_cls = getattr(importlib.import_module(_mod), _cls)
+
     if stage_type == "diffusion":
         return StageMetadata(
             stage_id=stage_id,
@@ -244,6 +251,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
+        input_preprocessor_cls=input_preprocessor_cls,
     )
 
 
