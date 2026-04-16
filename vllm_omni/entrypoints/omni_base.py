@@ -261,7 +261,7 @@ class OmniBase:
             metrics.on_stage_metrics(stage_id, req_id, _m)
 
         stage_meta = self.engine.get_stage_metadata(stage_id)
-        if not stage_meta["final_output"]:
+        if not stage_meta["final_output"] and not result.get("finished"):
             return None
 
         try:

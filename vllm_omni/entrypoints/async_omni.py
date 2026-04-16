@@ -164,6 +164,7 @@ class AsyncOmni(EngineClient, OmniBase):
         tokenization_kwargs: dict[str, Any] | None = None,
         sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         output_modalities: list[str] | None = None,
+        final_stage_id: int | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
@@ -215,8 +216,10 @@ class AsyncOmni(EngineClient, OmniBase):
             wall_start_ts = time.time()
             req_start_ts: dict[str, float] = {}
 
-            # Determine the final stage for E2E stats
-            final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)
+            if final_stage_id is not None:
+                final_stage_id_for_e2e = final_stage_id
+            else:
+                final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)
 
             metrics = OrchestratorMetrics(
                 self.num_stages,

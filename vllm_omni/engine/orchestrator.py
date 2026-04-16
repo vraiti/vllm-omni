@@ -322,7 +322,8 @@ class Orchestrator:
             self.request_states.pop(req_id, None)
             return
 
-        if stage_client.final_output:
+        is_request_terminal = finished and stage_id == req_state.final_stage_id
+        if stage_client.final_output or is_request_terminal:
             await self.output_async_queue.put(
                 {
                     "type": "output",
@@ -330,7 +331,7 @@ class Orchestrator:
                     "stage_id": stage_id,
                     "engine_outputs": output,
                     "metrics": stage_metrics,
-                    "finished": finished and stage_id == req_state.final_stage_id,
+                    "finished": is_request_terminal,
                     "stage_submit_ts": submit_ts,
                 }
             )

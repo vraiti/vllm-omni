@@ -124,6 +124,12 @@ class ImageGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    caption_upsample_temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="When set, upsample the prompt via the text encoder before encoding. Recommended: 0.15.",
+    )
     generator_device: str | None = Field(
         default=None,
         description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",

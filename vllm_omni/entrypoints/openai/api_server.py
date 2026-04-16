@@ -1366,6 +1366,15 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
+        if request.caption_upsample_temperature is not None:
+            prompt = await _upsample_prompt(
+                engine_client=engine_client,
+                stage_configs=stage_configs,
+                prompt=prompt,
+                temperature=request.caption_upsample_temperature,
+                request_id=f"{request_id}_upsample",
+            )
+
         # Generate images using AsyncOmni (multi-stage mode)
         result = await _generate_with_async_omni(
             engine_client=engine_client,
@@ -1681,6 +1690,77 @@ def _parse_lora_request(lora_body: dict[str, Any]):
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=str(e),
         ) from e
+
+
+async def _upsample_prompt(
+    engine_client: AsyncOmni | Any,
+    stage_configs: list[Any],
+    prompt: OmniTextPrompt,
+    temperature: float,
+    request_id: str,
+) -> OmniTextPrompt:
+    from vllm_omni.model_executor.models.mistral_diffusion_encoder.preprocessor import (
+        SYSTEM_MESSAGE_UPSAMPLING_T2I,
+    )
+
+    engine_client = cast(AsyncOmni, engine_client)
+
+    default_params_list: list[OmniSamplingParams] | None = getattr(
+        engine_client, "default_sampling_params_list", None,
+    )
+    if isinstance(default_params_list, list) and default_params_list:
+        stage0_params = default_params_list[0].clone()
+    else:
+        stage0_params = SamplingParams()
+
+    stage0_params.temperature = temperature
+    stage0_params.max_tokens = 512
+    stage0_params.detokenize = True
+
+    upsample_prompt: OmniTextPrompt = {
+        "prompt": prompt["prompt"],
+        "mm_processor_kwargs": {
+            "system_message": SYSTEM_MESSAGE_UPSAMPLING_T2I,
+            "add_generation_prompt": True,
+        },
+    }
+
+    sampling_params_list: list[OmniSamplingParams] = [stage0_params]
+    for idx, stage_cfg in enumerate(stage_configs):
+        if idx == 0:
+            continue
+        sampling_params_list.append(SamplingParams())
+
+    result = None
+    async for output in engine_client.generate(
+        prompt=upsample_prompt,
+        request_id=request_id,
+        sampling_params_list=sampling_params_list,
+        final_stage_id=0,
+    ):
+        result = output
+
+    if result is None or result.request_output is None:
+        logger.warning("[upsample] No output from upsampling pass; using original prompt")
+        return prompt
+
+    upsampled_text = ""
+    req_output = result.request_output
+    if hasattr(req_output, "outputs") and req_output.outputs:
+        upsampled_text = req_output.outputs[0].text or ""
+
+    if not upsampled_text.strip():
+        logger.warning("[upsample] Empty upsampled text; using original prompt")
+        return prompt
+
+    logger.info(
+        "[upsample] %s → %s",
+        prompt["prompt"][:80],
+        upsampled_text[:120],
+    )
+
+    upsampled_prompt: OmniTextPrompt = {**prompt, "prompt": upsampled_text}
+    return upsampled_prompt
 
 
 async def _generate_with_async_omni(
