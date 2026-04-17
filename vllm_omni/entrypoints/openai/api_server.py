@@ -1315,6 +1315,12 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         prompt: OmniTextPrompt = {"prompt": request.prompt}
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
+
+        if request.image is not None:
+            image_inputs = request.image if isinstance(request.image, list) else [request.image]
+            pil_images = await _load_input_images(image_inputs)
+            prompt["multi_modal_data"] = {"image": pil_images}
+
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
         extra_args = {}
         if request.use_system_prompt is not None:

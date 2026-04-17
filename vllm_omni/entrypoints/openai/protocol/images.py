@@ -79,6 +79,12 @@ class ImageGenerationRequest(BaseModel):
         """Validate the layers parameter for layered image models."""
         return validate_layered_layers(v)
 
+    # vllm-omni extension for multimodal input (e.g., Pixtral encoder in FLUX.2)
+    image: str | list[str] | None = Field(
+        default=None,
+        description="Input image(s) as base64 data URI(s) or HTTP URL(s) for image-conditioned generation",
+    )
+
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
     system_prompt: str | None = Field(
