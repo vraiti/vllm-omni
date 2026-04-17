@@ -27,6 +27,7 @@ from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import MultiModalConfig
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.mistral3 import (
     Mistral3DummyInputsBuilder,
     Mistral3ForConditionalGeneration,
@@ -56,7 +57,7 @@ DEFAULT_TARGET_LAYERS: tuple[int, ...] = (10, 20, 30)
     info=Mistral3ProcessingInfo,
     dummy_inputs=Mistral3DummyInputsBuilder,
 )
-class MistralDiffusionEncoder(nn.Module):
+class MistralDiffusionEncoder(nn.Module, SupportsMultiModal):
     """Pixtral encoder that outputs intermediate hidden states for diffusion.
 
     Wraps Mistral3ForConditionalGeneration internally and intercepts the
