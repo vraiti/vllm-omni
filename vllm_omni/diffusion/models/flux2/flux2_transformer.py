@@ -665,6 +665,16 @@ class Flux2Transformer2DModel(nn.Module):
     ) -> torch.Tensor | Transformer2DModelOutput:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
+        import os
+        _debug_dir = os.environ.get("FLUX2_DEBUG_DIR")
+        _debug_step = getattr(self, "_debug_step_counter", 0)
+        self._debug_step_counter = _debug_step + 1
+        _save_this_step = _debug_dir and _debug_step == 0
+
+        def _save(name, tensor):
+            if _save_this_step:
+                torch.save(tensor.detach().cpu(), os.path.join(_debug_dir, f"tf_{name}.pt"))
+
         num_txt_tokens = encoder_hidden_states.shape[1]
 
         timestep = timestep.to(hidden_states.dtype) * 1000
@@ -672,13 +682,19 @@ class Flux2Transformer2DModel(nn.Module):
             guidance = guidance.to(hidden_states.dtype) * 1000
 
         temb = self.time_guidance_embed(timestep, guidance)
+        _save("temb", temb)
 
         double_stream_mod_img = self.double_stream_modulation_img(temb)
         double_stream_mod_txt = self.double_stream_modulation_txt(temb)
         single_stream_mod = self.single_stream_modulation(temb)[0]
 
+        _save("input_hidden_states", hidden_states)
         hidden_states = self.x_embedder(hidden_states)
+        _save("after_x_embedder", hidden_states)
+
+        _save("input_encoder_hidden_states", encoder_hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+        _save("after_context_embedder", encoder_hidden_states)
 
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
@@ -707,8 +723,12 @@ class Flux2Transformer2DModel(nn.Module):
                 image_rotary_emb=concat_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
+            if _save_this_step and index_block in (0, 3, 7):
+                _save(f"after_double_block_{index_block}_img", hidden_states)
+                _save(f"after_double_block_{index_block}_txt", encoder_hidden_states)
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        _save("after_double_stream_concat", hidden_states)
 
         for index_block, block in enumerate(self.single_transformer_blocks):
             hidden_states = block(
@@ -718,10 +738,14 @@ class Flux2Transformer2DModel(nn.Module):
                 image_rotary_emb=concat_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
+            if _save_this_step and index_block in (0, 23, 47):
+                _save(f"after_single_block_{index_block}", hidden_states)
 
         hidden_states = hidden_states[:, num_txt_tokens:, ...]
         hidden_states = self.norm_out(hidden_states, temb)
+        _save("after_norm_out", hidden_states)
         output = self.proj_out(hidden_states)
+        _save("output", output)
 
         if not return_dict:
             return (output,)

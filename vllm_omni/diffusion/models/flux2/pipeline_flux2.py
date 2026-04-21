@@ -1027,28 +1027,53 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
         width = width or self.default_sample_size * self.vae_scale_factor
 
         # 5. prepare latent variables
+        import os
+        _debug_dir = os.environ.get("FLUX2_DEBUG_DIR")
+        if _debug_dir:
+            os.makedirs(_debug_dir, exist_ok=True)
+
         num_channels_latents = self.transformer.config.in_channels // 4
-        latents, latent_ids = self.prepare_latents(
-            batch_size=batch_size * num_images_per_prompt,
-            num_latents_channels=num_channels_latents,
-            height=height,
-            width=width,
-            dtype=prompt_embeds.dtype,
-            device=device,
-            generator=generator,
-            latents=latents,
-        )
+        _latents_path = os.path.join(_debug_dir, "initial_latents.pt") if _debug_dir else None
+        if _latents_path and os.path.exists(_latents_path):
+            saved = torch.load(_latents_path, map_location=device, weights_only=True)
+            latents = saved["latents"].to(dtype=prompt_embeds.dtype)
+            latent_ids = saved["latent_ids"].to(device=device)
+            logger.info("Loaded initial latents from %s", _latents_path)
+        else:
+            latents, latent_ids = self.prepare_latents(
+                batch_size=batch_size * num_images_per_prompt,
+                num_latents_channels=num_channels_latents,
+                height=height,
+                width=width,
+                dtype=prompt_embeds.dtype,
+                device=device,
+                generator=generator,
+                latents=latents,
+            )
+            if _debug_dir:
+                torch.save({"latents": latents.cpu(), "latent_ids": latent_ids.cpu()}, _latents_path)
+                logger.info("Saved initial latents to %s", _latents_path)
 
         image_latents = None
         image_latent_ids = None
         if condition_images is not None:
-            image_latents, image_latent_ids = self.prepare_image_latents(
-                images=condition_images,
-                batch_size=batch_size * num_images_per_prompt,
-                generator=generator,
-                device=device,
-                dtype=self.vae.dtype,
-            )
+            _img_latents_path = os.path.join(_debug_dir, "initial_image_latents.pt") if _debug_dir else None
+            if _img_latents_path and os.path.exists(_img_latents_path):
+                saved = torch.load(_img_latents_path, map_location=device, weights_only=True)
+                image_latents = saved["image_latents"].to(dtype=self.vae.dtype)
+                image_latent_ids = saved["image_latent_ids"].to(device=device)
+                logger.info("Loaded initial image latents from %s", _img_latents_path)
+            else:
+                image_latents, image_latent_ids = self.prepare_image_latents(
+                    images=condition_images,
+                    batch_size=batch_size * num_images_per_prompt,
+                    generator=generator,
+                    device=device,
+                    dtype=self.vae.dtype,
+                )
+                if _debug_dir:
+                    torch.save({"image_latents": image_latents.cpu(), "image_latent_ids": image_latent_ids.cpu()}, _img_latents_path)
+                    logger.info("Saved initial image latents to %s", _img_latents_path)
 
         # 6. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
