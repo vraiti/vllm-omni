@@ -226,7 +226,9 @@ class StageDiffusionClient:
                 # Route request errors as error outputs so the Orchestrator
                 # sees the request complete (instead of hanging forever).
                 if req_id is not None:
-                    self._output_queue.put_nowait(OmniRequestOutput.from_error(req_id, error_msg))
+                    self._output_queue.put_nowait(OmniRequestOutput.from_error(
+                        req_id, error_msg, error_type=msg.get("error_type"),
+                    ))
 
     # Fields that are subprocess-local and cannot be serialized across
     # process boundaries.  They are recreated in the subprocess with

@@ -102,18 +102,21 @@ class OmniRequestOutput:
 
     # Error information -- set when the output represents a failed request.
     error: str | None = None
+    error_type: str | None = None
 
     @classmethod
     def from_error(
         cls,
         request_id: str,
         error: str,
+        error_type: str | None = None,
     ) -> "OmniRequestOutput":
         """Create an error output for a request that failed during generation."""
         return cls(
             request_id=request_id,
             finished=True,
             error=error,
+            error_type=error_type,
         )
 
     @classmethod

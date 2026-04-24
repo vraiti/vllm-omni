@@ -15,6 +15,7 @@ from PIL import Image
 from pydantic import TypeAdapter
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.omni_base import OmniInputValidationError
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
@@ -451,6 +452,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request_metadata,
                 reasoning_parser,
             )
+        except OmniInputValidationError as e:
+            return self.create_error_response(e)
         except ValueError as e:
             return self.create_error_response(e)
 

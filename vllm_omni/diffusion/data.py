@@ -796,6 +796,7 @@ class DiffusionOutput:
     trajectory_log_probs: torch.Tensor | dict | None = None
     trajectory_decoded: list[Image.Image] | None = None
     error: str | None = None
+    error_type: str | None = None
     aborted: bool = False
     abort_message: str | None = None
 
