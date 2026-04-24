@@ -17,6 +17,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus import 
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered import (
     QwenImageLayeredPipeline,
 )
+from vllm_omni.exceptions import OmniInputValidationError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -258,3 +259,49 @@ def test_qwen_edit_validator_excludes_image_placeholders_from_budget(pipeline_cl
 )
 def test_forward_max_sequence_length_default_is_1024(pipeline_class: type):
     assert inspect.signature(pipeline_class.forward).parameters["max_sequence_length"].default == 1024
+
+
+def test_forward_caps_max_sequence_length_with_max_multimodal_text_tokens():
+    pipeline = object.__new__(QwenImageEditPlusPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.text_encoder = _RejectingTextEncoder()
+    pipeline.tokenizer_max_length = 1024
+    pipeline.prompt_template_encode = "{}"
+    pipeline.prompt_template_encode_start_idx = 64
+    pipeline.tokenizer = _FakeTokenizer([17, 0])
+    pipeline.processor = _FakeProcessor(17)
+    pipeline.vae_scale_factor = 8
+    pipeline.od_config = SimpleNamespace(max_multimodal_text_tokens=16, max_multimodal_image_inputs=None)
+    pipeline.check_cfg_parallel_validity = lambda *_args: True
+
+    req = SimpleNamespace(
+        prompts=[
+            {
+                "prompt": "a long prompt",
+                "additional_information": {
+                    "condition_images": [],
+                    "vae_images": [],
+                    "condition_image_sizes": [],
+                    "vae_image_sizes": [],
+                    "calculated_height": 1024,
+                    "calculated_width": 1024,
+                },
+            }
+        ],
+        sampling_params=SimpleNamespace(
+            height=1024,
+            width=1024,
+            num_inference_steps=1,
+            sigmas=None,
+            max_sequence_length=None,
+            generator=None,
+            true_cfg_scale=1.0,
+            guidance_scale_provided=False,
+            guidance_scale=1.0,
+            num_outputs_per_prompt=0,
+        ),
+    )
+
+    with pytest.raises(OmniInputValidationError, match=r"got 17 tokens"):
+        pipeline.forward(req)

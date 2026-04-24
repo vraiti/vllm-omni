@@ -496,6 +496,8 @@ class OmniDiffusionConfig:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
 
+    max_multimodal_text_tokens: int | None = None
+
     log_level: str = "info"
 
     # Omni configuration (injected from stage config)
@@ -686,9 +688,14 @@ class OmniDiffusionConfig:
     def update_multimodal_support(self) -> None:
         # Resolve serving-visible multimodal behavior from shared metadata
         # instead of importing concrete pipeline modules into the config layer.
+        # User-supplied values (from stage config) take precedence over
+        # model defaults.
         metadata = get_diffusion_model_metadata(self.model_class_name)
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
-        self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
+        if self.max_multimodal_image_inputs is None:
+            self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
+        if self.max_multimodal_text_tokens is None:
+            self.max_multimodal_text_tokens = metadata.max_multimodal_text_tokens
 
     def enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate config fields.
@@ -796,6 +803,7 @@ class DiffusionOutput:
     trajectory_log_probs: torch.Tensor | dict | None = None
     trajectory_decoded: list[Image.Image] | None = None
     error: str | None = None
+    error_type: str | None = None
     aborted: bool = False
     abort_message: str | None = None
 

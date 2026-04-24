@@ -88,6 +88,8 @@ from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.entrypoints.omni_base import OmniInputValidationError
+
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -1557,6 +1559,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniInputValidationError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -1794,6 +1798,8 @@ async def edit_images(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniInputValidationError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -1851,6 +1857,17 @@ def _get_diffusion_od_config(raw_request: Request, engine_client: Any) -> Any:
     )
 
 
+def _get_int_limit(od_config: Any, attr: str) -> int | None:
+    value = getattr(od_config, attr, None)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        return None
+    if value < 1:
+        return None
+    return int(value)
+
+
 def _get_max_edit_input_images(raw_request: Request, engine_client: Any) -> int | None:
     od_config = _get_diffusion_od_config(raw_request, engine_client)
     if od_config is None:
@@ -1868,14 +1885,14 @@ def _get_max_edit_input_images(raw_request: Request, engine_client: Any) -> int 
     if not supports_multimodal_inputs:
         return 1
 
-    max_input_images = getattr(od_config, "max_multimodal_image_inputs", None)
-    if max_input_images is None:
+    return _get_int_limit(od_config, "max_multimodal_image_inputs")
+
+
+def _get_max_multimodal_text_tokens(raw_request: Request, engine_client: Any) -> int | None:
+    od_config = _get_diffusion_od_config(raw_request, engine_client)
+    if od_config is None:
         return None
-    if isinstance(max_input_images, bool) or not isinstance(max_input_images, Integral):
-        return None
-    if max_input_images < 1:
-        return None
-    return int(max_input_images)
+    return _get_int_limit(od_config, "max_multimodal_text_tokens")
 
 
 def _get_lora_from_json_str(lora_body):

@@ -367,7 +367,7 @@ class DiffusionEngine:
                         req_id=sched_req_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput(error=str(exc), error_type=type(exc).__name__),
                     )
 
                 self._process_aborts_queue()

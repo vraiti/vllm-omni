@@ -341,6 +341,7 @@ class StageDiffusionProc:
                             "type": "error",
                             "request_id": request_id,
                             "error": str(e),
+                            "error_type": type(e).__name__,
                         }
                     )
                 )
@@ -396,6 +397,7 @@ class StageDiffusionProc:
                                         "type": "error",
                                         "request_id": rid,
                                         "error": str(e),
+                                        "error_type": type(e).__name__,
                                     }
                                 )
                             )

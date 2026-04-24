@@ -40,6 +40,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
 )
+from vllm_omni.exceptions import OmniInputValidationError
 from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
@@ -83,11 +84,11 @@ def get_qwen_image_edit_pre_process_func(
 
             # Only handles single image
             if not raw_image:  # None or empty list
-                raise ValueError("""Received no input image. This model requires one input image to run.""")
+                raise OmniInputValidationError("Received no input image. This model requires one input image to run.")
             elif isinstance(raw_image, list):
                 if len(raw_image) > 1:
-                    raise ValueError(
-                        """Received multiple input images. Only a single image is supported by this model."""
+                    raise OmniInputValidationError(
+                        "Received multiple input images. Only a single image is supported by this model."
                     )
                 else:
                     raw_image = raw_image[0]

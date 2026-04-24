@@ -10,15 +10,33 @@ class DiffusionModelMetadata:
     # config/model plumbing can read it without importing concrete pipelines.
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    max_multimodal_text_tokens: int | None = None
 
 
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "Flux2Pipeline": DiffusionModelMetadata(
+        max_multimodal_text_tokens=512,
+    ),
+    "QwenImagePipeline": DiffusionModelMetadata(
+        max_multimodal_text_tokens=1024,
+    ),
+    "QwenImageLayeredPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        max_multimodal_text_tokens=1024,
+    ),
+    "QwenImageEditPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        max_multimodal_text_tokens=1024,
+    ),
     "QwenImageEditPlusPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
+        max_multimodal_text_tokens=1024,
     ),
 }
 

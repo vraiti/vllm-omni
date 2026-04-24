@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+from vllm_omni.exceptions import OmniInputValidationError  # noqa: F401
+
+
 class OmniEngineDeadError(EngineDeadError):
     _DEFAULT_MESSAGE = EngineDeadError().args[0]
     error_stage_id: int | None
@@ -356,14 +359,17 @@ class OmniBase(PDDisaggregationMixin):
     ) -> None:
         """Raise if ``engine_outputs`` carries an error field.
 
-        Raises :class:`EngineDeadError` when ``self.errored`` indicates the
-        engine is unrecoverable, otherwise raises :class:`EngineGenerateError`
-        (recoverable, single-request failure).
+        Raises :class:`OmniEngineDeadError` when the engine is
+        unrecoverable, :class:`OmniInputValidationError` when the
+        original exception was explicitly marked as an input-validation
+        error (so the API layer can return 400), and
+        :class:`EngineGenerateError` otherwise.
         """
         engine_outputs = result.get("engine_outputs")
         error_text = getattr(engine_outputs, "error", None)
         if error_text is None:
             return
+        error_type = getattr(engine_outputs, "error_type", None)
         logger.error(
             "[%s] Stage error for req=%s stage-%s: %s",
             self.__class__.__name__,
@@ -377,6 +383,8 @@ class OmniBase(PDDisaggregationMixin):
                 error_text,
                 error_stage_id=stage_id,
             )
+        if error_type == "OmniInputValidationError":
+            raise OmniInputValidationError(error_text)
         raise EngineGenerateError(error_text)
 
     def _process_single_result(

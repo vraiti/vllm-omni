@@ -44,6 +44,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
 )
+from vllm_omni.exceptions import OmniInputValidationError
 from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
@@ -100,10 +101,11 @@ def get_qwen_image_edit_plus_pre_process_func(
 
             if not isinstance(raw_image, list):
                 raw_image = [raw_image]
-            if len(raw_image) > MAX_QWEN_IMAGE_EDIT_PLUS_INPUT_IMAGES:
-                raise ValueError(
+            max_images = od_config.max_multimodal_image_inputs if od_config.max_multimodal_image_inputs is not None else MAX_QWEN_IMAGE_EDIT_PLUS_INPUT_IMAGES
+            if len(raw_image) > max_images:
+                raise OmniInputValidationError(
                     f"Received {len(raw_image)} input images. "
-                    f"At most {MAX_QWEN_IMAGE_EDIT_PLUS_INPUT_IMAGES} images are supported by this model."
+                    f"At most {max_images} images are supported by this model."
                 )
             image = [
                 PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
@@ -677,6 +679,8 @@ class QwenImageEditPlusPipeline(
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        if self.od_config.max_multimodal_text_tokens is not None:
+            max_sequence_length = min(max_sequence_length, self.od_config.max_multimodal_text_tokens)
         generator = req.sampling_params.generator or generator
         true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
         if req.sampling_params.guidance_scale_provided:
@@ -726,25 +730,31 @@ class QwenImageEditPlusPipeline(
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
         self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
 
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
-            prompt=prompt,
-            image=condition_images,  # Use condition images for prompt encoding
-            prompt_embeds=prompt_embeds,
-            prompt_embeds_mask=prompt_embeds_mask,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
-        )
-
-        if do_true_cfg:
-            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-                prompt=negative_prompt,
-                image=condition_images,  # Use same condition images for negative prompt encoding
-                prompt_embeds=negative_prompt_embeds,
-                prompt_embeds_mask=negative_prompt_embeds_mask,
+        try:
+            prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+                prompt=prompt,
+                image=condition_images,  # Use condition images for prompt encoding
+                prompt_embeds=prompt_embeds,
+                prompt_embeds_mask=prompt_embeds_mask,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
-                prompt_name="negative_prompt",
             )
+        except ValueError as exc:
+            raise OmniInputValidationError(str(exc)) from exc
+
+        if do_true_cfg:
+            try:
+                negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                    prompt=negative_prompt,
+                    image=condition_images,  # Use same condition images for negative prompt encoding
+                    prompt_embeds=negative_prompt_embeds,
+                    prompt_embeds_mask=negative_prompt_embeds_mask,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                    prompt_name="negative_prompt",
+                )
+            except ValueError as exc:
+                raise OmniInputValidationError(str(exc)) from exc
 
         num_channels_latents = self.transformer.in_channels // 4
         # random noise latents, and image latents encoded by vae

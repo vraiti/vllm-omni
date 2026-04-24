@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.exceptions import OmniInputValidationError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.getLogger(__name__)
@@ -67,15 +68,17 @@ class Flux2ImageProcessor(VaeImageProcessor):
         max_area: int = 1024 * 1024,
     ) -> PIL.Image.Image:
         if not isinstance(image, PIL.Image.Image):
-            raise ValueError(f"Image must be a PIL.Image.Image, got {type(image)}")
+            raise OmniInputValidationError(f"Image must be a PIL.Image.Image, got {type(image)}")
 
         width, height = image.size
         if width < min_side_length or height < min_side_length:
-            raise ValueError(f"Image too small: {width}x{height}. Both dimensions must be at least {min_side_length}px")
+            raise OmniInputValidationError(
+                f"Image too small: {width}x{height}. Both dimensions must be at least {min_side_length}px"
+            )
 
         aspect_ratio = max(width / height, height / width)
         if aspect_ratio > max_aspect_ratio:
-            raise ValueError(
+            raise OmniInputValidationError(
                 f"Aspect ratio too extreme: {width}x{height} (ratio: {aspect_ratio:.1f}:1). "
                 f"Maximum allowed ratio is {max_aspect_ratio}:1"
             )

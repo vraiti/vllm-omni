@@ -123,6 +123,7 @@ class InlineStageDiffusionClient:
                 images=[],
             )
             error_output.error = str(e)
+            error_output.error_type = type(e).__name__
             self._output_queue.put_nowait(error_output)
         finally:
             self._tasks.pop(request_id, None)
@@ -223,6 +224,7 @@ class InlineStageDiffusionClient:
                 images=[],
             )
             error_output.error = str(e)
+            error_output.error_type = type(e).__name__
             self._output_queue.put_nowait(error_output)
         finally:
             self._tasks.pop(request_id, None)
