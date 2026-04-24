@@ -62,7 +62,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
-from vllm.entrypoints.utils import should_include_usage
+from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
@@ -390,6 +390,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
+
+                # Reject prompts that exceed the AR stage's max_model_len
+                # before dispatching to the engine (mirrors upstream vLLM).
+                max_model_len = self.model_config.max_model_len
+                prompt_len = self._extract_prompt_len(engine_prompt)
+                max_tokens = get_max_tokens(
+                    max_model_len,
+                    request.max_completion_tokens
+                    if request.max_completion_tokens is not None
+                    else request.max_tokens,
+                    prompt_len,
+                    self.default_sampling_params,
+                    self.override_max_tokens,
+                )
+                if sampling_params_list and isinstance(sampling_params_list[0], SamplingParams):
+                    sampling_params_list[0].max_tokens = max_tokens
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
