@@ -17,6 +17,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
+from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -167,6 +168,7 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
+        self.prom_metrics = OmniPrometheusMetrics(model_name=model)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
@@ -255,6 +257,8 @@ class OmniBase(PDDisaggregationMixin):
         try:
             if req_state is None or req_state.metrics is None:
                 return
+            if str(request_id) not in req_state.metrics.e2e_done:
+                self.prom_metrics.request_failed()
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",
@@ -263,6 +267,13 @@ class OmniBase(PDDisaggregationMixin):
             )
         finally:
             self.request_states.pop(request_id, None)
+            self._update_request_gauges()
+
+    def _update_request_gauges(self) -> None:
+        total = len(self.request_states)
+        running = self.engine._running_counter.value
+        self.prom_metrics.set_running(running)
+        self.prom_metrics.set_waiting(max(0, total - running))
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
@@ -429,6 +440,17 @@ class OmniBase(PDDisaggregationMixin):
                     req_id,
                     req_start_ts.get(req_id, wall_start_ts),
                 )
+                e2e_rec = metrics.e2e_events[-1] if metrics.e2e_events else None
+                e2e_seconds = e2e_rec.e2e_total_ms / 1000.0 if e2e_rec else None
+                queue_seconds = None
+                stage_evts = metrics.stage_events.get(rid_key, [])
+                for evt in stage_evts:
+                    pt = evt.pipeline_timings
+                    if pt and "queue_wait_ms" in pt:
+                        queue_seconds = pt["queue_wait_ms"] / 1000.0
+                        break
+                if e2e_seconds is not None:
+                    self.prom_metrics.request_succeeded(e2e_seconds, queue_seconds)
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 

@@ -30,6 +30,7 @@ from vllm_omni.engine import (
 )
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
@@ -148,6 +149,7 @@ class Orchestrator:
         *,
         async_chunk: bool = False,
         pd_config: dict[str, Any] | None = None,
+        running_counter: OmniRequestCounter | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -172,6 +174,7 @@ class Orchestrator:
 
         # Per-request state
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        self._running_counter = running_counter
 
         # CFG companion tracking
         self._cfg_tracker = CfgCompanionTracker()
@@ -186,6 +189,15 @@ class Orchestrator:
         self._stages_shutdown = False
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
+
+    def _track_request(self, request_id: str, state: OrchestratorRequestState) -> None:
+        self.request_states[request_id] = state
+        if self._running_counter is not None:
+            self._running_counter.increment()
+
+    def _remove_request(self, request_id: str) -> None:
+        if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
+            self._running_counter.decrement()
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -296,7 +308,7 @@ class Orchestrator:
                                     "finished": True,
                                 }
                             )
-                            self.request_states.pop(output.request_id, None)
+                            self._remove_request(output.request_id)
                             continue
 
                         req_state = self.request_states.get(output.request_id)
@@ -313,9 +325,9 @@ class Orchestrator:
                                 )
                                 role_map = self._companion_map.get(parent_id, {})
                                 for cid in role_map.values():
-                                    self.request_states.pop(cid, None)
+                                    self._remove_request(cid)
                                 self._cleanup_companion_state(parent_id)
-                                self.request_states.pop(parent_id, None)
+                                self._remove_request(parent_id)
                                 continue
 
                             stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
@@ -348,7 +360,7 @@ class Orchestrator:
                                     "stage_id": stage_id,
                                 }
                             )
-                            self.request_states.pop(req_id, None)
+                            self._remove_request(req_id)
                     self._shutdown_event.set()
                     raise
                 except Exception:
@@ -413,7 +425,7 @@ class Orchestrator:
         # and don't forward to the next stage directly.
         if finished and self._cfg_tracker.is_companion(req_id):
             await self._handle_cfg_companion_ready(req_id)
-            self.request_states.pop(req_id, None)
+            self._remove_request(req_id)
             return
 
         if stage_client.final_output:
@@ -492,7 +504,7 @@ class Orchestrator:
             # PD: clean up any lingering KV params for this request
             self._pd_kv_params.pop(req_id, None)
             self._cfg_tracker.cleanup_parent(req_id)
-            self.request_states.pop(req_id, None)
+            self._remove_request(req_id)
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
@@ -719,7 +731,7 @@ class Orchestrator:
                         )
                         self._pd_kv_params.pop(req_id, None)
                         self._cfg_tracker.cleanup_parent(req_id)
-                        self.request_states.pop(req_id, None)
+                        self._remove_request(req_id)
                         return
                     diffusion_prompt = diffusion_prompt[0]
             else:
@@ -925,7 +937,7 @@ class Orchestrator:
         if _preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = _preprocess_ms
 
-        self.request_states[request_id] = req_state
+        self._track_request(request_id, req_state)
 
         # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest
         # (pre-processed by AsyncOmniEngine.add_request, output processor
@@ -1063,7 +1075,7 @@ class Orchestrator:
             final_stage_id=0,
         )
         companion_state.stage_submit_ts[0] = _time.time()
-        self.request_states[companion_id] = companion_state
+        self._track_request(companion_id, companion_state)
 
         request = companion_prompt  # Already a processed OmniEngineCoreRequest
         stage_client = self.stage_clients[0]
@@ -1083,7 +1095,7 @@ class Orchestrator:
         for stage_id in range(self.num_stages):
             await self.stage_clients[stage_id].abort_requests_async(all_ids_to_abort)
         for req_id in all_ids_to_abort:
-            self.request_states.pop(req_id, None)
+            self._remove_request(req_id)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
 
     async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
@@ -1198,7 +1210,7 @@ class Orchestrator:
                         "stage_id": self._fatal_error_stage_id,
                     }
                 )
-            self.request_states.pop(req_id, None)
+            self._remove_request(req_id)
 
     def _shutdown_stages(self) -> None:
         """Shutdown all stage clients."""

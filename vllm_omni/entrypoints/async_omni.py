@@ -303,6 +303,7 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
+            self._update_request_gauges()
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
@@ -680,7 +681,9 @@ class AsyncOmni(EngineClient, OmniBase):
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         await self.engine.abort_async(request_ids)
         for req_id in request_ids:
-            self.request_states.pop(req_id, None)
+            if self.request_states.pop(req_id, None) is not None:
+                self.prom_metrics.request_failed()
+        self._update_request_gauges()
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
