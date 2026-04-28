@@ -1,4 +1,3 @@
-import threading
 from dataclasses import dataclass
 
 from prometheus_client import Counter, Gauge, Histogram
@@ -86,21 +85,13 @@ class OmniPrometheusMetrics:
 
 
 class OmniRequestCounter:
-    """Thread-safe counter shared between the client and orchestrator threads."""
+    """Running-request counter written by the orchestrator thread, read by the client thread."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._value = 0
+        self.value = 0
 
     def increment(self) -> None:
-        with self._lock:
-            self._value += 1
+        self.value += 1
 
     def decrement(self) -> None:
-        with self._lock:
-            self._value = max(0, self._value - 1)
-
-    @property
-    def value(self) -> int:
-        with self._lock:
-            return self._value
+        self.value = max(0, self.value - 1)
