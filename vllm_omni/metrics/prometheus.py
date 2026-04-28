@@ -11,60 +11,53 @@ _stage_labelnames = ["model_name", "stage_id"]
 class StagePrometheusStats:
     kv_cache_usage: float = 0.0
 
-_num_requests_running = Gauge(
-    "vllm_omni:num_requests_running",
-    "Number of requests currently running across all pipeline stages.",
-    labelnames=_labelnames,
-)
-
-_num_requests_waiting = Gauge(
-    "vllm_omni:num_requests_waiting",
-    "Number of requests waiting to be scheduled.",
-    labelnames=_labelnames,
-)
-
-_num_requests_success = Counter(
-    "vllm_omni:num_requests_success",
-    "Number of requests that completed without error.",
-    labelnames=_labelnames,
-)
-
-_num_requests_fail = Counter(
-    "vllm_omni:num_requests_fail",
-    "Number of requests that returned an error.",
-    labelnames=_labelnames,
-)
-
-_e2e_request_latency_seconds = Histogram(
-    "vllm_omni:e2e_request_latency_seconds",
-    "Histogram of end-to-end request latency in seconds.",
-    labelnames=_labelnames,
-)
-
-_request_queue_time_seconds = Histogram(
-    "vllm_omni:request_queue_time_seconds",
-    "Histogram of request queue wait time in seconds.",
-    labelnames=_labelnames,
-)
-
-_kv_cache_usage_percent = Gauge(
-    "vllm_omni:kv_cache_usage_percent",
-    "Fraction of KV cache blocks currently in use, per pipeline stage.",
-    labelnames=_stage_labelnames,
-)
-
 
 class OmniPrometheusMetrics:
-    """Label-bound wrapper around the raw Prometheus metrics."""
+    """Label-bound wrapper around the raw Prometheus metrics.
+
+    Metric collectors are registered here (not at module level) so that
+    upstream vLLM's ``unregister_vllm_metrics()`` — which strips every
+    collector whose ``_name`` contains ``"vllm"`` — has already run
+    before these are created.
+    """
 
     def __init__(self, model_name: str) -> None:
         self._model_name = model_name
-        self._running = _num_requests_running.labels(model_name=model_name)
-        self._waiting = _num_requests_waiting.labels(model_name=model_name)
-        self._success = _num_requests_success.labels(model_name=model_name)
-        self._fail = _num_requests_fail.labels(model_name=model_name)
-        self._e2e_latency = _e2e_request_latency_seconds.labels(model_name=model_name)
-        self._queue_time = _request_queue_time_seconds.labels(model_name=model_name)
+        self._running = Gauge(
+            "vllm_omni:num_requests_running",
+            "Number of requests currently running across all pipeline stages.",
+            labelnames=_labelnames,
+        ).labels(model_name=model_name)
+        self._waiting = Gauge(
+            "vllm_omni:num_requests_waiting",
+            "Number of requests waiting to be scheduled.",
+            labelnames=_labelnames,
+        ).labels(model_name=model_name)
+        self._success = Counter(
+            "vllm_omni:num_requests_success",
+            "Number of requests that completed without error.",
+            labelnames=_labelnames,
+        ).labels(model_name=model_name)
+        self._fail = Counter(
+            "vllm_omni:num_requests_fail",
+            "Number of requests that returned an error.",
+            labelnames=_labelnames,
+        ).labels(model_name=model_name)
+        self._e2e_latency = Histogram(
+            "vllm_omni:e2e_request_latency_seconds",
+            "Histogram of end-to-end request latency in seconds.",
+            labelnames=_labelnames,
+        ).labels(model_name=model_name)
+        self._queue_time = Histogram(
+            "vllm_omni:request_queue_time_seconds",
+            "Histogram of request queue wait time in seconds.",
+            labelnames=_labelnames,
+        ).labels(model_name=model_name)
+        self._kv_cache_usage_parent = Gauge(
+            "vllm_omni:kv_cache_usage_percent",
+            "Fraction of KV cache blocks currently in use, per pipeline stage.",
+            labelnames=_stage_labelnames,
+        )
         self._kv_cache_by_stage: dict[int, Gauge] = {}
 
     def set_running(self, n: int) -> None:
@@ -85,7 +78,7 @@ class OmniPrometheusMetrics:
     def set_stage_stats(self, stage_id: int, stats: StagePrometheusStats) -> None:
         gauge = self._kv_cache_by_stage.get(stage_id)
         if gauge is None:
-            gauge = _kv_cache_usage_percent.labels(
+            gauge = self._kv_cache_usage_parent.labels(
                 model_name=self._model_name, stage_id=str(stage_id),
             )
             self._kv_cache_by_stage[stage_id] = gauge

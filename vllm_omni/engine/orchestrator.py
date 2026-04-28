@@ -23,6 +23,8 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.metrics.loggers import PrometheusStatLogger
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.engine import (
@@ -179,6 +181,18 @@ class Orchestrator:
         self._running_counter = running_counter
         self._stage_prom_stats = stage_prom_stats or {}
         self._on_stage_stats_ref = on_stage_stats_ref
+
+        # Upstream vLLM stat logger for all 37 per-stage metrics.
+        vllm_config_for_stats = next(
+            (c for c in stage_vllm_configs if c is not None), None,
+        )
+        if vllm_config_for_stats is not None:
+            self._stat_logger: PrometheusStatLogger | None = PrometheusStatLogger(
+                vllm_config=vllm_config_for_stats,
+                engine_indexes=list(range(self.num_stages)),
+            )
+        else:
+            self._stat_logger = None
 
         # CFG companion tracking
         self._cfg_tracker = CfgCompanionTracker()
@@ -873,11 +887,12 @@ class Orchestrator:
         Also handles abort forwarding and scheduler stats updates.
         """
         processor = self.output_processors[stage_id]
+        iteration_stats = IterationStats() if self._stat_logger is not None else None
 
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            None,
+            iteration_stats,
         )
         for eco in raw_outputs.outputs:
             if not hasattr(eco, "request_id"):
@@ -899,6 +914,13 @@ class Orchestrator:
                 cb = self._on_stage_stats_ref[0]
                 if cb is not None:
                     cb(stage_id, raw_outputs.scheduler_stats.kv_cache_usage)
+
+        if self._stat_logger is not None:
+            self._stat_logger.record(
+                raw_outputs.scheduler_stats,
+                iteration_stats,
+                engine_idx=stage_id,
+            )
 
         return processed.request_outputs
 

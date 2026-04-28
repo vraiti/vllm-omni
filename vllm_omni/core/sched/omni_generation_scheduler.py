@@ -600,7 +600,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         stats = self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)
         if stats is None:
-            stats = SchedulerStats(kv_cache_usage=self.kv_cache_manager.usage)
+            stats = SchedulerStats(
+                kv_cache_usage=self.kv_cache_manager.usage,
+                num_running_reqs=len(self.running),
+                num_waiting_reqs=len(self.waiting),
+            )
         if (eco := next(iter(engine_core_outputs.values()), None)) is None:
             engine_core_outputs[0] = eco = EngineCoreOutputs()
         eco.scheduler_stats = stats
