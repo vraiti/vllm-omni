@@ -459,6 +459,10 @@ class OmniBase(PDDisaggregationMixin):
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
+        diffusion_metrics = getattr(engine_outputs, "metrics", None)
+        if finished and diffusion_metrics:
+            self.prom_metrics.observe_diffusion_metrics(stage_id, diffusion_metrics)
+
         images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
         return OmniRequestOutput(
             request_id=req_id or "",

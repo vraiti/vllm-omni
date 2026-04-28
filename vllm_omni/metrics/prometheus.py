@@ -5,6 +5,25 @@ from prometheus_client import Counter, Gauge, Histogram
 _labelnames = ["model_name"]
 _stage_labelnames = ["model_name", "stage_id"]
 
+_DIFFUSION_METRIC_DEFS: dict[str, tuple[str, str]] = {
+    "preprocess_time_ms": (
+        "vllm_omni:diffusion_preprocess_time_ms",
+        "Diffusion preprocess time per request in milliseconds.",
+    ),
+    "diffusion_engine_exec_time_ms": (
+        "vllm_omni:diffusion_exec_time_ms",
+        "Diffusion model execution time per request in milliseconds.",
+    ),
+    "postprocess_time_ms": (
+        "vllm_omni:diffusion_postprocess_time_ms",
+        "Diffusion postprocess time per request in milliseconds.",
+    ),
+    "diffusion_engine_total_time_ms": (
+        "vllm_omni:diffusion_step_time_ms",
+        "Total diffusion step time per request in milliseconds.",
+    ),
+}
+
 
 @dataclass
 class StagePrometheusStats:
@@ -58,6 +77,12 @@ class OmniPrometheusMetrics:
             labelnames=_stage_labelnames,
         )
         self._kv_cache_by_stage: dict[int, Gauge] = {}
+        self._diffusion_parents: dict[str, Histogram] = {}
+        for key, (metric_name, desc) in _DIFFUSION_METRIC_DEFS.items():
+            self._diffusion_parents[key] = Histogram(
+                metric_name, desc, labelnames=_stage_labelnames,
+            )
+        self._diffusion_by_stage: dict[tuple[str, int], Histogram] = {}
 
     def set_running(self, n: int) -> None:
         self._running.set(n)
@@ -82,6 +107,19 @@ class OmniPrometheusMetrics:
             )
             self._kv_cache_by_stage[stage_id] = gauge
         gauge.set(stats.kv_cache_usage)
+
+    def observe_diffusion_metrics(self, stage_id: int, metrics: dict[str, float]) -> None:
+        for key, parent in self._diffusion_parents.items():
+            value = metrics.get(key)
+            if value is None:
+                continue
+            bound = self._diffusion_by_stage.get((key, stage_id))
+            if bound is None:
+                bound = parent.labels(
+                    model_name=self._model_name, stage_id=str(stage_id),
+                )
+                self._diffusion_by_stage[(key, stage_id)] = bound
+            bound.observe(value)
 
 
 class OmniRequestCounter:
