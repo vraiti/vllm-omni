@@ -19,6 +19,7 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
 )
 from vllm.v1.metrics.perf import PerfStats
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -597,13 +598,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
             finished_req_ids.clear()
 
-        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
-            # Return stats to only one of the front-ends.
-            if (eco := next(iter(engine_core_outputs.values()), None)) is None:
-                # We must return the stats even if there are no request
-                # outputs this step.
-                engine_core_outputs[0] = eco = EngineCoreOutputs()
-            eco.scheduler_stats = stats
+        stats = self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)
+        if stats is None:
+            stats = SchedulerStats(kv_cache_usage=self.kv_cache_manager.usage)
+        if (eco := next(iter(engine_core_outputs.values()), None)) is None:
+            engine_core_outputs[0] = eco = EngineCoreOutputs()
+        eco.scheduler_stats = stats
 
         return engine_core_outputs
 
