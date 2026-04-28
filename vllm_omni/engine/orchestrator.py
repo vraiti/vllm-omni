@@ -30,7 +30,7 @@ from vllm_omni.engine import (
 )
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.metrics.prometheus import OmniRequestCounter, StagePrometheusStats
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
@@ -150,6 +150,7 @@ class Orchestrator:
         async_chunk: bool = False,
         pd_config: dict[str, Any] | None = None,
         running_counter: OmniRequestCounter | None = None,
+        stage_prom_stats: dict[int, StagePrometheusStats] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -175,6 +176,7 @@ class Orchestrator:
         # Per-request state
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._running_counter = running_counter
+        self._stage_prom_stats = stage_prom_stats or {}
 
         # CFG companion tracking
         self._cfg_tracker = CfgCompanionTracker()
@@ -888,6 +890,9 @@ class Orchestrator:
 
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)
+            sps = self._stage_prom_stats.get(stage_id)
+            if sps is not None:
+                sps.kv_cache_usage = raw_outputs.scheduler_stats.kv_cache_usage
 
         return processed.request_outputs
 

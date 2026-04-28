@@ -1,8 +1,15 @@
 import threading
+from dataclasses import dataclass
 
 from prometheus_client import Counter, Gauge, Histogram
 
 _labelnames = ["model_name"]
+_stage_labelnames = ["model_name", "stage_id"]
+
+
+@dataclass
+class StagePrometheusStats:
+    kv_cache_usage: float = 0.0
 
 _num_requests_running = Gauge(
     "vllm_omni:num_requests_running",
@@ -40,17 +47,25 @@ _request_queue_time_seconds = Histogram(
     labelnames=_labelnames,
 )
 
+_kv_cache_usage_percent = Gauge(
+    "vllm_omni:kv_cache_usage_percent",
+    "Fraction of KV cache blocks currently in use, per pipeline stage.",
+    labelnames=_stage_labelnames,
+)
+
 
 class OmniPrometheusMetrics:
     """Label-bound wrapper around the raw Prometheus metrics."""
 
     def __init__(self, model_name: str) -> None:
+        self._model_name = model_name
         self._running = _num_requests_running.labels(model_name=model_name)
         self._waiting = _num_requests_waiting.labels(model_name=model_name)
         self._success = _num_requests_success.labels(model_name=model_name)
         self._fail = _num_requests_fail.labels(model_name=model_name)
         self._e2e_latency = _e2e_request_latency_seconds.labels(model_name=model_name)
         self._queue_time = _request_queue_time_seconds.labels(model_name=model_name)
+        self._kv_cache_by_stage: dict[int, Gauge] = {}
 
     def set_running(self, n: int) -> None:
         self._running.set(n)
@@ -66,6 +81,15 @@ class OmniPrometheusMetrics:
 
     def request_failed(self) -> None:
         self._fail.inc()
+
+    def set_stage_stats(self, stage_id: int, stats: StagePrometheusStats) -> None:
+        gauge = self._kv_cache_by_stage.get(stage_id)
+        if gauge is None:
+            gauge = _kv_cache_usage_percent.labels(
+                model_name=self._model_name, stage_id=str(stage_id),
+            )
+            self._kv_cache_by_stage[stage_id] = gauge
+        gauge.set(stats.kv_cache_usage)
 
 
 class OmniRequestCounter:

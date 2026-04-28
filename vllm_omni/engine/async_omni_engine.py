@@ -45,7 +45,7 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.orchestrator import Orchestrator
-from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.metrics.prometheus import OmniRequestCounter, StagePrometheusStats
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
@@ -338,6 +338,9 @@ class AsyncOmniEngine:
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
         self._running_counter = OmniRequestCounter()
+        self._stage_prom_stats: dict[int, StagePrometheusStats] = {
+            i: StagePrometheusStats() for i in range(self.num_stages)
+        }
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -936,6 +939,7 @@ class AsyncOmniEngine:
                 stage_vllm_configs=self.stage_vllm_configs,
                 pd_config=pd_config,
                 running_counter=self._running_counter,
+                stage_prom_stats=self._stage_prom_stats,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

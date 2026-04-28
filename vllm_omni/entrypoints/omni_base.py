@@ -274,6 +274,8 @@ class OmniBase(PDDisaggregationMixin):
         running = self.engine._running_counter.value
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
+        for stage_id, stats in self.engine._stage_prom_stats.items():
+            self.prom_metrics.set_stage_stats(stage_id, stats)
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
