@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
@@ -341,6 +341,7 @@ class AsyncOmniEngine:
         self._stage_prom_stats: dict[int, StagePrometheusStats] = {
             i: StagePrometheusStats() for i in range(self.num_stages)
         }
+        self._on_stage_stats_ref: list[Callable[[int, float], None] | None] = [None]
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -940,6 +941,7 @@ class AsyncOmniEngine:
                 pd_config=pd_config,
                 running_counter=self._running_counter,
                 stage_prom_stats=self._stage_prom_stats,
+                on_stage_stats_ref=self._on_stage_stats_ref,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

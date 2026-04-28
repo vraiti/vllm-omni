@@ -151,6 +151,7 @@ class Orchestrator:
         pd_config: dict[str, Any] | None = None,
         running_counter: OmniRequestCounter | None = None,
         stage_prom_stats: dict[int, StagePrometheusStats] | None = None,
+        on_stage_stats_ref: list[Callable[[int, float], None] | None] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -177,6 +178,7 @@ class Orchestrator:
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._running_counter = running_counter
         self._stage_prom_stats = stage_prom_stats or {}
+        self._on_stage_stats_ref = on_stage_stats_ref
 
         # CFG companion tracking
         self._cfg_tracker = CfgCompanionTracker()
@@ -893,6 +895,10 @@ class Orchestrator:
             sps = self._stage_prom_stats.get(stage_id)
             if sps is not None:
                 sps.kv_cache_usage = raw_outputs.scheduler_stats.kv_cache_usage
+            if self._on_stage_stats_ref is not None:
+                cb = self._on_stage_stats_ref[0]
+                if cb is not None:
+                    cb(stage_id, raw_outputs.scheduler_stats.kv_cache_usage)
 
         return processed.request_outputs
 
