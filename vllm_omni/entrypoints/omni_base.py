@@ -17,7 +17,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
-from vllm_omni.metrics.prometheus import OmniPrometheusMetrics, StagePrometheusStats
+from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -169,9 +169,6 @@ class OmniBase(PDDisaggregationMixin):
 
         self.request_states: dict[str, ClientRequestState] = {}
         self.prom_metrics = OmniPrometheusMetrics(model_name=model)
-        self.engine._on_stage_stats_ref[0] = lambda stage_id, usage: (
-            self.prom_metrics.set_stage_stats(stage_id, StagePrometheusStats(kv_cache_usage=usage))
-        )
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
@@ -460,7 +457,7 @@ class OmniBase(PDDisaggregationMixin):
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
         diffusion_metrics = getattr(engine_outputs, "metrics", None)
-        if finished and diffusion_metrics:
+        if finished and isinstance(diffusion_metrics, dict) and diffusion_metrics:
             self.prom_metrics.observe_diffusion_metrics(stage_id, diffusion_metrics)
 
         images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
