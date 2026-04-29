@@ -24,7 +24,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.loggers import PrometheusStatLogger
-from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.engine import (
@@ -153,7 +152,6 @@ class Orchestrator:
         pd_config: dict[str, Any] | None = None,
         running_counter: OmniRequestCounter | None = None,
         stage_prom_stats: dict[int, StagePrometheusStats] | None = None,
-        on_stage_stats_ref: list[Callable[[int, float], None] | None] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -180,7 +178,6 @@ class Orchestrator:
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._running_counter = running_counter
         self._stage_prom_stats = stage_prom_stats or {}
-        self._on_stage_stats_ref = on_stage_stats_ref
 
         # Upstream vLLM stat logger for all 37 per-stage metrics.
         vllm_config_for_stats = next(
@@ -887,12 +884,11 @@ class Orchestrator:
         Also handles abort forwarding and scheduler stats updates.
         """
         processor = self.output_processors[stage_id]
-        iteration_stats = IterationStats() if self._stat_logger is not None else None
 
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            iteration_stats,
+            None,
         )
         for eco in raw_outputs.outputs:
             if not hasattr(eco, "request_id"):
@@ -910,15 +906,11 @@ class Orchestrator:
             sps = self._stage_prom_stats.get(stage_id)
             if sps is not None:
                 sps.kv_cache_usage = raw_outputs.scheduler_stats.kv_cache_usage
-            if self._on_stage_stats_ref is not None:
-                cb = self._on_stage_stats_ref[0]
-                if cb is not None:
-                    cb(stage_id, raw_outputs.scheduler_stats.kv_cache_usage)
 
         if self._stat_logger is not None:
             self._stat_logger.record(
                 raw_outputs.scheduler_stats,
-                iteration_stats,
+                None,
                 engine_idx=stage_id,
             )
 
