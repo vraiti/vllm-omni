@@ -24,6 +24,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.loggers import PrometheusStatLogger
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.engine import (
@@ -884,11 +885,12 @@ class Orchestrator:
         Also handles abort forwarding and scheduler stats updates.
         """
         processor = self.output_processors[stage_id]
+        iteration_stats = IterationStats() if self._stat_logger is not None else None
 
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            None,
+            iteration_stats,
         )
         for eco in raw_outputs.outputs:
             if not hasattr(eco, "request_id"):
@@ -910,7 +912,7 @@ class Orchestrator:
         if self._stat_logger is not None:
             self._stat_logger.record(
                 raw_outputs.scheduler_stats,
-                None,
+                iteration_stats,
                 engine_idx=stage_id,
             )
 

@@ -651,7 +651,7 @@ class AsyncOmniEngine:
                 )
             output_processor = MultimodalOutputProcessor(
                 tokenizer=tokenizer,
-                log_stats=False,
+                log_stats=True,
                 engine_core_output_type=started.metadata.engine_output_type,
             )
             input_processor = None
