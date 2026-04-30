@@ -33,13 +33,20 @@ class OmniSchedulerMixin:
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
 
-    def make_stats(self, *args, **kwargs) -> SchedulerStats:
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
         """Return minimal scheduler stats without expensive prefix cache traversal.
 
         Upstream ``Scheduler.make_stats()`` walks the prefix cache hash
         table on every call.  This override provides the fields that
         Prometheus and the stat logger need at near-zero cost.
+
+        Controlled by ``_enable_make_stats`` (set from the original
+        ``log_stats`` value in the concrete scheduler ``__init__``).
+        All other stats (IterationStats, RequestStateStats, event
+        recording) remain unconditionally enabled.
         """
+        if not getattr(self, "_enable_make_stats", True):
+            return None
         return SchedulerStats(
             kv_cache_usage=self.kv_cache_manager.usage,
             num_running_reqs=len(self.running),

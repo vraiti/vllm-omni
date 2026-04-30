@@ -35,6 +35,9 @@ logger = init_logger(__name__)
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._enable_make_stats = self.log_stats
+        self.log_stats = True
+
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):

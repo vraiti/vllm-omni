@@ -429,7 +429,7 @@ class AsyncOmniEngine:
                                 launch_omni_core_engines(
                                     vllm_config=vllm_config,
                                     executor_class=executor_class,
-                                    log_stats=True,
+                                    log_stats=False,
                                     omni_master_server=self._omni_master_server,
                                     stage_id=metadata.stage_id,
                                     stage_config=stage_cfg,
@@ -448,7 +448,7 @@ class AsyncOmniEngine:
                             addresses, proc, handshake_address = spawn_stage_core(
                                 vllm_config=vllm_config,
                                 executor_class=executor_class,
-                                log_stats=True,
+                                log_stats=False,
                             )
                             started_stage = StartedLlmStage(
                                 stage_id=metadata.stage_id,
@@ -651,7 +651,7 @@ class AsyncOmniEngine:
                 )
             output_processor = MultimodalOutputProcessor(
                 tokenizer=tokenizer,
-                log_stats=True,
+                log_stats=False,
                 engine_core_output_type=started.metadata.engine_output_type,
             )
             input_processor = None
