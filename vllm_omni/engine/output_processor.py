@@ -306,7 +306,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         """
         super().__init__(
             tokenizer=tokenizer,
-            log_stats=log_stats,
+            log_stats=True,
             stream_interval=stream_interval,
             tracing_enabled=tracing_enabled,
         )
