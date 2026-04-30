@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 
@@ -31,3 +32,16 @@ class OmniSchedulerMixin:
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def make_stats(self, *args, **kwargs) -> SchedulerStats:
+        """Return minimal scheduler stats without expensive prefix cache traversal.
+
+        Upstream ``Scheduler.make_stats()`` walks the prefix cache hash
+        table on every call.  This override provides the fields that
+        Prometheus and the stat logger need at near-zero cost.
+        """
+        return SchedulerStats(
+            kv_cache_usage=self.kv_cache_manager.usage,
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
+        )
