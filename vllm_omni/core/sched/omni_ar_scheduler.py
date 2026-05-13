@@ -273,12 +273,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         _n_reqs = len(num_scheduled_tokens)
         _n_sampled = len(sampled_token_ids) if sampled_token_ids is not None else 0
         if _n_reqs:
+            _sample_preview = "None"
+            if sampled_token_ids is not None and _n_sampled > 0:
+                _sample_preview = sampled_token_ids[:min(3, _n_sampled)]
+                if hasattr(_sample_preview, "tolist"):
+                    _sample_preview = _sample_preview.tolist()
             init_logger(__name__).info(
                 "[OmniARScheduler.update_from_output] reqs=%d sampled=%d "
                 "sampled_ids=%s",
-                _n_reqs, _n_sampled,
-                sampled_token_ids[:min(3, _n_sampled)].tolist()
-                if sampled_token_ids is not None and _n_sampled > 0 else "None",
+                _n_reqs, _n_sampled, _sample_preview,
             )
 
         perf_stats: PerfStats | None = None
