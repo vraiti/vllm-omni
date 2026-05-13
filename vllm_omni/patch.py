@@ -2,6 +2,7 @@ import logging
 import sys
 from functools import cached_property
 
+import vllm.v1.metrics.prometheus as _vllm_prometheus
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
@@ -136,8 +137,6 @@ for module_name, module in list(sys.modules.items()):
 # _STAT_LOGGER_METRIC_NAMES to vllm.v1.metrics.prometheus and scopes
 # unregister_vllm_metrics() to that set.  Track:
 # https://github.com/vllm-project/vllm/pull/42331
-import vllm.v1.metrics.prometheus as _vllm_prometheus
-
 _logger = logging.getLogger(__name__)
 
 
@@ -147,6 +146,5 @@ def _noop_unregister_vllm_metrics():
 
 _vllm_prometheus.unregister_vllm_metrics = _noop_unregister_vllm_metrics
 _logger.warning(
-    "Monkey-patched unregister_vllm_metrics() to a no-op. "
-    "Remove this patch once vLLM adds _STAT_LOGGER_METRIC_NAMES."
+    "Monkey-patched unregister_vllm_metrics() to a no-op. Remove this patch once vLLM adds _STAT_LOGGER_METRIC_NAMES."
 )
