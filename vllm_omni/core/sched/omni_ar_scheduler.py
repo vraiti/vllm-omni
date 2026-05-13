@@ -270,6 +270,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
 
+        _n_reqs = len(num_scheduled_tokens)
+        _n_sampled = len(sampled_token_ids) if sampled_token_ids is not None else 0
+        if _n_reqs:
+            init_logger(__name__).info(
+                "[OmniARScheduler.update_from_output] reqs=%d sampled=%d "
+                "sampled_ids=%s",
+                _n_reqs, _n_sampled,
+                sampled_token_ids[:min(3, _n_sampled)].tolist()
+                if sampled_token_ids is not None and _n_sampled > 0 else "None",
+            )
+
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
@@ -372,6 +383,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
+            if new_token_ids:
+                init_logger(__name__).info(
+                    "[OmniARScheduler.update_from_output] req=%s tokens=%s "
+                    "computed=%d status=%s",
+                    req_id, new_token_ids[:5], request.num_computed_tokens,
+                    request.status,
+                )
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
@@ -401,6 +419,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped = True
 
             if stopped:
+                init_logger(__name__).info(
+                    "[OmniARScheduler.update_from_output] STOPPED req=%s "
+                    "status=%s finished=%s",
+                    req_id, request.status, request.is_finished(),
+                )
                 routed_experts = self._get_routed_experts(request)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
