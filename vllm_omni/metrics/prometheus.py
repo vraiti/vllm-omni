@@ -5,50 +5,50 @@ _diffusion_labelnames = ["model_name", "engine"]
 
 _DIFFUSION_METRIC_DEFS: dict[str, tuple[str, str]] = {
     "preprocess_time_ms": (
-        "vllm:omni_diffusion_preprocess_time_ms",
+        "vllm_omni:diffusion_preprocess_time_ms",
         "Diffusion preprocess time per request in milliseconds.",
     ),
     "diffusion_engine_exec_time_ms": (
-        "vllm:omni_diffusion_exec_time_ms",
+        "vllm_omni:diffusion_exec_time_ms",
         "Diffusion model execution time per request in milliseconds.",
     ),
     "postprocess_time_ms": (
-        "vllm:omni_diffusion_postprocess_time_ms",
+        "vllm_omni:diffusion_postprocess_time_ms",
         "Diffusion postprocess time per request in milliseconds.",
     ),
     "diffusion_engine_total_time_ms": (
-        "vllm:omni_diffusion_step_time_ms",
+        "vllm_omni:diffusion_step_time_ms",
         "Total diffusion step time per request in milliseconds.",
     ),
 }
 
 _running_family = Gauge(
-    "vllm:omni_num_requests_running",
+    "vllm_omni:num_requests_running",
     "Number of requests currently running across all pipeline stages.",
     labelnames=_labelnames,
 )
 _waiting_family = Gauge(
-    "vllm:omni_num_requests_waiting",
+    "vllm_omni:num_requests_waiting",
     "Number of requests waiting to be scheduled.",
     labelnames=_labelnames,
 )
 _success_family = Counter(
-    "vllm:omni_num_requests_success",
+    "vllm_omni:num_requests_success",
     "Number of requests that completed without error.",
     labelnames=_labelnames,
 )
 _fail_family = Counter(
-    "vllm:omni_num_requests_fail",
+    "vllm_omni:num_requests_fail",
     "Number of requests that returned an error.",
     labelnames=_labelnames,
 )
 _e2e_latency_family = Histogram(
-    "vllm:omni_e2e_request_latency_seconds",
+    "vllm_omni:e2e_request_latency_seconds",
     "Histogram of end-to-end request latency in seconds.",
     labelnames=_labelnames,
 )
 _queue_time_family = Histogram(
-    "vllm:omni_request_queue_time_seconds",
+    "vllm_omni:request_queue_time_seconds",
     "Histogram of request queue wait time in seconds.",
     labelnames=_labelnames,
 )
@@ -61,7 +61,7 @@ _diffusion_families: dict[str, Histogram] = {
 class OmniPrometheusMetrics:
     """Label-bound wrapper around the raw Prometheus metrics.
 
-    Metric collectors use the ``vllm:omni_`` prefix to avoid being
+    Metric collectors use the ``vllm_omni:`` prefix to avoid being
     removed by upstream vLLM's ``unregister_vllm_metrics()``, which
     strips every collector whose ``_name`` contains ``"vllm"``.
     """

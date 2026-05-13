@@ -12,19 +12,19 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _MODEL = "test-model"
 
 _PIPELINE_METRICS = [
-    "vllm:omni_num_requests_running",
-    "vllm:omni_num_requests_waiting",
-    "vllm:omni_num_requests_success",
-    "vllm:omni_num_requests_fail",
-    "vllm:omni_e2e_request_latency_seconds",
-    "vllm:omni_request_queue_time_seconds",
+    "vllm_omni:num_requests_running",
+    "vllm_omni:num_requests_waiting",
+    "vllm_omni:num_requests_success",
+    "vllm_omni:num_requests_fail",
+    "vllm_omni:e2e_request_latency_seconds",
+    "vllm_omni:request_queue_time_seconds",
 ]
 
 _DIFFUSION_METRICS = [
-    "vllm:omni_diffusion_preprocess_time_ms",
-    "vllm:omni_diffusion_exec_time_ms",
-    "vllm:omni_diffusion_postprocess_time_ms",
-    "vllm:omni_diffusion_step_time_ms",
+    "vllm_omni:diffusion_preprocess_time_ms",
+    "vllm_omni:diffusion_exec_time_ms",
+    "vllm_omni:diffusion_postprocess_time_ms",
+    "vllm_omni:diffusion_step_time_ms",
 ]
 
 
@@ -72,39 +72,39 @@ class TestMetricObservation:
     def test_counter_values(self, scrape_output: str) -> None:
         success = _sample_value(
             scrape_output,
-            f'vllm:omni_num_requests_success_total{{model_name="{_MODEL}"}}',
+            f'vllm_omni:num_requests_success_total{{model_name="{_MODEL}"}}',
         )
         assert success == 2.0
 
         fail = _sample_value(
             scrape_output,
-            f'vllm:omni_num_requests_fail_total{{model_name="{_MODEL}"}}',
+            f'vllm_omni:num_requests_fail_total{{model_name="{_MODEL}"}}',
         )
         assert fail == 1.0
 
     def test_gauge_values(self, scrape_output: str) -> None:
         running = _sample_value(
             scrape_output,
-            f'vllm:omni_num_requests_running{{model_name="{_MODEL}"}}',
+            f'vllm_omni:num_requests_running{{model_name="{_MODEL}"}}',
         )
         assert running == 5.0
 
         waiting = _sample_value(
             scrape_output,
-            f'vllm:omni_num_requests_waiting{{model_name="{_MODEL}"}}',
+            f'vllm_omni:num_requests_waiting{{model_name="{_MODEL}"}}',
         )
         assert waiting == 2.0
 
     def test_histogram_counts(self, scrape_output: str) -> None:
         e2e_count = _sample_value(
             scrape_output,
-            f'vllm:omni_e2e_request_latency_seconds_count{{model_name="{_MODEL}"}}',
+            f'vllm_omni:e2e_request_latency_seconds_count{{model_name="{_MODEL}"}}',
         )
         assert e2e_count == 2.0
 
         queue_count = _sample_value(
             scrape_output,
-            f'vllm:omni_request_queue_time_seconds_count{{model_name="{_MODEL}"}}',
+            f'vllm_omni:request_queue_time_seconds_count{{model_name="{_MODEL}"}}',
         )
         assert queue_count == 2.0
 

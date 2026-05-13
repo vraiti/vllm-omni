@@ -39,7 +39,7 @@ vLLM-Omni runs multiple engine instances (stages) within a single
 process, coordinated by an Orchestrator. The pipeline needs its own
 metrics — aggregate request counts, end-to-end latency across all
 stages, and diffusion timing breakdowns — that do not exist in upstream
-vLLM. All pipeline-level metrics use the `vllm:omni_` prefix to
+vLLM. All pipeline-level metrics use the `vllm_omni:` prefix to
 distinguish them from upstream per-engine metrics. The
 `unregister_vllm_metrics()` function is monkey-patched to a no-op at
 import time (see `vllm_omni/patch.py`) so that these metrics are not
@@ -63,7 +63,7 @@ creates and feeds directly.
                                   |
                     +-------------+-------------+
                     |                           |
-          vllm:omni_* collectors      vllm:* collectors
+          vllm_omni:* collectors      vllm:* collectors
                     |                           |
         +-----------+-----------+      +--------+---------+
         | OmniPrometheusMetrics |      | PrometheusStatLogger |
@@ -79,7 +79,7 @@ creates and feeds directly.
 
 There are two independent paths for metric collection.
 
-**Path 1: Pipeline-level metrics (`vllm:omni_*`)**
+**Path 1: Pipeline-level metrics (`vllm_omni:*`)**
 
 `OmniPrometheusMetrics` registers Gauge, Counter, and Histogram
 collectors at init time. It is instantiated once per entrypoint,
@@ -124,7 +124,7 @@ passed to the Orchestrator at construction time.
 
 ### Metric Registration and Lifecycle
 
-All `vllm:omni_*` collectors are registered once when
+All `vllm_omni:*` collectors are registered once when
 `OmniPrometheusMetrics.__init__()` runs. Per-stage labels
 (`model_name`, `engine`) are bound lazily on first observation to
 avoid registering labels for stages that never produce data (e.g., a
@@ -132,7 +132,7 @@ diffusion pipeline has no AR stage stats).
 
 The `prometheus_client` default registry holds all collectors.
 FastAPI's `/metrics` endpoint serves the default registry, so both
-`vllm:omni_*` and `vllm:*` metrics appear in the same scrape
+`vllm_omni:*` and `vllm:*` metrics appear in the same scrape
 response alongside `http_*` and `process_*` metrics from the
 instrumentator and the Python client runtime.
 
@@ -157,21 +157,21 @@ eliminating the per-step overhead.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `vllm:omni_num_requests_running` | Gauge | `model_name` | Requests currently executing across all stages |
-| `vllm:omni_num_requests_waiting` | Gauge | `model_name` | Requests queued but not yet scheduled |
-| `vllm:omni_num_requests_success` | Counter | `model_name` | Requests completed without error |
-| `vllm:omni_num_requests_fail` | Counter | `model_name` | Requests that returned an error |
-| `vllm:omni_e2e_request_latency_seconds` | Histogram | `model_name` | End-to-end request latency across all stages |
-| `vllm:omni_request_queue_time_seconds` | Histogram | `model_name` | Time spent waiting in the request queue |
+| `vllm_omni:num_requests_running` | Gauge | `model_name` | Requests currently executing across all stages |
+| `vllm_omni:num_requests_waiting` | Gauge | `model_name` | Requests queued but not yet scheduled |
+| `vllm_omni:num_requests_success` | Counter | `model_name` | Requests completed without error |
+| `vllm_omni:num_requests_fail` | Counter | `model_name` | Requests that returned an error |
+| `vllm_omni:e2e_request_latency_seconds` | Histogram | `model_name` | End-to-end request latency across all stages |
+| `vllm_omni:request_queue_time_seconds` | Histogram | `model_name` | Time spent waiting in the request queue |
 
 ### Diffusion Stage-Level
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `vllm:omni_diffusion_preprocess_time_ms` | Histogram | `model_name`, `engine` | Diffusion input preprocessing time |
-| `vllm:omni_diffusion_exec_time_ms` | Histogram | `model_name`, `engine` | Diffusion model forward pass time |
-| `vllm:omni_diffusion_postprocess_time_ms` | Histogram | `model_name`, `engine` | Diffusion output postprocessing time |
-| `vllm:omni_diffusion_step_time_ms` | Histogram | `model_name`, `engine` | Total diffusion step time |
+| `vllm_omni:diffusion_preprocess_time_ms` | Histogram | `model_name`, `engine` | Diffusion input preprocessing time |
+| `vllm_omni:diffusion_exec_time_ms` | Histogram | `model_name`, `engine` | Diffusion model forward pass time |
+| `vllm_omni:diffusion_postprocess_time_ms` | Histogram | `model_name`, `engine` | Diffusion output postprocessing time |
+| `vllm_omni:diffusion_step_time_ms` | Histogram | `model_name`, `engine` | Total diffusion step time |
 
 ### LLM Stage-Level
 
