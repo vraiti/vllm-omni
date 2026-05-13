@@ -193,12 +193,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
+        _waiting_n = len(self.waiting)
+        _running_n = len(self.running)
         try:
             scheduler_output = super().schedule()
         finally:
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+
+        _new = len(scheduler_output.scheduled_new_reqs)
+        _total = scheduler_output.total_num_scheduled_tokens
+        if _new or _waiting_n or (_total and _running_n < 3):
+            init_logger(__name__).info(
+                "[OmniARScheduler.schedule] waiting=%d running=%d "
+                "scheduled_new=%d total_tokens=%d",
+                _waiting_n, _running_n, _new, _total,
+            )
+
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
