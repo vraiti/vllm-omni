@@ -679,12 +679,24 @@ class Orchestrator:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
-        if (
+        _should_fwd = (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
             and not self.async_chunk
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
-        ):
+        )
+        logger.info(
+            "[Orchestrator._route_output] forward_check req=%s finished=%s "
+            "stage<%d<final=%d async_chunk=%s already_submitted=%s "
+            "streaming=%s seg_finished=%s => should_fwd=%s",
+            req_id, finished, stage_id, req_state.final_stage_id,
+            self.async_chunk,
+            self._next_stage_already_submitted(stage_id, req_state),
+            req_state.streaming.enabled,
+            req_state.streaming.segment_finished,
+            _should_fwd,
+        )
+        if _should_fwd:
             if (
                 finished
                 and self._cfg_tracker.has_companions(req_id)
@@ -829,6 +841,12 @@ class Orchestrator:
         is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
+        logger.info(
+            "[Orchestrator._forward_to_next_stage] req=%s src=%d->%d "
+            "streaming=%s final_update=%s",
+            req_id, src_stage_id, src_stage_id + 1,
+            is_streaming_session, is_final_update,
+        )
         next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
         next_client = next_pool.stage_client
