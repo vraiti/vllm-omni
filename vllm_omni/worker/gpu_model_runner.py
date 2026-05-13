@@ -259,12 +259,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        if scheduler_output.scheduled_new_reqs:
-            logger.info(
-                "[OmniGPUModelRunner._update_states] new_reqs=%d total_tokens=%d",
-                len(scheduler_output.scheduled_new_reqs),
-                scheduler_output.total_num_scheduled_tokens,
-            )
         # Used for prefix cache
         if self.omni_prefix_cache is not None:
             self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
@@ -1191,15 +1185,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
-        if scheduler_output.scheduled_new_reqs or num_scheduled_tokens:
-            logger.info(
-                "[OmniGPUModelRunner._preprocess] scheduled=%d input=%d "
-                "new_reqs=%d encoder_inputs=%d is_enc_dec=%s mm=%s",
-                num_scheduled_tokens, num_input_tokens,
-                len(scheduler_output.scheduled_new_reqs),
-                len(scheduler_output.scheduled_encoder_inputs),
-                is_encoder_decoder, self.supports_mm_inputs,
-            )
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
@@ -1207,18 +1192,12 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
             # Run the multimodal encoder if any.
-            logger.info("[OmniGPUModelRunner._preprocess] entering MM path")
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
                 self._execute_mm_encoder(scheduler_output)
-                logger.info("[OmniGPUModelRunner._preprocess] _execute_mm_encoder done")
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
-                logger.info(
-                    "[OmniGPUModelRunner._preprocess] _gather_mm_embeddings done "
-                    "len=%d", len(mm_embeds) if mm_embeds else 0,
-                )
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
@@ -1228,7 +1207,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 multimodal_embeddings=mm_embeds,
                 is_multimodal=is_mm_embed,
             )
-            logger.info("[OmniGPUModelRunner._preprocess] embed_input_ids done")
 
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
@@ -1373,11 +1351,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             if self.has_talker_mtp:
                 self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
-        logger.info(
-            "[OmniGPUModelRunner._preprocess] done input_ids=%s embeds=%s",
-            input_ids.shape if input_ids is not None else None,
-            inputs_embeds.shape if inputs_embeds is not None else None,
-        )
         return (
             input_ids,
             inputs_embeds,

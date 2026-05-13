@@ -538,14 +538,6 @@ class Orchestrator:
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
-        if outputs:
-            logger.info(
-                "[Orchestrator._handle_processed_outputs] stage=%d replica=%d "
-                "n_outputs=%d first_req=%s first_finished=%s",
-                stage_id, replica_id, len(outputs),
-                getattr(outputs[0], "request_id", "?"),
-                getattr(outputs[0], "finished", "?"),
-            )
         pool = self.stage_pools[stage_id]
         for output in outputs:
             req_state = self.request_states.get(output.request_id)
@@ -635,15 +627,6 @@ class Orchestrator:
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
-        if finished or not hasattr(self, "_route_output_logged"):
-            logger.info(
-                "[Orchestrator._route_output] stage=%d req=%s finished=%s "
-                "final_stage=%d async_chunk=%s tokens=%d",
-                stage_id, req_id, finished, req_state.final_stage_id,
-                self.async_chunk,
-                len(getattr(output, "token_ids", []) or []),
-            )
-            self._route_output_logged = True
 
         if finished and self._cfg_tracker.is_companion(req_id):
             await self._handle_cfg_companion_ready(req_id)
@@ -679,24 +662,12 @@ class Orchestrator:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
-        _should_fwd = (
+        if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
             and not self.async_chunk
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
-        )
-        logger.info(
-            "[Orchestrator._route_output] forward_check req=%s finished=%s "
-            "stage<%d<final=%d async_chunk=%s already_submitted=%s "
-            "streaming=%s seg_finished=%s => should_fwd=%s",
-            req_id, finished, stage_id, req_state.final_stage_id,
-            self.async_chunk,
-            self._next_stage_already_submitted(stage_id, req_state),
-            req_state.streaming.enabled,
-            req_state.streaming.segment_finished,
-            _should_fwd,
-        )
-        if _should_fwd:
+        ):
             if (
                 finished
                 and self._cfg_tracker.has_companions(req_id)
@@ -841,12 +812,6 @@ class Orchestrator:
         is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
-        logger.info(
-            "[Orchestrator._forward_to_next_stage] req=%s src=%d->%d "
-            "streaming=%s final_update=%s",
-            req_id, src_stage_id, src_stage_id + 1,
-            is_streaming_session, is_final_update,
-        )
         next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
         next_client = next_pool.stage_client

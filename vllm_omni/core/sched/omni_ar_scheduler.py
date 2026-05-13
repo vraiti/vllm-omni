@@ -193,24 +193,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
-        _waiting_n = len(self.waiting)
-        _running_n = len(self.running)
         try:
             scheduler_output = super().schedule()
         finally:
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
-
-        _new = len(scheduler_output.scheduled_new_reqs)
-        _total = scheduler_output.total_num_scheduled_tokens
-        if _new or _waiting_n or (_total and _running_n < 3):
-            init_logger(__name__).info(
-                "[OmniARScheduler.schedule] waiting=%d running=%d "
-                "scheduled_new=%d total_tokens=%d",
-                _waiting_n, _running_n, _new, _total,
-            )
-
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
@@ -269,20 +257,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
-
-        _n_reqs = len(num_scheduled_tokens)
-        _n_sampled = len(sampled_token_ids) if sampled_token_ids is not None else 0
-        if _n_reqs:
-            _sample_preview = "None"
-            if sampled_token_ids is not None and _n_sampled > 0:
-                _sample_preview = sampled_token_ids[:min(3, _n_sampled)]
-                if hasattr(_sample_preview, "tolist"):
-                    _sample_preview = _sample_preview.tolist()
-            init_logger(__name__).info(
-                "[OmniARScheduler.update_from_output] reqs=%d sampled=%d "
-                "sampled_ids=%s",
-                _n_reqs, _n_sampled, _sample_preview,
-            )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -386,13 +360,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
-            if new_token_ids:
-                init_logger(__name__).info(
-                    "[OmniARScheduler.update_from_output] req=%s tokens=%s "
-                    "computed=%d status=%s",
-                    req_id, new_token_ids[:5], request.num_computed_tokens,
-                    request.status,
-                )
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
@@ -422,11 +389,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped = True
 
             if stopped:
-                init_logger(__name__).info(
-                    "[OmniARScheduler.update_from_output] STOPPED req=%s "
-                    "status=%s finished=%s",
-                    req_id, request.status, request.is_finished(),
-                )
                 routed_experts = self._get_routed_experts(request)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
