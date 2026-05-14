@@ -46,7 +46,9 @@ def scrape_output(prom: OmniPrometheusMetrics, registry: CollectorRegistry) -> s
     prom.set_running(5)
     prom.set_waiting(2)
     prom.observe_diffusion_metrics(
+        engine_idx=2,
         stage_id=1,
+        replica_id=0,
         metrics={
             "preprocess_time_ms": 10.0,
             "diffusion_engine_exec_time_ms": 200.0,
@@ -112,7 +114,7 @@ class TestMetricObservation:
         for name in _DIFFUSION_METRICS:
             count = _sample_value(
                 scrape_output,
-                f'{name}_count{{engine="1",model_name="{_MODEL}"}}',
+                f'{name}_count{{engine="2",model_name="{_MODEL}",replica_id="0",stage_id="1"}}',
             )
             assert count == 1.0, f"{name}_count expected 1.0, got {count}"
 
@@ -125,11 +127,15 @@ class TestLabelCorrectness:
 
     def test_diffusion_metrics_carry_engine_label(self, scrape_output: str) -> None:
         for name in _DIFFUSION_METRICS:
-            pattern = rf'^{re.escape(name)}.*engine="1".*model_name="{re.escape(_MODEL)}"'
+            pattern = rf'^{re.escape(name)}.*engine="2".*model_name="{re.escape(_MODEL)}"'
             assert re.search(pattern, scrape_output, re.MULTILINE), f"{name} missing engine label"
 
-    def test_no_stage_id_label(self, scrape_output: str) -> None:
-        assert "stage_id=" not in scrape_output
+    def test_diffusion_metrics_carry_stage_and_replica_labels(self, scrape_output: str) -> None:
+        for name in _DIFFUSION_METRICS:
+            pattern = rf'^{re.escape(name)}.*stage_id="1".*replica_id="0"'
+            assert re.search(pattern, scrape_output, re.MULTILINE), (
+                f"{name} missing stage_id/replica_id labels"
+            )
 
 
 class TestScrapeOutput:

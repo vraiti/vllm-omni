@@ -43,7 +43,8 @@ vLLM. All pipeline-level metrics use the `vllm_omni:` prefix to
 distinguish them from upstream per-engine metrics. The
 `unregister_vllm_metrics()` function is monkey-patched to a no-op at
 import time (see `vllm_omni/patch.py`) so that these metrics are not
-destroyed during engine initialization.
+destroyed during engine initialization (this is a temporary fix until
+vLLM patches this behavior).
 
 Upstream per-engine metrics retain the `vllm:` prefix and are
 registered by a `PrometheusStatLogger` instance that the Orchestrator

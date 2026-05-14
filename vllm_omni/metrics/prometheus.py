@@ -1,7 +1,7 @@
 from prometheus_client import Counter, Gauge, Histogram
 
 _labelnames = ["model_name"]
-_diffusion_labelnames = ["model_name", "engine"]
+_diffusion_labelnames = ["model_name", "engine", "stage_id", "replica_id"]
 
 _DIFFUSION_METRIC_DEFS: dict[str, tuple[str, str]] = {
     "preprocess_time_ms": (
@@ -74,7 +74,7 @@ class OmniPrometheusMetrics:
         self._fail = _fail_family.labels(model_name=model_name)
         self._e2e_latency = _e2e_latency_family.labels(model_name=model_name)
         self._queue_time = _queue_time_family.labels(model_name=model_name)
-        self._diffusion_by_stage: dict[tuple[str, int], Histogram] = {}
+        self._diffusion_by_replica: dict[tuple[str, int], Histogram] = {}
 
     def set_running(self, n: int) -> None:
         self._running.set(n)
@@ -91,18 +91,27 @@ class OmniPrometheusMetrics:
     def request_failed(self) -> None:
         self._fail.inc()
 
-    def observe_diffusion_metrics(self, stage_id: int, metrics: dict[str, float]) -> None:
+    def observe_diffusion_metrics(
+        self,
+        engine_idx: int,
+        stage_id: int,
+        replica_id: int,
+        metrics: dict[str, float],
+    ) -> None:
         for key, parent in _diffusion_families.items():
             value = metrics.get(key)
             if value is None:
                 continue
-            bound = self._diffusion_by_stage.get((key, stage_id))
+            cache_key = (key, engine_idx)
+            bound = self._diffusion_by_replica.get(cache_key)
             if bound is None:
                 bound = parent.labels(
                     model_name=self._model_name,
-                    engine=str(stage_id),
+                    engine=str(engine_idx),
+                    stage_id=str(stage_id),
+                    replica_id=str(replica_id),
                 )
-                self._diffusion_by_stage[(key, stage_id)] = bound
+                self._diffusion_by_replica[cache_key] = bound
             bound.observe(value)
 
 
