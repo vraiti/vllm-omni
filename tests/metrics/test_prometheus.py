@@ -132,7 +132,7 @@ class TestLabelCorrectness:
 
     def test_diffusion_metrics_carry_stage_and_replica_labels(self, scrape_output: str) -> None:
         for name in _DIFFUSION_METRICS:
-            pattern = rf'^{re.escape(name)}.*stage_id="1".*replica_id="0"'
+            pattern = rf'^{re.escape(name)}.*replica_id="0".*stage_id="1"'
             assert re.search(pattern, scrape_output, re.MULTILINE), (
                 f"{name} missing stage_id/replica_id labels"
             )

@@ -490,11 +490,14 @@ def compute_replica_layout(
     replicas_per_stage: list[int] = []
     for stage_cfg in stage_configs:
         runtime_cfg = getattr(stage_cfg, "runtime", {})
-        num_replicas = int(
-            runtime_cfg.get("num_replicas", 1)
-            if hasattr(runtime_cfg, "get")
-            else getattr(runtime_cfg, "num_replicas", 1)
-        )
+        if runtime_cfg:
+            num_replicas = int(
+                runtime_cfg.get("num_replicas", 1)
+                if hasattr(runtime_cfg, "get")
+                else getattr(runtime_cfg, "num_replicas", 1)
+            )
+        else:
+            num_replicas = int(getattr(stage_cfg, "num_replicas", 1))
         replicas_per_stage.append(max(1, num_replicas))
 
     replica_devices_map: dict[int, list[str]] = {}

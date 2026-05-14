@@ -156,6 +156,10 @@ class Orchestrator:
         self._running_counter = running_counter
 
         engine_indexes = list(range(flat))
+        extra_labelvalues: dict[int, list[object]] = {}
+        for (sid, rid), eidx in self._engine_idx.items():
+            extra_labelvalues[eidx] = [str(sid), str(rid)]
+
         vllm_config_for_stats = next(
             (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
             None,
@@ -164,6 +168,8 @@ class Orchestrator:
             self._stat_logger: PrometheusStatLogger | None = PrometheusStatLogger(
                 vllm_config=vllm_config_for_stats,
                 engine_indexes=engine_indexes,
+                extra_labelnames=["stage_id", "replica_id"],
+                extra_labelvalues=extra_labelvalues,
             )
         else:
             self._stat_logger = None

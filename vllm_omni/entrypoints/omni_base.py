@@ -356,8 +356,6 @@ class OmniBase(PDDisaggregationMixin):
             return True, None, None, None
 
         req_state.stage_id = stage_id
-        req_state.replica_id = msg.get("replica_id", 0)
-        req_state.engine_idx = msg.get("engine_idx", stage_id)
 
         return False, req_id, stage_id, req_state
 
@@ -470,9 +468,9 @@ class OmniBase(PDDisaggregationMixin):
         diffusion_metrics = getattr(engine_outputs, "metrics", None)
         if finished and isinstance(diffusion_metrics, dict) and diffusion_metrics:
             self.prom_metrics.observe_diffusion_metrics(
-                engine_idx=getattr(req_state, "engine_idx", stage_id),
+                engine_idx=result.get("engine_idx", stage_id),
                 stage_id=stage_id,
-                replica_id=getattr(req_state, "replica_id", 0),
+                replica_id=result.get("replica_id", 0),
                 metrics=diffusion_metrics,
             )
 
