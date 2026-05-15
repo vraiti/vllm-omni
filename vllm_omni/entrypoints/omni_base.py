@@ -139,8 +139,8 @@ class OmniBase(PDDisaggregationMixin):
     ) -> None:
         engine_args: OmniEngineArgs | None = kwargs.pop("engine_args", None)
 
-        stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
-        init_timeout = kwargs.pop("init_timeout", 600)
+        stage_init_timeout = kwargs.pop("stage_init_timeout", 1800)
+        init_timeout = kwargs.pop("init_timeout", 1800)
         log_stats = kwargs.pop("log_stats", False)
         self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
