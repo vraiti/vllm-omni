@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import multiprocessing.connection
+import os
 import threading
 import time
 import weakref
@@ -10,7 +11,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import zmq
-from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+from vllm.distributed.device_communicators.shm_broadcast import (
+    MessageQueue,
+    ShmRingBuffer,
+)
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -25,6 +29,84 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
+
+
+def _patch_shm_ring_buffer():
+    """Instrument ShmRingBuffer to log shm lifecycle and surface errors."""
+    from multiprocessing import shared_memory
+    from unittest.mock import patch
+
+    _orig_init = ShmRingBuffer.__init__
+
+    def _traced_init(self, n_reader, max_chunk_bytes, max_chunks, name=None):
+        self.n_reader = n_reader
+        self.metadata_size = 1 + n_reader
+        self.max_chunk_bytes = max_chunk_bytes
+        self.max_chunks = max_chunks
+        self.total_bytes_of_buffer = (
+            self.max_chunk_bytes + self.metadata_size
+        ) * self.max_chunks
+        self.data_offset = 0
+        self.metadata_offset = self.max_chunk_bytes * self.max_chunks
+
+        import torch
+
+        if name is None:
+            self.is_creator = True
+            self.shared_memory = shared_memory.SharedMemory(
+                create=True, size=self.total_bytes_of_buffer
+            )
+            logger.warning(
+                "ShmRingBuffer CREATED name=%s size=%d pid=%d",
+                self.shared_memory.name, self.shared_memory.size, os.getpid(),
+            )
+            assert self.shared_memory.buf is not None
+            with self.shared_memory.buf[self.metadata_offset:] as buf:
+                torch.frombuffer(buf, dtype=torch.uint8).fill_(0)
+        else:
+            self.is_creator = False
+            with patch(
+                "multiprocessing.resource_tracker.register",
+                lambda *args, **kwargs: None,
+            ):
+                try:
+                    self.shared_memory = shared_memory.SharedMemory(name=name)
+                    logger.warning(
+                        "ShmRingBuffer OPENED name=%s size=%d pid=%d",
+                        name, self.shared_memory.size, os.getpid(),
+                    )
+                    assert self.shared_memory.size >= self.total_bytes_of_buffer
+                except FileNotFoundError as exc:
+                    shm_path = f"/dev/shm/{name}"
+                    exists = os.path.exists(shm_path)
+                    entries = sorted(os.listdir("/dev/shm"))[:30]
+                    logger.error(
+                        "ShmRingBuffer FAILED to open name=%s pid=%d: %s | "
+                        "/dev/shm/%s exists=%s | /dev/shm sample: %s",
+                        name, os.getpid(), exc, name, exists, entries,
+                    )
+
+    _orig_del = ShmRingBuffer.__del__
+
+    def _traced_del(self):
+        if hasattr(self, "shared_memory"):
+            logger.warning(
+                "ShmRingBuffer.__del__ name=%s is_creator=%s pid=%d",
+                self.shared_memory.name, self.is_creator, os.getpid(),
+            )
+            self.shared_memory.close()
+            if self.is_creator:
+                logger.warning(
+                    "ShmRingBuffer UNLINKING name=%s pid=%d",
+                    self.shared_memory.name, os.getpid(),
+                )
+                self.shared_memory.unlink()
+
+    ShmRingBuffer.__init__ = _traced_init
+    ShmRingBuffer.__del__ = _traced_del
+
+
+_patch_shm_ring_buffer()
 
 _DEQUEUE_TIMEOUT_S = 5.0
 
@@ -108,7 +190,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if result_handle is None:
             logger.error("Failed to get result queue handle from workers")
             return None
-        return MessageQueue.create_from_handle(result_handle, 0)
+        logger.info(
+            "Opening result queue from handle: buffer_handle=%s",
+            result_handle.buffer_handle,
+        )
+        mq = MessageQueue.create_from_handle(result_handle, 0)
+        if mq.buffer is not None and not hasattr(mq.buffer, "shared_memory"):
+            logger.error(
+                "Result queue ShmRingBuffer has no shared_memory attribute. "
+                "The shm segment was not found. handle=%s",
+                result_handle.buffer_handle,
+            )
+            raise RuntimeError(
+                f"Failed to open result queue shm segment: "
+                f"{result_handle.buffer_handle}"
+            )
+        return mq
 
     def _ensure_open(self) -> None:
         if self._closed:
