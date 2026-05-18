@@ -98,25 +98,19 @@ def metrics_after(omni_server, metrics_before) -> str:
 class TestMetricFamilies:
     def test_omni_pipeline_metrics_present(self, metrics_before: str) -> None:
         for name in _PIPELINE_METRICS:
-            assert f"# HELP {name}" in metrics_before, (
-                f"missing metric family: {name}"
-            )
+            assert f"# HELP {name}" in metrics_before, f"missing metric family: {name}"
 
     def test_omni_pipeline_metrics_carry_model_name(self, metrics_before: str) -> None:
         for name in _PIPELINE_METRICS:
             pattern = rf'^{re.escape(name)}.*model_name="{re.escape(MODEL)}"'
-            assert re.search(pattern, metrics_before, re.MULTILINE), (
-                f"{name} missing model_name label"
-            )
+            assert re.search(pattern, metrics_before, re.MULTILINE), f"{name} missing model_name label"
 
     def test_vllm_per_engine_metrics_present(self, metrics_before: str) -> None:
         assert "# HELP vllm:num_requests_running" in metrics_before
 
     def test_vllm_metrics_have_correct_engine_count(self, metrics_before: str) -> None:
         count = _count_data_lines(metrics_before, "vllm:num_requests_running")
-        assert count == NUM_ENGINES, (
-            f"expected {NUM_ENGINES} engine label sets, got {count}"
-        )
+        assert count == NUM_ENGINES, f"expected {NUM_ENGINES} engine label sets, got {count}"
 
 
 @pytest.mark.full_model
@@ -124,13 +118,9 @@ class TestMetricFamilies:
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 class TestMetricValues:
-    def test_success_counter_increments(
-        self, metrics_before: str, metrics_after: str
-    ) -> None:
+    def test_success_counter_increments(self, metrics_before: str, metrics_after: str) -> None:
         prefix = f'vllm_omni:num_requests_success_total{{model_name="{MODEL}"}}'
         before = _sample_value(metrics_before, prefix) or 0.0
         after = _sample_value(metrics_after, prefix)
         assert after is not None, "success counter not found after requests"
-        assert after >= before + NUM_REQUESTS, (
-            f"expected success count >= {before + NUM_REQUESTS}, got {after}"
-        )
+        assert after >= before + NUM_REQUESTS, f"expected success count >= {before + NUM_REQUESTS}, got {after}"

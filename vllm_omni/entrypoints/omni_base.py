@@ -350,8 +350,8 @@ class OmniBase(PDDisaggregationMixin):
             return True, None, None, None
 
         req_state.stage_id = stage_id
-        req_state.replica_id = msg.get("replica_id", 0)
-        req_state.engine_idx = msg.get("engine_idx", stage_id)
+        req_state.replica_id = msg.replica_id
+        req_state.engine_idx = msg.engine_idx
 
         return False, req_id, stage_id, req_state
 
@@ -448,7 +448,7 @@ class OmniBase(PDDisaggregationMixin):
                     req_start_ts.get(req_id, wall_start_ts),
                 )
                 e2e_seconds = now - req_start_ts.get(req_id, wall_start_ts)
-                _fin_m = result.get("metrics")
+                _fin_m = result.metrics
                 _pt = getattr(_fin_m, "pipeline_timings", None) or {}
                 queue_ms = _pt.get("queue_wait_ms")
                 queue_seconds = queue_ms / 1000.0 if queue_ms is not None else None
