@@ -110,6 +110,7 @@ from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
 )
 from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -357,6 +358,7 @@ class AsyncOmniEngine:
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
+        self._running_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -905,7 +907,7 @@ class AsyncOmniEngine:
                                         launch_omni_core_engines(
                                             vllm_config=vllm_config,
                                             executor_class=executor_class,
-                                            log_stats=False,
+                                            log_stats=True,
                                             omni_master_server=self._omni_master_server,
                                             stage_id=plan.metadata.stage_id,
                                             stage_config=stage_cfg,
@@ -917,7 +919,7 @@ class AsyncOmniEngine:
                                     addresses, proc, handshake_address = spawn_stage_core(
                                         vllm_config=vllm_config,
                                         executor_class=executor_class,
-                                        log_stats=False,
+                                        log_stats=True,
                                     )
                                 logger.info(
                                     "[AsyncOmniEngine] Stage %s engine launch started",
@@ -1377,6 +1379,7 @@ class AsyncOmniEngine:
                 coordinator_pub_address=coordinator_pub_address,
                 load_balancer_factory=load_balancer_factory,
                 remote_replica_factory=remote_replica_factory,
+                running_counter=self._running_counter,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

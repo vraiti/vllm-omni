@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
@@ -31,6 +33,8 @@ except ValueError:
         _INPUT_WAIT_TIMEOUT_RAW,
     )
     DEFAULT_INPUT_WAIT_TIMEOUT_S = 300.0
+
+_STATS_INTERVAL_S = 1.0
 
 
 class OmniSchedulerMixin:
@@ -171,3 +175,14 @@ class OmniSchedulerMixin:
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        now = time.monotonic()
+        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:
+            return None
+        self._last_stats_time = now
+        return SchedulerStats(
+            kv_cache_usage=self.kv_cache_manager.usage,
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
+        )

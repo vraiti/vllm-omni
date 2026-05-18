@@ -23,6 +23,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
+from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -190,6 +191,7 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
+        self.prom_metrics = OmniPrometheusMetrics(model_name=model)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
@@ -278,9 +280,9 @@ class OmniBase(PDDisaggregationMixin):
             if req_state is None or req_state.metrics is None:
                 return
             if self.log_stats:
-                # Emit per-request orchestrator timing (including e2e_total_ms)
-                # before dropping request state.
                 req_state.metrics.build_and_log_summary()
+            if str(request_id) not in req_state.metrics.e2e_done:
+                self.prom_metrics.request_failed()
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",
@@ -348,6 +350,8 @@ class OmniBase(PDDisaggregationMixin):
             return True, None, None, None
 
         req_state.stage_id = stage_id
+        req_state.replica_id = msg.get("replica_id", 0)
+        req_state.engine_idx = msg.get("engine_idx", stage_id)
 
         return False, req_id, stage_id, req_state
 
@@ -443,8 +447,28 @@ class OmniBase(PDDisaggregationMixin):
                     req_id,
                     req_start_ts.get(req_id, wall_start_ts),
                 )
+                e2e_seconds = now - req_start_ts.get(req_id, wall_start_ts)
+                _fin_m = result.get("metrics")
+                _pt = getattr(_fin_m, "pipeline_timings", None) or {}
+                queue_ms = _pt.get("queue_wait_ms")
+                queue_seconds = queue_ms / 1000.0 if queue_ms is not None else None
+                self.prom_metrics.request_succeeded(e2e_seconds, queue_seconds=queue_seconds)
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
+
+        running = self.engine._running_counter.value
+        total = len(self.request_states)
+        self.prom_metrics.set_running(running)
+        self.prom_metrics.set_waiting(max(0, total - running))
+
+        diffusion_metrics = getattr(engine_outputs, "metrics", None)
+        if finished and isinstance(diffusion_metrics, dict) and diffusion_metrics:
+            self.prom_metrics.observe_diffusion_metrics(
+                engine_idx=result.engine_idx,
+                stage_id=stage_id,
+                replica_id=result.replica_id,
+                metrics=diffusion_metrics,
+            )
 
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         images = getattr(engine_outputs, "images", []) if output_type == "image" else []

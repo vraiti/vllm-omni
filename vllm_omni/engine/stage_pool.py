@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
@@ -641,6 +642,7 @@ class StagePool:
         self,
         replica_id: int,
         raw_outputs: EngineCoreOutputs,
+        iteration_stats: IterationStats | None = None,
     ) -> list[Any]:
         """Run the shared LLM output processor on one raw poll result."""
         raw_client = self.clients[replica_id]
@@ -651,7 +653,7 @@ class StagePool:
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            None,
+            iteration_stats,
         )
 
         if processed.reqs_to_abort:
