@@ -212,8 +212,9 @@ class Orchestrator:
             )
         else:
             self._stat_logger = None
-        self._last_stats_ts: float = 0.0
         self._stats_interval_s: float = 1.0
+        self._per_engine_stats_ts: dict[int, float] = {idx: 0.0 for idx in engine_indexes}
+        self._pending_iteration_stats: dict[int, IterationStats] = {idx: IterationStats() for idx in engine_indexes}
 
         self._cfg_tracker = CfgCompanionTracker()
 
@@ -631,23 +632,27 @@ class Orchestrator:
                                     "new_prompt_len_snapshot",
                                     None,
                                 )
-                            now = _time.monotonic()
-                            record_stats = (
-                                self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
-                            )
-                            iteration_stats = IterationStats() if record_stats else None
+                            engine_idx = self._engine_idx[(stage_id, replica_id)]
+                            iteration_stats = self._pending_iteration_stats.get(engine_idx)
+                            if iteration_stats is not None:
+                                iteration_stats.iteration_timestamp = _time.time()
                             raw_output = await pool.process_llm_raw_outputs(
                                 replica_id,
                                 raw_outputs,
                                 iteration_stats=iteration_stats,
                             )
-                            if record_stats:
-                                self._last_stats_ts = now
+                            now = _time.monotonic()
+                            if (
+                                self._stat_logger is not None
+                                and now - self._per_engine_stats_ts.get(engine_idx, 0.0) >= self._stats_interval_s
+                            ):
+                                self._per_engine_stats_ts[engine_idx] = now
                                 self._stat_logger.record(
                                     raw_outputs.scheduler_stats,
                                     iteration_stats,
-                                    engine_idx=self._engine_idx[(stage_id, replica_id)],
+                                    engine_idx=engine_idx,
                                 )
+                                self._pending_iteration_stats[engine_idx] = IterationStats()
                         except asyncio.CancelledError:
                             raise
                         except EngineDeadError as e:
