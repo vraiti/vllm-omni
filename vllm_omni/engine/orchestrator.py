@@ -29,7 +29,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
-from vllm.v1.metrics.loggers import VllmPrometheusStatLogger as VllmVllmPrometheusStatLogger
+from vllm.v1.metrics.loggers import PrometheusStatLogger as VllmPrometheusStatLogger
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -200,21 +200,26 @@ class Orchestrator:
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._running_counter = running_counter
 
-        engine_indexes = list(range(flat))
+        llm_engine_indexes = [
+            self._engine_idx[(sid, rid)]
+            for sid, pool in enumerate(stage_pools)
+            if pool.stage_vllm_config is not None
+            for rid in range(pool.num_replicas)
+        ]
         vllm_config_for_stats = next(
             (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
             None,
         )
         if vllm_config_for_stats is not None:
-            self._stat_logger: VllmPrometheusStatLogger | None = VllmVllmPrometheusStatLogger(
+            self._stat_logger: VllmPrometheusStatLogger | None = VllmPrometheusStatLogger(
                 vllm_config=vllm_config_for_stats,
-                engine_indexes=engine_indexes,
+                engine_indexes=llm_engine_indexes,
             )
         else:
             self._stat_logger = None
         self._stats_interval_s: float = 1.0
-        self._per_engine_stats_ts: dict[int, float] = {idx: 0.0 for idx in engine_indexes}
-        self._pending_iteration_stats: dict[int, IterationStats] = {idx: IterationStats() for idx in engine_indexes}
+        self._per_engine_stats_ts: dict[int, float] = {idx: 0.0 for idx in llm_engine_indexes}
+        self._pending_iteration_stats: dict[int, IterationStats] = {idx: IterationStats() for idx in llm_engine_indexes}
 
         self._cfg_tracker = CfgCompanionTracker()
 
