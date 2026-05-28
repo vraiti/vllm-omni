@@ -30,6 +30,7 @@ from vllm import envs as vllm_envs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.tracing import init_tracer
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
@@ -377,6 +378,9 @@ class AsyncOmniEngine:
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
         self._running_counter = OmniRequestCounter()
+        self._otlp_traces_endpoint: str | None = kwargs.get("otlp_traces_endpoint")
+        if self._otlp_traces_endpoint is not None:
+            init_tracer("vllm_omni.engine", self._otlp_traces_endpoint)
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -1249,7 +1253,12 @@ class AsyncOmniEngine:
             if plan.replicas[0].metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 assert stage_vllm_config is not None
-                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config, log_stats=self._log_stats)
+                output_processor = build_llm_stage_output_processor(
+                    plan,
+                    stage_vllm_config,
+                    log_stats=self._log_stats,
+                    tracing_enabled=self._otlp_traces_endpoint is not None,
+                )
 
             stage_pools.append(
                 StagePool(
@@ -1400,6 +1409,7 @@ class AsyncOmniEngine:
                 remote_replica_factory=remote_replica_factory,
                 transfer_emitter=self._transfer_emitter,
                 log_stats=self._log_stats,
+                tracing_enabled=self._otlp_traces_endpoint is not None,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

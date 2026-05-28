@@ -1014,8 +1014,7 @@ class AsyncOmni(EngineClient, OmniBase):
         return self.input_processor.tokenizer  # type: ignore[return-value]
 
     async def is_tracing_enabled(self) -> bool:
-        """Check if tracing is enabled."""
-        return False
+        return getattr(self.engine, "_otlp_traces_endpoint", None) is not None
 
     async def notify_kv_transfer_request_rejected(
         self,

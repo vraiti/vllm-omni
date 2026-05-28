@@ -835,14 +835,9 @@ def build_llm_stage_output_processor(
     plan: LogicalStageInitPlan,
     stage_vllm_config: Any,
     log_stats: bool = False,
+    tracing_enabled: bool = False,
 ) -> Any | None:
-    """Build one output processor per logical LLM stage.
-
-    ``log_stats`` controls whether the processor populates per-request
-    IterationStats (consumed by the Prometheus wrap). Default False matches
-    the upstream MultimodalOutputProcessor default and respects the
-    --log-stats CLI flag plumbed through AsyncOmniEngine.
-    """
+    """Build one output processor per logical LLM stage."""
 
     metadata = plan.replicas[0].metadata
     if stage_vllm_config.model_config.skip_tokenizer_init:
@@ -854,6 +849,7 @@ def build_llm_stage_output_processor(
     return MultimodalOutputProcessor(
         tokenizer=tokenizer,
         log_stats=log_stats,
+        tracing_enabled=tracing_enabled,
         engine_core_output_type=metadata.engine_output_type,
     )
 
