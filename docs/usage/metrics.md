@@ -13,7 +13,7 @@ curl http://localhost:8000/metrics
 
 | Prefix | Source | Present when |
 |--------|--------|--------------|
-| `vllm_omni:` | vLLM-Omni orchestrato / diffusion stages | Always / Pipeline includes a diffusion stage |
+| `vllm_omni:` | vLLM-Omni orchestrator / diffusion stages | Always / Pipeline includes a diffusion stage |
 | `vllm:` | Upstream vLLM engine | Pipeline includes an LLM (AR) stage |
 | `http_` / `process_` | Uvicorn / Python runtime | Always |
 
