@@ -29,7 +29,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
-from vllm.v1.metrics.loggers import PrometheusStatLogger
+from vllm.v1.metrics.loggers import VllmPrometheusStatLogger as VllmVllmPrometheusStatLogger
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -206,7 +206,7 @@ class Orchestrator:
             None,
         )
         if vllm_config_for_stats is not None:
-            self._stat_logger: PrometheusStatLogger | None = PrometheusStatLogger(
+            self._stat_logger: VllmPrometheusStatLogger | None = VllmVllmPrometheusStatLogger(
                 vllm_config=vllm_config_for_stats,
                 engine_indexes=engine_indexes,
             )

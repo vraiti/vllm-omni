@@ -23,7 +23,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
-from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
+from vllm_omni.metrics.prometheus import OmniPrometheusStatLogger
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -191,7 +191,7 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
-        self.prom_metrics = OmniPrometheusMetrics(model_name=model)
+        self.prom_metrics = OmniPrometheusStatLogger(model_name=model)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:

@@ -58,7 +58,7 @@ _diffusion_families: dict[str, Histogram] = {
 }
 
 
-class OmniPrometheusMetrics:
+class OmniPrometheusStatLogger:
     """Label-bound wrapper around the raw Prometheus metrics.
 
     Metric collectors use the ``vllm_omni:`` prefix to avoid being

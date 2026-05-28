@@ -5,7 +5,7 @@ import re
 import pytest
 from prometheus_client import REGISTRY, CollectorRegistry, generate_latest
 
-from vllm_omni.metrics import OmniPrometheusMetrics
+from vllm_omni.metrics import OmniPrometheusStatLogger
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -34,12 +34,12 @@ def registry() -> CollectorRegistry:
 
 
 @pytest.fixture(scope="module")
-def prom() -> OmniPrometheusMetrics:
-    return OmniPrometheusMetrics(model_name=_MODEL)
+def prom() -> OmniPrometheusStatLogger:
+    return OmniPrometheusStatLogger(model_name=_MODEL)
 
 
 @pytest.fixture(scope="module")
-def scrape_output(prom: OmniPrometheusMetrics, registry: CollectorRegistry) -> str:
+def scrape_output(prom: OmniPrometheusStatLogger, registry: CollectorRegistry) -> str:
     prom.request_succeeded(e2e_seconds=1.5, queue_seconds=0.3)
     prom.request_succeeded(e2e_seconds=2.0, queue_seconds=0.5)
     prom.request_failed()

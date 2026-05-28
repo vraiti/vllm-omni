@@ -66,9 +66,9 @@ creates and feeds directly.
                     |                           |
           vllm_omni:* collectors      vllm:* collectors
                     |                           |
-        +-----------+-----------+      +--------+---------+
-        | OmniPrometheusMetrics |      | PrometheusStatLogger |
-        +-----------+-----------+      +--------+---------+
+        +----------------------------+      +--------------------------+
+        | OmniPrometheusStatLogger |      | VllmPrometheusStatLogger |
+        +----------------------------+      +--------------------------+
                     |                           |
                OmniBase                   Orchestrator
             (request lifecycle,       (feeds SchedulerStats
@@ -82,7 +82,7 @@ There are two independent paths for metric collection.
 
 **Path 1: Pipeline-level metrics (`vllm_omni:*`)**
 
-`OmniPrometheusMetrics` registers Gauge, Counter, and Histogram
+`OmniPrometheusStatLogger` registers Gauge, Counter, and Histogram
 collectors at init time. It is instantiated once per entrypoint,
 labeled with the model name. The entrypoint calls its methods as
 requests progress:
@@ -126,7 +126,7 @@ passed to the Orchestrator at construction time.
 ### Metric Registration and Lifecycle
 
 All `vllm_omni:*` collectors are registered once when
-`OmniPrometheusMetrics.__init__()` runs. Per-stage labels
+`OmniPrometheusStatLogger.__init__()` runs. Per-stage labels
 (`model_name`, `engine`) are bound lazily on first observation to
 avoid registering labels for stages that never produce data (e.g., a
 diffusion pipeline has no AR stage stats).
@@ -188,7 +188,7 @@ per-stage, and per-transfer statistics and prints formatted tables to
 the `INFO` log. This is designed for development and debugging —
 individual request traces, transfer bandwidth, inter-stage timing.
 
-`OmniPrometheusMetrics` is the Prometheus-oriented path. It records
+`OmniPrometheusStatLogger` is the Prometheus-oriented path. It records
 aggregate counters, gauges, and histograms suitable for time-series
 monitoring and alerting. The two paths are independent; both can run
 simultaneously.
