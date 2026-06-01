@@ -988,7 +988,7 @@ class Orchestrator:
         span = req_state._omni_span
         if span is None:
             return
-        engine_idx = self._engine_idx.get((stage_id, replica_id), -1)
+        engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id), -1)
         span.set_attribute(OmniSpanAttributes.REQUEST_ID, req_id)
         span.set_attribute(
             OmniSpanAttributes.REQUEST_NUM_STAGES,
