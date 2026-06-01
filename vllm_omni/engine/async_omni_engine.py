@@ -381,6 +381,9 @@ class AsyncOmniEngine:
         self._otlp_traces_endpoint: str | None = kwargs.get("otlp_traces_endpoint")
         if self._otlp_traces_endpoint is not None:
             init_tracer("vllm_omni.engine", self._otlp_traces_endpoint)
+            # Upstream do_tracing asserts req_state.stats is not None, which
+            # requires log_stats=True so RequestStateStats gets created.
+            self._log_stats = True
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
