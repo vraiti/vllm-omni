@@ -714,7 +714,7 @@ class Orchestrator:
                             # A second global throttle here would drop stats for
                             # other (stage, replica) pairs in the same 1s window.
                             record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
-                            iteration_stats = IterationStats() if record_stats else None
+                            iteration_stats = IterationStats() if record_stats or self._tracing_enabled else None
                             raw_output = await pool.process_llm_raw_outputs(
                                 replica_id,
                                 raw_outputs,
