@@ -4,10 +4,16 @@ import os
 import time
 import weakref
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
+from vllm.tracing import (
+    SpanKind,
+    extract_trace_context,
+    instrument_manual,
+    is_tracing_available,
+)
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -27,7 +33,11 @@ from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.tracing import OmniSpanAttributes
 from vllm_omni.utils.tracking_parser import TrackingNamespace
+
+if TYPE_CHECKING:
+    pass
 
 logger = init_logger(__name__)
 
@@ -555,6 +565,33 @@ class OmniBase(PDDisaggregationMixin):
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
 
+        diffusion_metrics = getattr(engine_outputs, "metrics", None)
+        if finished and isinstance(diffusion_metrics, dict) and diffusion_metrics:
+            if is_tracing_available():
+                trace_context = extract_trace_context(getattr(result, "trace_headers", None))
+                step_start = diffusion_metrics.get(
+                    "step_start_ts",
+                    req_start_ts.get(req_id, wall_start_ts),
+                )
+                total_ms = diffusion_metrics.get("diffusion_engine_total_time_ms")
+                step_end_ns = int((step_start + total_ms / 1000) * 1e9) if total_ms is not None else time.time_ns()
+                instrument_manual(
+                    span_name="diffusion_request",
+                    start_time=int(step_start * 1e9),
+                    end_time=step_end_ns,
+                    attributes={
+                        OmniSpanAttributes.STAGE_ID: stage_id,
+                        OmniSpanAttributes.STAGE_NAME: "diffusion",
+                        OmniSpanAttributes.STAGE_REPLICA_ID: result.replica_id,
+                        OmniSpanAttributes.ENGINE_IDX: getattr(result, "engine_idx", stage_id),
+                        OmniSpanAttributes.DIFFUSION_PREPROCESS_MS: diffusion_metrics.get("preprocess_time_ms"),
+                        OmniSpanAttributes.DIFFUSION_EXEC_MS: diffusion_metrics.get("diffusion_engine_exec_time_ms"),
+                        OmniSpanAttributes.DIFFUSION_POSTPROCESS_MS: diffusion_metrics.get("postprocess_time_ms"),
+                        OmniSpanAttributes.DIFFUSION_TOTAL_MS: diffusion_metrics.get("diffusion_engine_total_time_ms"),
+                    },
+                    context=trace_context,
+                    kind=SpanKind.INTERNAL,
+                )
         images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}

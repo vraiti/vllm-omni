@@ -485,6 +485,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                         is_segment_finished=is_segment_finished,
                         new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
+                        first_chunk_received_ts=getattr(request, "first_chunk_received_ts", None),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:

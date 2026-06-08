@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time as _time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -217,6 +218,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if payload_data:
             # Update connector state
+            if chunk_id == 0:
+                request.first_chunk_received_ts = _time.time()
             self.get_req_chunk[req_id] += 1
 
             meta = payload_data.get("meta", {})

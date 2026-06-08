@@ -27,6 +27,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     request_timestamp: float
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
+    arrival_time: float | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -89,6 +90,7 @@ class OutputMessage(EngineQueueMessage, kw_only=True):
     metrics: StageRequestMetrics | None = None
     finished: bool
     stage_submit_ts: float | None = None
+    trace_headers: dict[str, str] | None = None
 
 
 class StageMetricsMessage(EngineQueueMessage, kw_only=True):

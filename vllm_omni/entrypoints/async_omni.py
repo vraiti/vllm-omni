@@ -389,7 +389,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
-            req_start_ts[request_id] = submit_ts
+            req_start_ts[request_id] = wall_start_ts
 
             # Process results based on mode
             # Both sequential and async_chunk modes read the same message stream
@@ -1046,8 +1046,7 @@ class AsyncOmni(EngineClient, OmniBase):
         return self.input_processor.tokenizer  # type: ignore[return-value]
 
     async def is_tracing_enabled(self) -> bool:
-        """Check if tracing is enabled."""
-        return False
+        return getattr(self.engine, "_otlp_traces_endpoint", None) is not None
 
     async def notify_kv_transfer_request_rejected(
         self,

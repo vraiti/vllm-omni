@@ -151,6 +151,11 @@ class OmniSchedulerMixin:
             pending_input_registrations=pending_input_registrations,
         )
 
+    def add_request(self, request) -> None:
+        if request.request_id not in self.requests:
+            request.first_chunk_received_ts = time.time()
+        super().add_request(request)
+
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
         now = time.monotonic()
         if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:

@@ -6,6 +6,13 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
+from vllm.tracing import (
+    SpanAttributes,
+    SpanKind,
+    extract_trace_context,
+    instrument_manual,
+)
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.engine.output_processor import (
@@ -25,6 +32,7 @@ from vllm_omni.engine.output_modality import (
     get_accumulation_strategy,
 )
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.tracing import OmniSpanAttributes
 
 logger = init_logger(__name__)
 
@@ -464,6 +472,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         tracing_enabled: bool = False,
         engine_core_output_type: str | None = None,
         output_modality: OutputModality = OutputModality.TEXT,
+        engine_idx: int = -1,
+        stage_id: int = -1,
+        stage_name: str | None = None,
+        replica_id: int = 0,
     ):
         """Initialize the multimodal output processor.
 
@@ -478,6 +490,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             output_modality: Type-safe output modality flag. Used to tag
                 multimodal outputs with the correct modality key when
                 per-output type info is unavailable.
+            engine_idx: Engine index for tracing
+            stage_id: Stage ID for tracing
+            stage_name: Stage name for tracing
+            replica_id: Replica ID for tracing
         """
         super().__init__(
             tokenizer=tokenizer,
@@ -492,6 +508,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             self.output_modality = output_modality
         self.engine_core_output_type = engine_core_output_type
         self._native_text_metrics_by_request: dict[str, dict[str, Any]] = {}
+        self._engine_idx = engine_idx
+        self._stage_id = stage_id
+        self._stage_name = stage_name
+        self._replica_id = replica_id
+        self._span_kind = SpanKind.INTERNAL
 
     def _native_text_metric_record(self, request_id: str) -> dict[str, Any]:
         return self._native_text_metrics_by_request.setdefault(
@@ -736,4 +757,63 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             return
         self._native_text_metric_record(req_state.external_req_id)["vllm_tpot_ms"] = (
             float(finished_request.mean_time_per_output_token) * 1000.0
+        )
+
+    # TODO: deduplicate once upstream do_tracing accepts extra_attributes
+    def do_tracing(
+        self,
+        engine_core_output: EngineCoreOutput,
+        req_state: RequestState,
+        iteration_stats: IterationStats | None,
+    ) -> None:
+        assert req_state.stats is not None
+        assert iteration_stats is not None
+
+        metrics = req_state.stats
+        first_chunk_ts = getattr(engine_core_output, "first_chunk_received_ts", None)
+        if first_chunk_ts is not None:
+            arrival_time_ns = int(first_chunk_ts * 1e9)
+        else:
+            arrival_time_ns = int(metrics.arrival_time * 1e9)
+        trace_context = extract_trace_context(engine_core_output.trace_headers)
+        prompt_length = length_from_prompt_token_ids_or_embeds(req_state.prompt_token_ids, req_state.prompt_embeds)
+
+        e2e_time = iteration_stats.iteration_timestamp - metrics.arrival_time
+        queued_time = metrics.scheduled_ts - metrics.queued_ts
+        prefill_time = metrics.first_token_ts - metrics.scheduled_ts
+        decode_time = metrics.last_token_ts - metrics.first_token_ts
+        inference_time = metrics.last_token_ts - metrics.scheduled_ts
+
+        attributes: dict[str, Any] = {
+            SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN: (metrics.first_token_latency),
+            SpanAttributes.GEN_AI_LATENCY_E2E: e2e_time,
+            SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE: queued_time,
+            SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS: prompt_length,
+            SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS: (metrics.num_generation_tokens),
+            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL: prefill_time,
+            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE: decode_time,
+            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE: (inference_time),
+            SpanAttributes.GEN_AI_REQUEST_ID: req_state.external_req_id,
+            OmniSpanAttributes.ENGINE_IDX: self._engine_idx,
+            OmniSpanAttributes.STAGE_ID: self._stage_id,
+            OmniSpanAttributes.STAGE_REPLICA_ID: self._replica_id,
+        }
+
+        if self._stage_name is not None:
+            attributes[OmniSpanAttributes.STAGE_NAME] = self._stage_name
+        if req_state.top_p:
+            attributes[SpanAttributes.GEN_AI_REQUEST_TOP_P] = req_state.top_p
+        if req_state.max_tokens_param:
+            attributes[SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS] = req_state.max_tokens_param
+        if req_state.temperature:
+            attributes[SpanAttributes.GEN_AI_REQUEST_TEMPERATURE] = req_state.temperature
+        if req_state.n:
+            attributes[SpanAttributes.GEN_AI_REQUEST_N] = req_state.n
+
+        instrument_manual(
+            span_name="llm_request",
+            start_time=arrival_time_ns,
+            attributes=attributes,
+            context=trace_context,
+            kind=self._span_kind,
         )

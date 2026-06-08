@@ -189,6 +189,7 @@ class DiffusionEngine:
         await self._check_and_start_background_loop()
 
         diffusion_engine_start_time = time.perf_counter()
+        step_start_ts = time.time()
 
         # Apply pre-processing if available
         preprocess_time = 0.0
@@ -278,7 +279,7 @@ class DiffusionEngine:
             step_total_ms,
         )
 
-        return format_diffusion_outputs(
+        outputs = format_diffusion_outputs(
             request=request,
             od_config=self.od_config,
             diffusion_output=output,
@@ -291,6 +292,11 @@ class DiffusionEngine:
                 total_time_ms=step_total_ms,
             ),
         )
+        # Inject step_start_ts into metrics for tracing
+        for out in outputs:
+            if out.metrics is not None:
+                out.metrics["step_start_ts"] = step_start_ts
+        return outputs
 
     def _busy_loop(self):
         while not self.stop_event.is_set():
