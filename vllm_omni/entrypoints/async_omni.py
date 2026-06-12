@@ -502,6 +502,15 @@ class AsyncOmni(EngineClient, OmniBase):
             result = await req_state.queue.get()
 
             stage_id = result.get("stage_id", 0)
+            _eo = result.get("engine_outputs")
+            logger.warning(
+                "[DEBUG-NOSTREAM] queue item: stage=%s pipeline_finished=%s "
+                "engine_finished=%s engine_type=%s",
+                stage_id,
+                result.get("finished"),
+                getattr(_eo, "finished", "N/A"),
+                type(_eo).__name__ if _eo is not None else "None",
+            )
 
             if result.get("type") == "error" and result.get("fatal"):
                 raise OmniEngineDeadError(

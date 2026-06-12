@@ -1660,6 +1660,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return self.create_error_response(e)
 
         assert final_outputs is not None
+        logger.warning(
+            "[DEBUG-NOSTREAM] collected %d outputs: %s",
+            len(final_outputs),
+            [(o.stage_id, o.final_output_type,
+              getattr(o.request_output, "finished", "N/A"))
+             for o in final_outputs],
+        )
 
         choices: list[ChatCompletionResponseChoice] = []
 
@@ -1677,8 +1684,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         for omni_outputs in final_outputs:
             choices_data = []
+            _rq_finished = getattr(omni_outputs.request_output, "finished", "N/A")
             if omni_outputs.request_output is not None and not getattr(omni_outputs.request_output, "finished", False):
+                logger.warning(
+                    "[DEBUG-NOSTREAM] SKIPPING stage=%s type=%s "
+                    "request_output.finished=%s",
+                    omni_outputs.stage_id,
+                    omni_outputs.final_output_type,
+                    _rq_finished,
+                )
                 continue
+            logger.warning(
+                "[DEBUG-NOSTREAM] PROCESSING stage=%s type=%s "
+                "request_output.finished=%s",
+                omni_outputs.stage_id,
+                omni_outputs.final_output_type,
+                _rq_finished,
+            )
 
             # Filter outputs based on requested modalites
             if requested_modalities is not None and omni_outputs.final_output_type not in requested_modalities:

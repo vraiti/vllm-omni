@@ -439,6 +439,21 @@ class OmniBase(PDDisaggregationMixin):
         if not stage_meta["final_output"]:
             return None
 
+        _has_outputs = hasattr(engine_outputs, "outputs") and engine_outputs.outputs
+        _mm = None
+        if _has_outputs:
+            _mm = getattr(engine_outputs.outputs[0], "multimodal_output", None)
+        logger.warning(
+            "[DEBUG-NOSTREAM] _process_single_result: stage=%s "
+            "engine_finished=%s final_output_type=%s "
+            "has_outputs=%s mm_keys=%s",
+            stage_id,
+            finished,
+            stage_meta.get("final_output_type"),
+            _has_outputs,
+            list(_mm.keys()) if isinstance(_mm, dict) else type(_mm).__name__ if _mm else "None",
+        )
+
         try:
             rid_key = str(req_id)
             if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done and finished:
