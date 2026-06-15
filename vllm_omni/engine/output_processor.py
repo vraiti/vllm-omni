@@ -6,13 +6,7 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
-from vllm.tracing import (
-    SpanAttributes,
-    SpanKind,
-    extract_trace_context,
-    instrument_manual,
-)
-from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.tracing import SpanKind, extract_trace_context, instrument_manual
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.engine.output_processor import (
@@ -759,61 +753,40 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             float(finished_request.mean_time_per_output_token) * 1000.0
         )
 
-    # TODO: deduplicate once upstream do_tracing accepts extra_attributes
     def do_tracing(
         self,
         engine_core_output: EngineCoreOutput,
         req_state: RequestState,
         iteration_stats: IterationStats | None,
     ) -> None:
-        assert req_state.stats is not None
-        assert iteration_stats is not None
-
-        metrics = req_state.stats
-        first_chunk_ts = getattr(engine_core_output, "first_chunk_received_ts", None)
-        if first_chunk_ts is not None:
-            arrival_time_ns = int(first_chunk_ts * 1e9)
-        else:
-            arrival_time_ns = int(metrics.arrival_time * 1e9)
-        trace_context = extract_trace_context(engine_core_output.trace_headers)
-        prompt_length = length_from_prompt_token_ids_or_embeds(req_state.prompt_token_ids, req_state.prompt_embeds)
-
-        e2e_time = iteration_stats.iteration_timestamp - metrics.arrival_time
-        queued_time = metrics.scheduled_ts - metrics.queued_ts
-        prefill_time = metrics.first_token_ts - metrics.scheduled_ts
-        decode_time = metrics.last_token_ts - metrics.first_token_ts
-        inference_time = metrics.last_token_ts - metrics.scheduled_ts
-
-        attributes: dict[str, Any] = {
-            SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN: (metrics.first_token_latency),
-            SpanAttributes.GEN_AI_LATENCY_E2E: e2e_time,
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE: queued_time,
-            SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS: prompt_length,
-            SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS: (metrics.num_generation_tokens),
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL: prefill_time,
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE: decode_time,
-            SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE: (inference_time),
-            SpanAttributes.GEN_AI_REQUEST_ID: req_state.external_req_id,
+        # Build omni-specific attributes
+        extra_attributes: dict[str, Any] = {
             OmniSpanAttributes.ENGINE_IDX: self._engine_idx,
             OmniSpanAttributes.STAGE_ID: self._stage_id,
             OmniSpanAttributes.STAGE_REPLICA_ID: self._replica_id,
         }
-
         if self._stage_name is not None:
-            attributes[OmniSpanAttributes.STAGE_NAME] = self._stage_name
-        if req_state.top_p:
-            attributes[SpanAttributes.GEN_AI_REQUEST_TOP_P] = req_state.top_p
-        if req_state.max_tokens_param:
-            attributes[SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS] = req_state.max_tokens_param
-        if req_state.temperature:
-            attributes[SpanAttributes.GEN_AI_REQUEST_TEMPERATURE] = req_state.temperature
-        if req_state.n:
-            attributes[SpanAttributes.GEN_AI_REQUEST_N] = req_state.n
+            extra_attributes[OmniSpanAttributes.STAGE_NAME] = self._stage_name
 
-        instrument_manual(
-            span_name="llm_request",
-            start_time=arrival_time_ns,
-            attributes=attributes,
-            context=trace_context,
-            kind=self._span_kind,
+        # Call upstream to create llm_request span (includes queue wait)
+        super().do_tracing(
+            engine_core_output,
+            req_state,
+            iteration_stats,
+            extra_attributes=extra_attributes,
+            span_kind=self._span_kind,
         )
+
+        # Create additional llm_processing span if first_chunk_received_ts available
+        # This span measures pure processing time (scheduler pickup → finish)
+        first_chunk_ts = getattr(engine_core_output, "first_chunk_received_ts", None)
+        if first_chunk_ts is not None:
+            trace_context = extract_trace_context(engine_core_output.trace_headers)
+            processing_start_ns = int(first_chunk_ts * 1e9)
+            instrument_manual(
+                span_name="llm_processing",
+                start_time=processing_start_ns,
+                attributes=extra_attributes,
+                context=trace_context,
+                kind=self._span_kind,
+            )
