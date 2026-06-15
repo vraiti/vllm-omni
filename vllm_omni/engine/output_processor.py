@@ -779,14 +779,24 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
         # Create additional llm_processing span if first_chunk_received_ts available
         # This span measures pure processing time (scheduler pickup → finish)
-        first_chunk_ts = getattr(engine_core_output, "first_chunk_received_ts", None)
-        if first_chunk_ts is not None:
-            trace_context = extract_trace_context(engine_core_output.trace_headers)
-            processing_start_ns = int(first_chunk_ts * 1e9)
-            instrument_manual(
-                span_name="llm_processing",
-                start_time=processing_start_ns,
-                attributes=extra_attributes,
-                context=trace_context,
-                kind=self._span_kind,
-            )
+        first_chunk_ts = engine_core_output.first_chunk_received_ts
+        if first_chunk_ts is None:
+            return
+        
+        metrics = req_state.stats
+        trace_context = extract_trace_context(engine_core_output.trace_headers)
+        processing_start_ns = int(first_chunk_ts * 1e9)
+
+        # Calculate end time: first_chunk_ts + time elapsed from scheduled to last_token
+        # (scheduled_ts and last_token_ts are monotonic, first_chunk_ts is wall-clock)
+        processing_duration_s = metrics.last_token_ts - metrics.scheduled_ts
+        processing_end_ns = int((first_chunk_ts + processing_duration_s) * 1e9)
+
+        instrument_manual(
+            span_name="llm_processing",
+            start_time=processing_start_ns,
+            end_time=processing_end_ns,
+            attributes=extra_attributes,
+            context=trace_context,
+            kind=self._span_kind,
+        )
