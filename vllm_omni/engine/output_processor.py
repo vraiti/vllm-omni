@@ -774,7 +774,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         if first_chunk_ts is None:
             return
 
-        metrics = req_state.stats
+        # Use native_text_stats for OmniRequestState (has correct timestamps),
+        # fall back to base stats otherwise
+        metrics = (
+            req_state.native_text_stats
+            if isinstance(req_state, OmniRequestState)
+            else req_state.stats
+        )
         trace_context = extract_trace_context(engine_core_output.trace_headers)
         processing_start_ns = int(first_chunk_ts * 1e9)
 
