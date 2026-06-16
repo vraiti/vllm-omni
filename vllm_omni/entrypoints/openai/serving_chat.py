@@ -569,6 +569,51 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             if _val is not None:
                                 sp.extra_args[_key] = _val
 
+                # DEBUG TRACING: Validate prompt length before sending to engine
+                # This catches the max_model_len validation gap (see notes/issues/MAX_MODEL_LEN_VALIDATION.md)
+                max_model_len = self.model_config.max_model_len
+                prompt_len = None
+
+                try:
+                    if isinstance(engine_prompt, dict):
+                        if "prompt_token_ids" in engine_prompt:
+                            prompt_len = len(engine_prompt["prompt_token_ids"])
+                        elif "prompt" in engine_prompt and isinstance(engine_prompt["prompt"], str):
+                            # For text prompts, estimate token count
+                            # (actual tokenization may happen later in the pipeline)
+                            prompt_len = len(tokenizer.encode(engine_prompt["prompt"]))
+                        elif "prompt" in engine_prompt and isinstance(engine_prompt["prompt"], list):
+                            # Token IDs list
+                            prompt_len = len(engine_prompt["prompt"])
+
+                    if prompt_len is not None:
+                        logger.info(
+                            f"[DEBUG] Request {request_id}: prompt_len={prompt_len}, "
+                            f"max_model_len={max_model_len}, "
+                            f"engine_prompt_type={type(engine_prompt).__name__}, "
+                            f"engine_prompt_keys={list(engine_prompt.keys()) if isinstance(engine_prompt, dict) else 'N/A'}"
+                        )
+
+                        if prompt_len > max_model_len:
+                            error_msg = (
+                                f"Prompt length ({prompt_len}) exceeds model's maximum "
+                                f"context length ({max_model_len}). "
+                                f"Request ID: {request_id}"
+                            )
+                            logger.error(f"[DEBUG] Validation failed: {error_msg}")
+                            raise ValueError(error_msg)
+                    else:
+                        logger.warning(
+                            f"[DEBUG] Request {request_id}: Could not extract prompt length. "
+                            f"engine_prompt_type={type(engine_prompt).__name__}, "
+                            f"engine_prompt_keys={list(engine_prompt.keys()) if isinstance(engine_prompt, dict) else 'N/A'}"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[DEBUG] Request {request_id}: Error during prompt length validation: {e}. "
+                        f"Proceeding without validation (may crash in engine)."
+                    )
+
                 self._log_inputs(
                     request_id,
                     engine_prompt,
