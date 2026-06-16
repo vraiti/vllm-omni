@@ -759,22 +759,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         req_state: RequestState,
         iteration_stats: IterationStats | None,
     ) -> None:
-        # Build omni-specific attributes
-        extra_attributes: dict[str, Any] = {
-            OmniSpanAttributes.ENGINE_IDX: self._engine_idx,
-            OmniSpanAttributes.STAGE_ID: self._stage_id,
-            OmniSpanAttributes.STAGE_REPLICA_ID: self._replica_id,
-        }
-        if self._stage_name is not None:
-            extra_attributes[OmniSpanAttributes.STAGE_NAME] = self._stage_name
-
         # Call upstream to create llm_request span (includes queue wait)
+        # TODO: Add omni-specific attributes (ENGINE_IDX, STAGE_ID, STAGE_REPLICA_ID, STAGE_NAME)
+        # once vLLM supports extra_attributes parameter in do_tracing()
         super().do_tracing(
             engine_core_output,
             req_state,
             iteration_stats,
-            extra_attributes=extra_attributes,
-            span_kind=self._span_kind,
         )
 
         # Create additional llm_processing span if first_chunk_received_ts available
@@ -782,7 +773,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         first_chunk_ts = engine_core_output.first_chunk_received_ts
         if first_chunk_ts is None:
             return
-        
+
         metrics = req_state.stats
         trace_context = extract_trace_context(engine_core_output.trace_headers)
         processing_start_ns = int(first_chunk_ts * 1e9)
@@ -792,11 +783,20 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         processing_duration_s = metrics.last_token_ts - metrics.scheduled_ts
         processing_end_ns = int((first_chunk_ts + processing_duration_s) * 1e9)
 
+        # Build omni-specific attributes for llm_processing span
+        attributes: dict[str, Any] = {
+            OmniSpanAttributes.ENGINE_IDX: self._engine_idx,
+            OmniSpanAttributes.STAGE_ID: self._stage_id,
+            OmniSpanAttributes.STAGE_REPLICA_ID: self._replica_id,
+        }
+        if self._stage_name is not None:
+            attributes[OmniSpanAttributes.STAGE_NAME] = self._stage_name
+
         instrument_manual(
             span_name="llm_processing",
             start_time=processing_start_ns,
             end_time=processing_end_ns,
-            attributes=extra_attributes,
+            attributes=attributes,
             context=trace_context,
             kind=self._span_kind,
         )
