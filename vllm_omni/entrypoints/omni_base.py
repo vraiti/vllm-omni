@@ -4,7 +4,7 @@ import os
 import time
 import weakref
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
@@ -35,9 +35,6 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.tracing import OmniSpanAttributes
 from vllm_omni.utils.tracking_parser import TrackingNamespace
-
-if TYPE_CHECKING:
-    pass
 
 logger = init_logger(__name__)
 
@@ -490,7 +487,9 @@ class OmniBase(PDDisaggregationMixin):
         # Merge pipeline timings from Orchestrator into stage_durations
         _m = result.metrics
         if _m is not None and hasattr(_m, "pipeline_timings") and _m.pipeline_timings:
-            for key, value in _m.pipeline_timings.items():
+            import dataclasses
+
+            for key, value in dataclasses.asdict(_m.pipeline_timings).items():
                 if key not in stage_durations:
                     stage_durations[key] = value
 

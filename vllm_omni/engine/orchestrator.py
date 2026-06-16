@@ -63,6 +63,7 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.metrics.stats import PipelineTimings
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.tracing import OmniSpanAttributes
 
@@ -152,7 +153,7 @@ class OrchestratorRequestState:
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
     # Per-request pipeline timing accumulator (milliseconds)
-    pipeline_timings: dict[str, float] = field(default_factory=dict)
+    pipeline_timings: PipelineTimings = field(default_factory=PipelineTimings)
 
     # W3C trace context propagated across stages
     trace_headers: dict[str, str] | None = None
@@ -500,7 +501,7 @@ class Orchestrator:
             trace_headers=getattr(prompt, "trace_headers", None),
         )
         if self._tracing_enabled and is_tracing_available():
-            arrival_time = msg.arrival_time or getattr(prompt, "arrival_time", None) or _time.time()
+            arrival_time = msg.arrival_time or _time.time()
             req_state.trace_start_ns = int(arrival_time * 1e9)
             self._start_omni_request_span(req_state)
             if req_state.trace_headers and hasattr(prompt, "trace_headers"):
@@ -512,10 +513,10 @@ class Orchestrator:
         req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
-            req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
+            req_state.pipeline_timings.queue_wait_ms = (_time.perf_counter() - enqueue_ts) * 1000.0
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
-            req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+            req_state.pipeline_timings.preprocess_ms = preprocess_ms
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
@@ -820,7 +821,7 @@ class Orchestrator:
                     replica_id=replica_id,
                     sampling_params=req_state.sampling_params_list[stage_id],
                 )
-                stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+                stage_metrics.pipeline_timings = req_state.pipeline_timings
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
@@ -1037,12 +1038,14 @@ class Orchestrator:
         if span is None:
             return
         span.set_attribute(SpanAttributes.GEN_AI_REQUEST_ID, req_id)
-        if req_state.pipeline_timings:
-            import json
+        import dataclasses
+        import json
 
+        pt_dict = dataclasses.asdict(req_state.pipeline_timings)
+        if pt_dict:
             span.set_attribute(
                 OmniSpanAttributes.PIPELINE_TIMINGS,
-                json.dumps(req_state.pipeline_timings),
+                json.dumps(pt_dict),
             )
         span.end(_time.time_ns())
 
@@ -1238,7 +1241,7 @@ class Orchestrator:
                     **_extra_kwargs,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
-                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
+                req_state.pipeline_timings.ar2diffusion_ms = _dt_ar2d
                 logger.info(
                     "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
                     req_id,

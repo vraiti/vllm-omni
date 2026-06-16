@@ -12,6 +12,7 @@ from vllm.tracing import (
 )
 from vllm.tracing.otel import is_otel_available
 
+from vllm_omni.metrics.stats import PipelineTimings
 from vllm_omni.tracing import OmniSpanAttributes
 
 from .conftest import FakeTraceService
@@ -250,7 +251,7 @@ class MockOrchestratorRequestState:
     request_id: str = "req-001"
     trace_headers: dict[str, str] | None = None
     trace_start_ns: int = 0
-    pipeline_timings: dict[str, float] = field(default_factory=dict)
+    pipeline_timings: PipelineTimings = field(default_factory=PipelineTimings)
     _omni_span: Any = None
 
 
@@ -299,7 +300,7 @@ class TestOmniRequestSpan:
         orch = self._make_orchestrator()
         req_state = MockOrchestratorRequestState(
             trace_start_ns=int(time.time() * 1e9),
-            pipeline_timings={"stage0_ms": 100.5, "stage1_ms": 200.3},
+            pipeline_timings=PipelineTimings(queue_wait_ms=100.5, preprocess_ms=200.3),
         )
 
         orch._start_omni_request_span(req_state)
