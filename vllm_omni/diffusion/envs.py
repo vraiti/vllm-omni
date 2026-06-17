@@ -46,12 +46,18 @@ class PackagesEnvChecker:
 
     def _check_flash_attn(self) -> bool:
         """Check if flash attention is available and compatible."""
-        platform = current_omni_platform
+        try:
+            platform = current_omni_platform
 
-        if platform.get_device_count() == 0:
-            return False
+            if platform.get_device_count() == 0:
+                return False
 
-        return platform.has_flash_attn_package()
+            return platform.has_flash_attn_package()
+        except RuntimeError:
+            # CUDA not available (e.g., running on bastion with old driver before
+            # cloudexe forwards to GPU node). Assume flash_attn is available - the
+            # actual check will happen when code runs on the GPU node.
+            return True
 
     def get_packages_info(self) -> dict:
         """Get the packages info dictionary."""
