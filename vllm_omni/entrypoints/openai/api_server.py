@@ -646,6 +646,10 @@ async def build_async_omni_from_stage_config(
     try:
         kwargs = args.get_explicit_kwargs_dict()
         model = kwargs.pop("model", None) or args.model
+        # Extract otlp_traces_endpoint from args if present
+        # AsyncOmniEngine expects it as a direct kwarg, not nested in observability_config
+        if hasattr(args, "otlp_traces_endpoint") and args.otlp_traces_endpoint is not None:
+            kwargs["otlp_traces_endpoint"] = args.otlp_traces_endpoint
         async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
