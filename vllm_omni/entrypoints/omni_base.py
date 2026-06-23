@@ -674,8 +674,13 @@ class OmniBase(PDDisaggregationMixin):
         )
         if total_ms <= 0:
             return
-        start_ns = int(time.time_ns() - total_ms * 1_000_000)
-        end_ns = time.time_ns()
+        step_start = dm.get("step_start_ts", 0.0)
+        if step_start > 0:
+            start_ns = int(step_start * 1e9)
+            end_ns = int((step_start + total_ms / 1000) * 1e9)
+        else:
+            start_ns = int(time.time_ns() - total_ms * 1_000_000)
+            end_ns = time.time_ns()
         _KEY_MAP = {
             "preprocess_time_ms": OmniSpanAttributes.DIFFUSION_PREPROCESS_MS,
             "preprocess_ms": OmniSpanAttributes.DIFFUSION_PREPROCESS_MS,

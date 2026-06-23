@@ -27,7 +27,7 @@ from vllm import envs as vllm_envs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
-from vllm.tracing import init_tracer
+from vllm.tracing import init_tracer, instrument
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
@@ -352,6 +352,7 @@ class AsyncOmniEngine:
             self._diffusion_od_config_view = SimpleNamespace(model_class_name=resolve_model_class_name(self.model))
         return self._diffusion_od_config_view
 
+    @instrument(span_name="Initialize stages")
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
         self._runtime = create_stage_runtime(

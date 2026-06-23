@@ -794,25 +794,24 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_output: EngineCoreOutput,
         req_state: RequestState,
     ) -> None:
+        first_chunk_ts = getattr(engine_core_output, "first_chunk_received_ts", None)
+        if first_chunk_ts is None:
+            return
         stats = getattr(req_state, "native_text_stats", None) or req_state.stats
         if stats is None:
             return
-        if stats.last_token_ts <= 0:
-            return
-        start_mono = stats.scheduled_ts if stats.scheduled_ts > 0 else stats.first_token_ts
-        if start_mono <= 0:
-            start_ns = int(stats.arrival_time * 1e9)
+        scheduled_ts = stats.scheduled_ts if stats.scheduled_ts > 0 else 0.0
+        last_token_ts = stats.last_token_ts if stats.last_token_ts > 0 else 0.0
+        if scheduled_ts > 0 and last_token_ts > 0:
+            duration = last_token_ts - scheduled_ts
+        elif stats.first_token_ts > 0 and last_token_ts > 0:
+            duration = last_token_ts - stats.first_token_ts
         else:
-            wall_now = _time.time()
-            mono_now = _time.monotonic()
-            start_ns = int((wall_now - (mono_now - start_mono)) * 1e9)
+            return
+        start_ns = int(first_chunk_ts * 1e9)
+        end_ns = int((first_chunk_ts + duration) * 1e9)
         trace_context = extract_trace_context(
             engine_core_output.trace_headers,
-        )
-        wall_now = _time.time()
-        mono_now = _time.monotonic()
-        end_ns = int(
-            (wall_now - (mono_now - stats.last_token_ts)) * 1e9
         )
         attributes: dict[str, Any] = {
             OmniSpanAttributes.STAGE_ID: self._stage_id,

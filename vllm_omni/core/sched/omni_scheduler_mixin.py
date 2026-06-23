@@ -40,6 +40,11 @@ except ValueError:
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
 
+    def add_request(self, request) -> None:
+        if request.request_id not in self.requests:
+            request.first_chunk_received_ts = time.time()
+        super().add_request(request)
+
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
         input_coordinator = getattr(self, "input_coordinator", None)
