@@ -8,6 +8,12 @@ from typing import Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
+from vllm.tracing import (
+    SpanKind,
+    extract_trace_context,
+    instrument_manual,
+    is_tracing_available,
+)
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -23,6 +29,7 @@ from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_st
 from vllm_omni.errors import raise_client_error_or
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
+from vllm_omni.tracing import OmniSpanAttributes
 from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -506,6 +513,11 @@ class OmniBase(PDDisaggregationMixin):
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if finished and _m is not None:
             metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
+            if (
+                is_tracing_available()
+                and getattr(_m, "diffusion_metrics", None)
+            ):
+                self._emit_diffusion_span(result, _m)
 
         if not stage_meta.final_output:
             return None
@@ -643,6 +655,38 @@ class OmniBase(PDDisaggregationMixin):
             List of results from each stage.
         """
         return self.engine.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
+
+    @staticmethod
+    def _emit_diffusion_span(
+        result: OutputMessage,
+        stage_metrics: Any,
+    ) -> None:
+        dm = stage_metrics.diffusion_metrics
+        if not dm:
+            return
+        trace_context = extract_trace_context(result.trace_headers)
+        total_ms = dm.get("total_ms", 0)
+        if total_ms <= 0:
+            return
+        start_ns = int(time.time_ns() - total_ms * 1_000_000)
+        end_ns = time.time_ns()
+        attributes: dict[str, Any] = {}
+        for key, attr in (
+            ("preprocess_ms", OmniSpanAttributes.DIFFUSION_PREPROCESS_MS),
+            ("exec_ms", OmniSpanAttributes.DIFFUSION_EXEC_MS),
+            ("postprocess_ms", OmniSpanAttributes.DIFFUSION_POSTPROCESS_MS),
+            ("total_ms", OmniSpanAttributes.DIFFUSION_TOTAL_MS),
+        ):
+            if key in dm:
+                attributes[attr] = float(dm[key])
+        instrument_manual(
+            span_name="diffusion_request",
+            start_time=start_ns,
+            end_time=end_ns,
+            attributes=attributes,
+            context=trace_context,
+            kind=SpanKind.INTERNAL,
+        )
 
     def _shutdown_base(self) -> None:
         if getattr(self, "_shutdown_called", False):

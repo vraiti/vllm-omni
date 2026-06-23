@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
+from vllm.tracing import maybe_init_worker_tracer
 from vllm.utils.system_utils import (
     decorate_logs,
     set_process_title,
@@ -104,6 +105,9 @@ class StageEngineCoreProc(EngineCoreProc):
             stage_label = f"stage{omni_stage_id}" if omni_stage_id is not None else "noid"
             set_death_signal(signal.SIGTERM)
             set_process_title(f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
+            maybe_init_worker_tracer(
+                "vllm_omni", "stage_engine_core", stage_label,
+            )
             decorate_logs()
             # Workaround for flashinfer/jit-cache version mismatch in CI.
             # The parent process handles this gracefully via ring_globals.py,
