@@ -512,6 +512,8 @@ class OmniBase(PDDisaggregationMixin):
         stage_meta = self.engine.get_stage_metadata(stage_id)
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if finished and _m is not None:
+            metrics.accumulate_diffusion_metrics(
+                stage_meta.stage_type, req_id, engine_outputs)
             metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
             if (
                 is_tracing_available()
@@ -665,19 +667,28 @@ class OmniBase(PDDisaggregationMixin):
         if not dm:
             return
         trace_context = extract_trace_context(result.trace_headers)
-        total_ms = dm.get("total_ms", 0)
+        total_ms = (
+            dm.get("diffusion_engine_total_time_ms")
+            or dm.get("total_ms")
+            or 0
+        )
         if total_ms <= 0:
             return
         start_ns = int(time.time_ns() - total_ms * 1_000_000)
         end_ns = time.time_ns()
+        _KEY_MAP = {
+            "preprocess_time_ms": OmniSpanAttributes.DIFFUSION_PREPROCESS_MS,
+            "preprocess_ms": OmniSpanAttributes.DIFFUSION_PREPROCESS_MS,
+            "diffusion_engine_exec_time_ms": OmniSpanAttributes.DIFFUSION_EXEC_MS,
+            "exec_ms": OmniSpanAttributes.DIFFUSION_EXEC_MS,
+            "postprocess_time_ms": OmniSpanAttributes.DIFFUSION_POSTPROCESS_MS,
+            "postprocess_ms": OmniSpanAttributes.DIFFUSION_POSTPROCESS_MS,
+            "diffusion_engine_total_time_ms": OmniSpanAttributes.DIFFUSION_TOTAL_MS,
+            "total_ms": OmniSpanAttributes.DIFFUSION_TOTAL_MS,
+        }
         attributes: dict[str, Any] = {}
-        for key, attr in (
-            ("preprocess_ms", OmniSpanAttributes.DIFFUSION_PREPROCESS_MS),
-            ("exec_ms", OmniSpanAttributes.DIFFUSION_EXEC_MS),
-            ("postprocess_ms", OmniSpanAttributes.DIFFUSION_POSTPROCESS_MS),
-            ("total_ms", OmniSpanAttributes.DIFFUSION_TOTAL_MS),
-        ):
-            if key in dm:
+        for key, attr in _KEY_MAP.items():
+            if key in dm and attr not in attributes:
                 attributes[attr] = float(dm[key])
         instrument_manual(
             span_name="diffusion_request",
