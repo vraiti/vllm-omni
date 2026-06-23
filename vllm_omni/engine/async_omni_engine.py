@@ -238,7 +238,8 @@ class AsyncOmniEngine:
 
         otlp_traces_endpoint = kwargs.get("otlp_traces_endpoint")
         if otlp_traces_endpoint:
-            init_tracer("vllm_omni", otlp_traces_endpoint)
+            init_tracer("vllm_omni", otlp_traces_endpoint,
+                       extra_attributes={"service.name": "vllm-omni"})
             self._tracing_enabled = True
             self._log_stats = True
             logger.info(
