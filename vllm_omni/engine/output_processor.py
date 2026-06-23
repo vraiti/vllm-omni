@@ -480,12 +480,31 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         stage_name: str | None = None,
         replica_id: int = 0,
     ):
+        """Initialize the multimodal output processor.
+
+        Args:
+            tokenizer: Tokenizer for detokenizing text outputs
+            log_stats: Whether to log statistics
+            stream_interval: Stream interval for output generation
+            tracing_enabled: Whether OpenTelemetry tracing is active
+            engine_core_output_type: Optional output type string (e.g.,
+                "image", "audio", "latent"). Converted to OutputModality
+                internally. Kept for backward compatibility with
+                stage_init_utils.
+            output_modality: Type-safe output modality flag. Used to tag
+                multimodal outputs with the correct modality key when
+                per-output type info is unavailable.
+            stage_id: Pipeline stage index for span attributes.
+            stage_name: Human-readable stage name for span attributes.
+            replica_id: Replica index for span attributes.
+        """
         super().__init__(
             tokenizer=tokenizer,
             log_stats=log_stats,
             stream_interval=stream_interval,
             tracing_enabled=tracing_enabled,
         )
+        # Convert string-based engine_core_output_type to OutputModality
         if engine_core_output_type is not None:
             self.output_modality = OutputModality.from_string(engine_core_output_type)
         else:

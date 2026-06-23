@@ -42,6 +42,8 @@ class OmniSchedulerMixin:
 
     def add_request(self, request) -> None:
         if request.request_id not in self.requests:
+            # Fallback for stage 0 which has no upstream chunks;
+            # downstream stages overwrite this in chunk_transfer_adapter.
             request.first_chunk_received_ts = time.time()
         super().add_request(request)
 
