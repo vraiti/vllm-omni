@@ -1,4 +1,3 @@
-import time as _time
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
@@ -23,7 +22,6 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
-from vllm_omni.tracing import OmniSpanAttributes
 from vllm_omni.engine.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 from vllm_omni.engine.output_modality import (
     DRAINABLE_MODALITIES,
@@ -32,6 +30,7 @@ from vllm_omni.engine.output_modality import (
     get_accumulation_strategy,
 )
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.tracing import OmniSpanAttributes
 
 logger = init_logger(__name__)
 
@@ -638,7 +637,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
         # Handle multimodal-only outputs (generation stages) locally.
         self._process_mm_only_outputs(
-            mm_only_outputs, engine_core_timestamp, iteration_stats,
+            mm_only_outputs,
+            engine_core_timestamp,
+            iteration_stats,
         )
 
         # Delegate text/pooling outputs to upstream.
@@ -666,7 +667,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
             if req_state.stats is not None:
                 self._update_stats_from_output(
-                    req_state, eco, engine_core_timestamp, iteration_stats,
+                    req_state,
+                    eco,
+                    engine_core_timestamp,
+                    iteration_stats,
                 )
 
             new_token_ids = eco.new_token_ids

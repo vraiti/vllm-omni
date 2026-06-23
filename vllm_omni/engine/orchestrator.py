@@ -12,6 +12,7 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import time as _time
 from dataclasses import dataclass, field
@@ -27,7 +28,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.tracing import (
     SpanKind,
     extract_trace_context,
-    instrument_manual,
     is_tracing_available,
 )
 from vllm.tracing.utils import SpanAttributes
@@ -36,7 +36,6 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine import OmniEngineCoreRequest
-from vllm_omni.tracing import OmniSpanAttributes
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
@@ -57,7 +56,9 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.metrics.stats import PipelineTimings
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.tracing import OmniSpanAttributes
 
 logger = init_logger(__name__)
 
@@ -195,7 +196,7 @@ class OrchestratorRequestState:
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
     # Per-request pipeline timing accumulator (milliseconds)
-    pipeline_timings: dict[str, float] = field(default_factory=dict)
+    pipeline_timings: PipelineTimings = field(default_factory=PipelineTimings)
 
     # Tracing: W3C trace context for downstream propagation
     trace_headers: dict[str, str] | None = None
@@ -480,10 +481,10 @@ class Orchestrator:
         req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
-            req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
+            req_state.pipeline_timings.queue_wait_ms = (_time.perf_counter() - enqueue_ts) * 1000.0
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
-            req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+            req_state.pipeline_timings.preprocess_ms = preprocess_ms
         if self._tracing_enabled:
             self._start_omni_request_span(req_state, prompt)
         await self.stage_pools[stage_id].submit_initial(
@@ -790,7 +791,7 @@ class Orchestrator:
                     replica_id=replica_id,
                     sampling_params=req_state.sampling_params_list[stage_id],
                 )
-                stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+                stage_metrics.pipeline_timings = dataclasses.replace(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
@@ -875,10 +876,11 @@ class Orchestrator:
                 SpanAttributes.GEN_AI_REQUEST_ID,
                 req_state.request_id,
             )
-            if req_state.pipeline_timings:
+            pt_dict = dataclasses.asdict(req_state.pipeline_timings)
+            if pt_dict:
                 span.set_attribute(
                     OmniSpanAttributes.PIPELINE_TIMINGS,
-                    json.dumps(req_state.pipeline_timings),
+                    json.dumps(pt_dict),
                 )
             span.end()
         except Exception:
@@ -1296,7 +1298,7 @@ class Orchestrator:
                     **_extra_kwargs,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
-                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
+                req_state.pipeline_timings.ar2diffusion_ms = _dt_ar2d
                 logger.info(
                     "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
                     req_id,

@@ -207,7 +207,9 @@ class DiffusionEngine:
         exec_start_time = time.perf_counter()
         output = await self.async_add_req_and_wait_for_response(request)
         exec_total_time = time.perf_counter() - exec_start_time
-        return self.postprocess_output(request, output, diffusion_engine_start_time, preprocess_time, exec_total_time, step_start_ts=step_start_ts)
+        return self.postprocess_output(
+            request, output, diffusion_engine_start_time, preprocess_time, exec_total_time, step_start_ts=step_start_ts
+        )
 
     async def step_streaming(self, request: OmniDiffusionRequest) -> AsyncGenerator[list[OmniRequestOutput], None]:
         await self._check_and_start_background_loop()
@@ -227,7 +229,12 @@ class DiffusionEngine:
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
             yield self.postprocess_output(
-                request, output, diffusion_engine_start_time, preprocess_time, exec_total_time, step_start_ts=step_start_ts
+                request,
+                output,
+                diffusion_engine_start_time,
+                preprocess_time,
+                exec_total_time,
+                step_start_ts=step_start_ts,
             )
 
     def postprocess_output(

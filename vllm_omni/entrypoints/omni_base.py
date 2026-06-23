@@ -29,11 +29,11 @@ from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_st
 from vllm_omni.errors import raise_client_error_or
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
-from vllm_omni.tracing import OmniSpanAttributes
 from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.tracing import OmniSpanAttributes
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 logger = init_logger(__name__)
@@ -487,7 +487,9 @@ class OmniBase(PDDisaggregationMixin):
         # Merge pipeline timings from Orchestrator into stage_durations
         _m = result.metrics
         if _m is not None and hasattr(_m, "pipeline_timings") and _m.pipeline_timings:
-            for key, value in _m.pipeline_timings.items():
+            import dataclasses as _dc
+
+            for key, value in _dc.asdict(_m.pipeline_timings).items():
                 if key not in stage_durations:
                     stage_durations[key] = value
 
@@ -512,13 +514,9 @@ class OmniBase(PDDisaggregationMixin):
         stage_meta = self.engine.get_stage_metadata(stage_id)
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if finished and _m is not None:
-            metrics.accumulate_diffusion_metrics(
-                stage_meta.stage_type, req_id, engine_outputs)
+            metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
             metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
-            if (
-                is_tracing_available()
-                and getattr(_m, "diffusion_metrics", None)
-            ):
+            if is_tracing_available() and getattr(_m, "diffusion_metrics", None):
                 self._emit_diffusion_span(result, _m)
 
         if not stage_meta.final_output:
@@ -658,8 +656,8 @@ class OmniBase(PDDisaggregationMixin):
         """
         return self.engine.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
-    @staticmethod
     def _emit_diffusion_span(
+        self,
         result: OutputMessage,
         stage_metrics: Any,
     ) -> None:
@@ -667,11 +665,7 @@ class OmniBase(PDDisaggregationMixin):
         if not dm:
             return
         trace_context = extract_trace_context(result.trace_headers)
-        total_ms = (
-            dm.get("diffusion_engine_total_time_ms")
-            or dm.get("total_ms")
-            or 0
-        )
+        total_ms = dm.get("diffusion_engine_total_time_ms") or dm.get("total_ms") or 0
         if total_ms <= 0:
             return
         step_start = dm.get("step_start_ts", 0.0)
@@ -691,7 +685,11 @@ class OmniBase(PDDisaggregationMixin):
             "diffusion_engine_total_time_ms": OmniSpanAttributes.DIFFUSION_TOTAL_MS,
             "total_ms": OmniSpanAttributes.DIFFUSION_TOTAL_MS,
         }
-        attributes: dict[str, Any] = {}
+        attributes: dict[str, Any] = {
+            OmniSpanAttributes.STAGE_ID: stage_metrics.stage_id,
+            OmniSpanAttributes.STAGE_NAME: "diffusion",
+            OmniSpanAttributes.STAGE_REPLICA_ID: stage_metrics.replica_id,
+        }
         for key, attr in _KEY_MAP.items():
             if key in dm and attr not in attributes:
                 attributes[attr] = float(dm[key])

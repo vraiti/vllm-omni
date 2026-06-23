@@ -1,5 +1,4 @@
 class OmniSpanAttributes:
-    ENGINE_IDX = "vllm_omni.engine.idx"
     STAGE_ID = "vllm_omni.stage.id"
     STAGE_NAME = "vllm_omni.stage.name"
     STAGE_REPLICA_ID = "vllm_omni.stage.replica_id"

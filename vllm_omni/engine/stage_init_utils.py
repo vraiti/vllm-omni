@@ -833,9 +833,15 @@ def build_llm_stage_output_processor(
         tokenizer = cached_tokenizer_from_config(
             model_config=stage_vllm_config.model_config,
         )
-    stage_name = getattr(
-        stage_vllm_config.model_config, "model_stage", None,
-    ) if hasattr(stage_vllm_config, "model_config") else None
+    stage_name = (
+        getattr(
+            stage_vllm_config.model_config,
+            "model_stage",
+            None,
+        )
+        if hasattr(stage_vllm_config, "model_config")
+        else None
+    )
     if stage_name is None:
         stage_name = metadata.stage_type
     return MultimodalOutputProcessor(
