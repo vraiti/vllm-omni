@@ -820,7 +820,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         first_chunk_ts = getattr(engine_core_output, "first_chunk_received_ts", None)
         if first_chunk_ts is None:
             return
-        stats = getattr(req_state, "native_text_stats", None) or req_state.stats
+        native_stats = getattr(req_state, "native_text_stats", None)
+        stats = native_stats if native_stats and native_stats.scheduled_ts > 0 else req_state.stats
         if stats is None:
             return
         scheduled_ts = stats.scheduled_ts if stats.scheduled_ts > 0 else 0.0
