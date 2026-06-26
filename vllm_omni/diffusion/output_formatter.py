@@ -101,12 +101,12 @@ def format_diffusion_outputs(
 
     outputs = _ensure_list(postprocess_output.outputs)
     metrics = {
-        "preprocess_time_ms": timings.preprocess_time_s * 1000,
-        "diffusion_engine_exec_time_ms": timings.exec_time_s * 1000,
-        "diffusion_engine_total_time_ms": timings.total_time_ms,
+        "preprocess_time_s": timings.preprocess_time_s,
+        "diffusion_engine_exec_time_s": timings.exec_time_s,
+        "diffusion_engine_total_time_s": timings.total_time_ms / 1000.0,
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
         "resolution": int(request.sampling_params.resolution),
-        "postprocess_time_ms": timings.postprocess_time_s * 1000,
+        "postprocess_time_s": timings.postprocess_time_s,
     }
 
     # Detect text output: when the pipeline returns a string (e.g.,
