@@ -18,7 +18,7 @@ class DiffusionStepTimings:
     preprocess_time_s: float
     exec_time_s: float
     postprocess_time_s: float
-    total_time_ms: float
+    total_time_s: float
 
 
 @dataclass(frozen=True)
@@ -103,7 +103,7 @@ def format_diffusion_outputs(
     metrics = {
         "preprocess_time_s": timings.preprocess_time_s,
         "diffusion_engine_exec_time_s": timings.exec_time_s,
-        "diffusion_engine_total_time_s": timings.total_time_ms / 1000.0,
+        "diffusion_engine_total_time_s": timings.total_time_s,
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
         "resolution": int(request.sampling_params.resolution),
         "postprocess_time_s": timings.postprocess_time_s,

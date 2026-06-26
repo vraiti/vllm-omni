@@ -303,14 +303,14 @@ class DiffusionEngine:
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 
-        step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
+        step_total_s = time.perf_counter() - diffusion_engine_start_time
         logger.debug(
             "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
             "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
             preprocess_time * 1000,
             exec_total_time * 1000,
             postprocess_time * 1000,
-            step_total_ms,
+            step_total_s * 1000,
         )
 
         return format_diffusion_outputs(
@@ -323,7 +323,7 @@ class DiffusionEngine:
                 preprocess_time_s=preprocess_time,
                 exec_time_s=exec_total_time,
                 postprocess_time_s=postprocess_time,
-                total_time_ms=step_total_ms,
+                total_time_s=step_total_s,
             ),
         )
 
