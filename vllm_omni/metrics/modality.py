@@ -283,26 +283,17 @@ def observe_modality_at_finalize(
         else:
             mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
 
-    diffusion_metrics = getattr(stage_metrics, "diffusion_metrics", None)
-    if diffusion_metrics:
-        _observe_diffusion(mod_metrics, stage_label, replica_label, diffusion_metrics)
-
-
-def _observe_diffusion(
-    mod_metrics: OmniModalityMetrics,
-    stage: str,
-    replica: str,
-    dm: dict[str, float],
-) -> None:
-    _KEY_MAP = {
-        "diffusion_engine_exec_time_s": mod_metrics.observe_diffusion_exec,
-        "preprocess_time_s": mod_metrics.observe_diffusion_preprocess,
-        "postprocess_time_s": mod_metrics.observe_diffusion_postprocess,
-    }
-    for key, observe_fn in _KEY_MAP.items():
-        val = dm.get(key)
-        if val is not None:
-            observe_fn(stage, replica, float(val))
+    dm = getattr(stage_metrics, "diffusion_metrics", None)
+    if dm:
+        _key_map = {
+            "diffusion_engine_exec_time_s": mod_metrics.observe_diffusion_exec,
+            "preprocess_time_s": mod_metrics.observe_diffusion_preprocess,
+            "postprocess_time_s": mod_metrics.observe_diffusion_postprocess,
+        }
+        for key, observe_fn in _key_map.items():
+            val = dm.get(key)
+            if val is not None:
+                observe_fn(stage_label, replica_label, float(val))
 
 
 def observe_audio_first_packet(
