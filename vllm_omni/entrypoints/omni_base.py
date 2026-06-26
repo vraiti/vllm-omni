@@ -506,8 +506,8 @@ class OmniBase(PDDisaggregationMixin):
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if _m is not None:
             metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
-        if finished and _m is not None:
-            metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
+            if finished:
+                metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
 
         if not stage_meta.final_output:
             return None
