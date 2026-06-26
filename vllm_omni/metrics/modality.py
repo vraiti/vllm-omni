@@ -295,7 +295,7 @@ def _observe_diffusion(
     }
     for key, observe_fn in _KEY_MAP.items():
         val = dm.get(key)
-        if val is not None and val >= 0:
+        if val is not None:
             observe_fn(stage, replica, float(val))
 
 
