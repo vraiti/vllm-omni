@@ -86,6 +86,12 @@ _diffusion_exec_family = Histogram(
     labelnames=_stage_labels,
     buckets=defs.SECONDS_FAST_BUCKETS,
 )
+_diffusion_exec_per_step_family = Histogram(
+    defs.DIFFUSION_EXEC_PER_STEP_S,
+    "DiT forward pass execution time per denoising step in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
 _diffusion_preprocess_family = Histogram(
     defs.DIFFUSION_PREPROCESS_S,
     "Diffusion input preprocessing time per request in seconds.",
@@ -167,6 +173,15 @@ class OmniModalityMetrics:
         if not self._log_stats:
             return
         _diffusion_exec_family.labels(
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
+        ).observe(seconds)
+
+    def observe_diffusion_exec_per_step(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats:
+            return
+        _diffusion_exec_per_step_family.labels(
             model_name=self._model_name,
             stage=stage,
             replica=replica,
@@ -294,6 +309,15 @@ def observe_modality_at_finalize(
             val = dm.get(key)
             if val is not None:
                 observe_fn(stage_label, replica_label, float(val))
+
+        exec_time = dm.get("diffusion_engine_exec_time_s")
+        num_steps = dm.get("num_inference_steps")
+        if exec_time is not None and num_steps and num_steps > 0:
+            mod_metrics.observe_diffusion_exec_per_step(
+                stage_label,
+                replica_label,
+                float(exec_time) / int(num_steps),
+            )
 
 
 def observe_audio_first_packet(

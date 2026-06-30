@@ -107,6 +107,7 @@ def format_diffusion_outputs(
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
         "resolution": int(request.sampling_params.resolution),
         "postprocess_time_s": timings.postprocess_time_s,
+        "num_inference_steps": request.sampling_params.num_inference_steps,
     }
 
     # Detect text output: when the pipeline returns a string (e.g.,

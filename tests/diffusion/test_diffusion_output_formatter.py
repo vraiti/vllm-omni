@@ -47,7 +47,7 @@ def _timings() -> DiffusionStepTimings:
         preprocess_time_s=0.01,
         exec_time_s=0.02,
         postprocess_time_s=0.03,
-        total_time_ms=60.0,
+        total_time_s=0.06,
     )
 
 
@@ -101,12 +101,13 @@ def test_formatter_preserves_single_video_audio_actions_and_custom_output(
     assert result.stage_durations == {"execute": 1.25}
     assert result.peak_memory_mb == 321.0
     assert result.metrics == {
-        "preprocess_time_ms": 10.0,
-        "diffusion_engine_exec_time_ms": 20.0,
-        "diffusion_engine_total_time_ms": 60.0,
+        "preprocess_time_s": 0.01,
+        "diffusion_engine_exec_time_s": 0.02,
+        "diffusion_engine_total_time_s": 0.06,
         "image_num": 1,
         "resolution": 512,
-        "postprocess_time_ms": 30.0,
+        "postprocess_time_s": 0.03,
+        "num_inference_steps": 1,
     }
 
 
