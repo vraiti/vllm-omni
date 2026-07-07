@@ -149,3 +149,15 @@ batch may still pay compile or CUDA-graph capture cost.
 
 For a Qwen-Image continuous-batching replay example, see
 [`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).
+
+## 4. GLM-Image Benchmarks
+
+The [`glm-image/`](./glm-image/) subdirectory contains benchmarks for GLM-Image T2I and I2I across three backends:
+
+| Benchmark | Script | Description |
+|-----------|--------|-------------|
+| HuggingFace Baseline | `glm-image/huggingface/inference.py` | Single-GPU transformers + diffusers pipeline |
+| vLLM-Omni Offline | `glm-image/vllm-omni/inference.py` | Offline inference with continuous batching |
+| vLLM-Omni Online | `glm-image/benchmark_glm_image.py` | Online serving via `/v1/chat/completions` |
+
+See [`glm-image/README.md`](./glm-image/README.md) for full usage and CLI reference.

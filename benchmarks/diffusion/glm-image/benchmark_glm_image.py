@@ -15,19 +15,19 @@ Supports three dataset types:
 
 Usage:
     # T2I with prompt.json (default)
-    python benchmarks/glm_image/benchmark_glm_image.py \
+    python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
         --mode t2i --num-prompts 10
 
     # I2I with prompt.json (downloads source images automatically)
-    python benchmarks/glm_image/benchmark_glm_image.py \
+    python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
         --mode i2i --num-prompts 10
 
     # Random dataset
-    python benchmarks/glm_image/benchmark_glm_image.py \
+    python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
         --mode t2i --dataset random --num-prompts 20
 
     # Custom dataset
-    python benchmarks/glm_image/benchmark_glm_image.py \
+    python benchmarks/diffusion/glm-image/benchmark_glm_image.py \
         --mode i2i --dataset custom \
         --dataset-path my_prompts.json --num-prompts 5
 """
@@ -51,7 +51,7 @@ from PIL import Image
 from tqdm.asyncio import tqdm
 
 # Import backends from the diffusion benchmark (add parent dirs to path)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "diffusion"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from backends import RequestFuncOutput
 
 BENCHMARK_DIR = Path(__file__).resolve().parent
