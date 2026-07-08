@@ -17,24 +17,22 @@ benchmarks/
 
 ### [TTS](tts/README.md) — Text-to-Speech
 
-Model-agnostic serving benchmarks for TTS models, including Qwen3-TTS, VoxCPM2, Higgs-Audio, and MOSS-TTS variants.
+Serving benchmarks for TTS models
 
-- **Serving benchmark**: `tts/bench_tts.py` (CLI wrapper around `vllm bench serve --omni`)
-- **Model registry**: `tts/model_configs.yaml` (add new models here, no code changes)
+- **Serving benchmark**: `tts/bench_tts.py` (wraps `vllm bench serve --omni`)
+- **Model registry**: `tts/model_configs.yaml` (model-specific benchmark configurations)
 - **Datasets**: `tts/datasets/` (bundled smoke/design prompt sets, download instructions for full Seed-TTS corpus)
-- **Model-specific**: `tts/fish-speech/` (Fish Speech DAC-code cache benchmark, async benchmark utils)
-- **Key metrics**: TTFP, E2E latency, RTF, audio throughput, WER/SIM/UTMOS (optional quality)
+- **Key metrics**: TTFP, E2E latency, RTF, audio throughput, optional quality metrics (WER, SIM, UTMOS)
+- **Model-specific directories**: `tts/fish-speech` for DAC-code cache performance
 
 ### [Diffusion](diffusion/README.md) — Image and Video Generation
 
-Online-serving benchmarks for diffusion image/video models, sending requests to the configured vLLM serving endpoint (`/v1/chat/completions`, `/v1/images/generations`, `/v1/images/edits`, or `/v1/videos`).
+Benchmarks for diffusion image/video models
 
-- **Serving benchmark**: `diffusion/diffusion_benchmark_serving.py` (async, multi-endpoint)
-- **Backends**: `diffusion/backends.py` (shared request/response dataclasses and async HTTP clients)
-- **Model-specific**: `diffusion/glm-image/` (GLM-Image T2I/I2I: HuggingFace baseline, offline, and online serving benchmarks)
-- **Diagnostics**: `diffusion/bench_attention_backends.py` (attention kernel comparison), `diffusion/quantization_quality.py` (LPIPS quality loss from quantization)
-- **Performance dashboards**: `diffusion/performance_dashboard/` (reference results for Qwen-Image, Wan2.2)
+- **Serving benchmark**: `diffusion/diffusion_benchmark_serving.py`
 - **Key metrics**: request throughput, latency percentiles, SLO attainment, per-stage durations
+- **Recipes**: `diffusion/recipes/` (reference results and directons for Qwen-Image, Wan2.2)
+- **Model-specific directories**: `diffusion/glm-image/` for HuggingFace baseline and offline benchmarks
 
 ### [Accuracy](accuracy/README.md) — Image Generation and Editing Quality
 
@@ -55,6 +53,7 @@ RDMA environment setup and transfer tests for `MooncakeTransferEngineConnector`,
 Kernel-level micro-benchmarks and auto-tuners for custom operators.
 
 - **MoT GEMM**: `kernels/mot_linear_benchmarks.py` (Triton kernel auto-tuner for Mixture-of-Tokens GEMM operations)
+- **Attention backends**: `kernels/bench_attention_backends.py` (diffusion attention kernel comparison across SDPA, cuDNN, Flash, FA4, FlashInfer, SageAttn3)
 
 ### Common serving metrics framework
 
@@ -68,9 +67,9 @@ See `vllm_omni/benchmarks/serve.py` for the `vllm bench serve --omni` runner wra
 
 ## Adding a new benchmark
 
-1. Identify the modality: `tts/`, `diffusion/`, or create a new top-level modality directory.
+When adding a new benchmark, make sure to maintain the current structure of `benchmarks/`. This includes:
+
+1. Include benchmarks in appropriate modality (`tts/`, `diffusion/`) or other directory (`distrubted/`, `kernels/`, `accuracy/`) or add a new top-level directory.
 2. For model-specific benchmarks within an existing modality, create a subdirectory under the modality (e.g., `tts/fish-speech/`, `diffusion/glm-image/`).
-3. Include a `README.md` with: purpose, prerequisites, usage examples, CLI arguments table, and key metrics.
-4. If comparing against another runtime, use clear backend subfolders (e.g., `huggingface/`, `vllm-omni/`).
-5. Place datasets and prompt files under the modality's `datasets/` directory if applicable.
-6. Update this README with a link to the new benchmark.
+3. Update the subdirectory's `README.md` with: new benchmark purpose, any additional prerequisites, usage examples, CLI arguments table, and key metrics
+4. For any new datasets or prompt files, place under the modality's `datasets/` directory if applicable.

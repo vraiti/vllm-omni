@@ -51,3 +51,26 @@ python benchmarks/kernels/mot_linear_benchmarks.py \
 ### Output
 
 JSON config file at `device_name=<gpu>,dtype=<dtype>.json`, consumed by `invoke_mot_gemm` at runtime.
+
+## bench_attention_backends.py
+
+Diagnostic benchmark for diffusion attention kernel backends. Exercises the same synthetic attention shape through each backend (SDPA, cuDNN, Flash Attention, FA4, FlashInfer, SageAttn3) with and without `attn_mask`, to identify backends that underperform on specific GPU SKUs.
+
+### Usage
+
+```bash
+# Preset shapes matching real DiT models
+python benchmarks/kernels/bench_attention_backends.py --preset hv15
+python benchmarks/kernels/bench_attention_backends.py --preset wan22
+
+# Custom shape
+python benchmarks/kernels/bench_attention_backends.py \
+    --batch 1 --heads 24 --seq 14336 --head-dim 128
+```
+
+### Optional dependencies
+
+```bash
+pip install --pre flash-attn-4    # FA4 (pre-release)
+pip install -U flashinfer          # FlashInfer
+```
