@@ -43,6 +43,7 @@ PROMPT_TEMPLATE = (
     "commentary or evaluations:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
+IMG_PROMPT_TEMPLATE = "<|vision_start|><|image_pad|><|vision_end|>"
 DEFAULT_NEGATIVE_PROMPT = (
     '{"universal_negative": {"visual_quality": ["low quality", "worst quality", "blurry", '
     '"pixelated", "jpeg artifacts", "low resolution", "unstable color", "color flicker", '
@@ -226,11 +227,7 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
 
 
 class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery):
-    """Native vLLM-Omni entry for the dense LingBot-Video checkpoint.
-
-    This PR supports the dense checkpoint only. MoE and fused-expert kernels are
-    intentionally left for the follow-up MoE PR.
-    """
+    """Native vLLM-Omni text-to-video pipeline for LingBot-Video."""
 
     supports_step_execution: ClassVar[bool] = False
     _dit_modules: ClassVar[list[str]] = ["transformer"]

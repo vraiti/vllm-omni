@@ -169,6 +169,9 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "LingBotVideoPipeline": {
         "extra_body_params": LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
     },
+    "LingBotVideoI2VPipeline": {
+        "extra_body_params": LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
+    },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,

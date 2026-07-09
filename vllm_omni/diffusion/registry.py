@@ -261,6 +261,11 @@ _DIFFUSION_MODELS = {
         "pipeline_lingbot_video",
         "LingBotVideoPipeline",
     ),
+    "LingBotVideoI2VPipeline": (
+        "lingbot_video",
+        "pipeline_lingbot_video_i2v",
+        "LingBotVideoI2VPipeline",
+    ),
     "MagiHumanPipeline": (
         "magi_human",
         "pipeline_magi_human",
@@ -532,6 +537,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
+    "LingBotVideoI2VPipeline": "get_lingbot_video_i2v_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
@@ -574,6 +580,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
+    "LingBotVideoI2VPipeline": "get_lingbot_video_i2v_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
