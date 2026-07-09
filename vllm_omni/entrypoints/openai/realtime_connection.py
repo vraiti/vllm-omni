@@ -138,6 +138,15 @@ class RealtimeConnection(VllmRealtimeConnection):
             is_streaming=True,
         )
 
+        sp0 = sampling_params_list[0]
+        logger.info(
+            "[rt-debug] stage0 sampling_params: stop_token_ids=%s eos_token_id=%s ignore_eos=%s max_tokens=%s",
+            getattr(sp0, "stop_token_ids", "N/A"),
+            getattr(sp0, "eos_token_id", "N/A"),
+            getattr(sp0, "ignore_eos", "N/A"),
+            getattr(sp0, "max_tokens", "N/A"),
+        )
+
         try:
             result_gen = self.engine.generate(
                 prompt=streaming_input_gen,
@@ -150,6 +159,13 @@ class RealtimeConnection(VllmRealtimeConnection):
                 if stage_id == 0 and output.outputs:
                     first_output = output.outputs[0]
                     new_token_ids = list(first_output.token_ids)
+                    finish_reason = getattr(first_output, "finish_reason", None)
+                    if new_token_ids or finish_reason:
+                        logger.info(
+                            "[rt-debug] stage0 tokens=%s finish=%s",
+                            new_token_ids,
+                            finish_reason,
+                        )
                     if new_token_ids:
                         input_stream.put_nowait(new_token_ids)
 

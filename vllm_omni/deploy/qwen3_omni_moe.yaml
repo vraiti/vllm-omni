@@ -33,6 +33,7 @@ stages:
     default_sampling_params:
       temperature: 0.0
       max_tokens: 2048
+      stop_token_ids: [151645]
 
   - stage_id: 1
     max_num_batched_tokens: 32768
@@ -48,6 +49,7 @@ stages:
       top_k: 50
       max_tokens: 4096
       repetition_penalty: 1.05
+      stop_token_ids: [4198]
 
   - stage_id: 2
     max_num_batched_tokens: 65536

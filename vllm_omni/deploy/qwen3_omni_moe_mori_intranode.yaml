@@ -71,6 +71,7 @@ stages:
       max_tokens: 2048
       seed: 42
       repetition_penalty: 1.05
+      stop_token_ids: [151645]
 
   - stage_id: 1
     gpu_memory_utilization: 0.9
@@ -86,6 +87,7 @@ stages:
       max_tokens: 4096
       seed: 42
       repetition_penalty: 1.05
+      stop_token_ids: [4198]
 
   - stage_id: 2
     gpu_memory_utilization: 0.3
