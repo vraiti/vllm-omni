@@ -30,6 +30,9 @@ import requests
 from PIL import Image
 from vllm import SamplingParams
 
+from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
 BENCHMARK_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_PROMPT_JSON = BENCHMARK_DIR / "prompt" / "prompt.json"
 IMAGE_CACHE_DIR = BENCHMARK_DIR / "prompt" / "images"
@@ -188,9 +191,6 @@ def resolve_deploy_config(args: argparse.Namespace) -> str:
 
 
 def benchmark(args: argparse.Namespace) -> None:
-    from vllm_omni.entrypoints.omni import Omni
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
     is_i2i = args.mode == "i2i"
 
     print("=" * 60)
