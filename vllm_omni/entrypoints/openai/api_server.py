@@ -1618,6 +1618,18 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
         await websocket.close()
         return
+
+    mode = websocket.query_params.get("mode", "default")
+    if mode == "duplex":
+        from vllm_omni.experimental.fullduplex.qwen3_omni.transport import (
+            DuplexRealtimeHandler,
+        )
+
+        engine = serving.engine_client
+        handler = DuplexRealtimeHandler(websocket, engine, serving)
+        await handler.handle_connection()
+        return
+
     connection = RealtimeConnection(websocket, serving)
     await connection.handle_connection()
 

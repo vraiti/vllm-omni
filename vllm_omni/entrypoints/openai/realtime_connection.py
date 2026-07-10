@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator
 from typing import cast
 from uuid import uuid4
 
@@ -15,6 +14,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.experimental.fullduplex.qwen3_omni.audio_utils import (
+    extract_audio_chunks,
+    pcm16_b64,
+)
 
 logger = init_logger(__name__)
 
@@ -34,88 +37,9 @@ class RealtimeConnection(VllmRealtimeConnection):
     async def start_generation(self):
         await super().start_generation()
 
-    @staticmethod
-    def _tensor_to_numpy(value) -> np.ndarray | None:
-        if value is None:
-            return None
-        if isinstance(value, np.ndarray):
-            arr = value
-        elif hasattr(value, "detach"):
-            arr = value.detach().float().cpu().numpy()
-        else:
-            try:
-                arr = np.asarray(value)
-            except Exception:
-                return None
-        if arr.ndim > 1:
-            arr = arr.reshape(-1)
-        return arr.astype(np.float32, copy=False)
-
-    @staticmethod
-    def _numpy_audio_prefix_match(prev: np.ndarray, curr: np.ndarray) -> bool:
-        n = prev.shape[0]
-        if n == 0:
-            return True
-        if curr.shape[0] < n:
-            return False
-        return bool(np.allclose(curr[:n], prev, rtol=1e-3, atol=2e-4))
-
-    def _raw_waveform_to_deltas(self, arr: np.ndarray) -> list[np.ndarray]:
-        """Convert one streaming PCM f32 chunk into incremental piece(s) for the client.
-
-        Some engine paths emit a growing cumulative waveform each step; others emit
-        true per-step deltas. We support both without duplicating audio on the client.
-        """
-        if arr.size == 0:
-            return []
-        ref = self._realtime_audio_ref
-        if ref is None:
-            self._realtime_audio_ref = arr.copy()
-            return [arr]
-        if self._numpy_audio_prefix_match(ref, arr):
-            delta = arr[ref.shape[0] :]
-            self._realtime_audio_ref = arr.copy()
-            return [delta] if delta.size > 0 else []
-        # True per-step delta (not a prefix extension of what we have seen).
-        self._realtime_audio_ref = np.concatenate([ref, arr])
-        return [arr]
-
-    def _extract_audio_chunks(self, output) -> tuple[list[np.ndarray], int]:
-        mm = getattr(output, "multimodal_output", None)
-        if mm is None:
-            return [], 24000
-        # Support both MultimodalPayload and plain dict
-        if not isinstance(mm, Mapping):
-            return [], 24000
-
-        sr = mm.get("sr") or mm.get("sample_rate") or mm.get("audio_sample_rate") or 24000
-        if isinstance(sr, (list, tuple)) and sr:
-            sr = sr[-1]
-        if hasattr(sr, "item"):
-            sr = sr.item()
-        sample_rate_hz = int(sr)
-        key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
-        if key is None:
-            return [], sample_rate_hz
-
-        raw_audio = mm.get(key)
-        chunks: list[np.ndarray] = []
-        if isinstance(raw_audio, (list, tuple)):
-            if len(raw_audio) > 0:
-                arr = self._tensor_to_numpy(raw_audio[-1])
-                if arr is not None and arr.size > 0:
-                    chunks.extend(self._raw_waveform_to_deltas(arr))
-        else:
-            arr = self._tensor_to_numpy(raw_audio)
-            if arr is not None and arr.size > 0:
-                chunks.extend(self._raw_waveform_to_deltas(arr))
-        return chunks, sample_rate_hz
-
-    @staticmethod
-    def _pcm16_b64(audio_f32: np.ndarray) -> str:
-        clipped = np.clip(audio_f32, -1.0, 1.0)
-        pcm16 = (clipped * 32767.0).astype(np.int16)
-        return base64.b64encode(pcm16.tobytes()).decode("utf-8")
+    def _extract_audio_chunks_with_ref(self, output) -> tuple[list[np.ndarray], int]:
+        chunks, sr, self._realtime_audio_ref = extract_audio_chunks(output, self._realtime_audio_ref)
+        return chunks, sr
 
     async def _run_generation(
         self,
@@ -182,14 +106,14 @@ class RealtimeConnection(VllmRealtimeConnection):
                     if delta_text:
                         await self.send(TranscriptionDelta(delta=delta_text))
 
-                audio_chunks, sample_rate = self._extract_audio_chunks(output)
+                audio_chunks, sample_rate = self._extract_audio_chunks_with_ref(output)
 
                 for chunk in audio_chunks:
                     sent_audio = True
                     await self.send_json(
                         {
                             "type": "response.audio.delta",
-                            "audio": self._pcm16_b64(chunk),
+                            "audio": pcm16_b64(chunk),
                             "format": "pcm16",
                             "sample_rate_hz": sample_rate,
                         }
@@ -212,14 +136,11 @@ class RealtimeConnection(VllmRealtimeConnection):
             logger.exception("Error in generation: %s", e)
             await self.send_error(str(e), "processing_error")
         finally:
-            # Always send terminal event so clients don't hang forever.
             if self._is_connected and not audio_done_sent:
                 try:
                     await self.send_json({"type": "response.audio.done", "has_audio": sent_audio})
                 except Exception:
                     logger.exception("Failed to send response.audio.done")
-            while not self.audio_queue.empty():
-                self.audio_queue.get_nowait()
 
     async def send_json(self, payload: dict):
         await self.websocket.send_text(json.dumps(payload))
