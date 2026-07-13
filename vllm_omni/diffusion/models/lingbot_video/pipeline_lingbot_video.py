@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from collections.abc import Iterable, Mapping
@@ -18,8 +17,6 @@ from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import (
-    AutoModelForImageTextToText,
-    AutoProcessor,
     Qwen3VLForConditionalGeneration,
     Qwen3VLProcessor,
 )
@@ -30,20 +27,10 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.lingbot_video.lingbot_video_transformer import (
     LingBotVideoTransformer3DModel,
 )
-from vllm_omni.diffusion.models.lingbot_video.rewriter_prompts import (
-    _step1_text,
-    _step2_text,
-    parse_json,
-)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-
-try:
-    from peft import PeftModel
-except ImportError:
-    PeftModel = None
 
 logger = logging.getLogger(__name__)
 
@@ -318,35 +305,6 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
         self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
 
-        if PeftModel is None:
-            raise ImportError(
-                "The peft package is required for the LingBot rewriter. Install it with: pip install peft"
-            )
-        rewriter_base = model_config.get(
-            "rewriter_base",
-            "Qwen/Qwen3.6-27B",
-        )
-        rewriter_adapter = model_config.get(
-            "rewriter_adapter",
-            "robbyant/lingbot-video-rewriter-lora",
-        )
-        logger.info("Loading rewriter base model: %s", rewriter_base)
-        self.rewriter_processor = AutoProcessor.from_pretrained(
-            rewriter_base,
-            trust_remote_code=True,
-        )
-        base_model = AutoModelForImageTextToText.from_pretrained(
-            rewriter_base,
-            torch_dtype=torch.bfloat16,
-            device_map=self.device,
-            trust_remote_code=True,
-        )
-        logger.info("Loading rewriter LoRA adapter: %s", rewriter_adapter)
-        self.rewriter_model = PeftModel.from_pretrained(
-            base_model,
-            rewriter_adapter,
-        ).eval()
-
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
         super().to(*args, **kwargs)
@@ -355,7 +313,6 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             self.transformer.to(device=self.device, non_blocking=non_blocking)
             self.text_encoder.to(device=self.device, non_blocking=non_blocking)
             self.vae.to(device=self.device, non_blocking=non_blocking)
-            self.rewriter_model.to(device=self.device, non_blocking=non_blocking)
         if dtype is not None:
             self.transformer.to(dtype=dtype, non_blocking=non_blocking)
         return self
@@ -441,74 +398,6 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             prompt_mask = prompt_mask[:, :true_len]
         return prompt_embeds, prompt_mask
 
-    @torch.no_grad()
-    def _rewriter_generate(
-        self,
-        text: str,
-        *,
-        use_lora: bool,
-        max_new_tokens: int = 6144,
-    ) -> str:
-        messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
-        chat = self.rewriter_processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-        inputs = self.rewriter_processor(
-            text=[chat],
-            images=None,
-            return_tensors="pt",
-        ).to(self.rewriter_model.device)
-        ctx = nullcontext() if use_lora else self.rewriter_model.disable_adapter()
-        with ctx:
-            out = self.rewriter_model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-            )
-        gen = out[:, inputs["input_ids"].shape[1] :]
-        return self.rewriter_processor.batch_decode(
-            gen,
-            skip_special_tokens=True,
-        )[0].strip()
-
-    @torch.no_grad()
-    def rewrite_prompt(
-        self,
-        prompt: str,
-        *,
-        mode: str = "t2v",
-        duration: int = 5,
-        max_new_tokens: int = 6144,
-    ) -> str:
-        dur = int(round(duration))
-        text1 = _step1_text(mode, prompt, dur)
-        detailed = self._rewriter_generate(
-            text1,
-            use_lora=False,
-            max_new_tokens=max_new_tokens,
-        )
-        logger.info("Rewriter step 1 produced %d chars", len(detailed))
-
-        text2 = _step2_text(mode, detailed, dur)
-        raw_json = self._rewriter_generate(
-            text2,
-            use_lora=True,
-            max_new_tokens=max_new_tokens,
-        )
-        logger.info("Rewriter step 2 produced %d chars", len(raw_json))
-
-        parsed = parse_json(raw_json)
-        if parsed is None:
-            logger.warning("Rewriter JSON parse failed, using raw output")
-            return raw_json
-        return json.dumps(
-            {"caption": parsed, "duration": dur},
-            ensure_ascii=False,
-        )
-
     def prepare_latents(
         self,
         num_frames: int,
@@ -578,22 +467,9 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
         t_thresh: float | None = None,
         refiner_sigma_tail_steps: int = LOW_NOISE_TAIL_V1_DEFAULT_STEPS,
         offload_vae_during_denoise: bool = False,
-        enable_prompt_rewrite: bool = True,
-        rewrite_mode: str = "t2v",
-        rewrite_duration: int = 5,
-        offload_rewriter_after_rewrite: bool = True,
         **extra_args,
     ) -> torch.Tensor:
         del extra_args
-        if enable_prompt_rewrite and prompt_embeds is None:
-            prompt = self.rewrite_prompt(
-                prompt,
-                mode=rewrite_mode,
-                duration=rewrite_duration,
-            )
-            if offload_rewriter_after_rewrite:
-                self.rewriter_model.to("cpu")
-                torch.accelerator.empty_cache()
         self.check_inputs(height, width, num_frames)
         device = self.device
         do_cfg = guidance_scale > 1.0
@@ -806,13 +682,6 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             output_type = "pt"
         sampling.output_type = output_type
 
-        enable_prompt_rewrite = bool(extra_args.pop("enable_prompt_rewrite", True))
-        rewrite_mode = str(extra_args.pop("rewrite_mode", "t2v"))
-        fps = 24
-        default_duration = max(1, min(30, num_frames // fps))
-        rewrite_duration = int(extra_args.pop("rewrite_duration", default_duration))
-        offload_rewriter_after_rewrite = bool(extra_args.pop("offload_rewriter_after_rewrite", True))
-
         frames = self._generate(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -830,9 +699,5 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             offload_vae_during_denoise=bool(extra_args.pop("offload_vae_during_denoise", False)),
             t_thresh=extra_args.pop("t_thresh", None),
             refiner_sigma_tail_steps=int(extra_args.pop("refiner_sigma_tail_steps", LOW_NOISE_TAIL_V1_DEFAULT_STEPS)),
-            enable_prompt_rewrite=enable_prompt_rewrite,
-            rewrite_mode=rewrite_mode,
-            rewrite_duration=rewrite_duration,
-            offload_rewriter_after_rewrite=offload_rewriter_after_rewrite,
         )
         return DiffusionOutput(output=frames)

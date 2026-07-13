@@ -57,6 +57,7 @@ from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
 from vllm_omni.model_executor.models.hunyuan_video.pipeline import HUNYUAN_VIDEO_15_PIPELINE
 from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
+from vllm_omni.model_executor.models.lingbot_video.pipeline import LINGBOT_VIDEO_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
     MAMMOTH_MODA2_PIPELINE,
@@ -116,6 +117,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel_think": BAGEL_THINK_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "lance": LANCE_PIPELINE,
+    "lingbot_video": LINGBOT_VIDEO_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
