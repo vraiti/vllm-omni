@@ -311,6 +311,222 @@ class LingBotVideoMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class LingBotVideoRouter(nn.Module):
+    def __init__(self, hidden_size, num_experts, top_k, score_func, norm_topk_prob, n_group, topk_group, route_scale):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.score_func = score_func
+        self.norm_topk_prob = norm_topk_prob
+        self.n_group = n_group
+        self.topk_group = topk_group
+        self.route_scale = route_scale
+        self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
+        self.register_buffer("e_score_correction_bias", torch.zeros(num_experts), persistent=True)
+
+    def _group_limited_topk(self, scores_for_choice):
+        seq_len = scores_for_choice.shape[0]
+        experts_per_group = self.num_experts // self.n_group
+        grouped = scores_for_choice.view(seq_len, self.n_group, experts_per_group)
+        group_scores = grouped.topk(2, dim=-1)[0].sum(dim=-1)
+        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = group_mask.unsqueeze(-1).expand(seq_len, self.n_group, experts_per_group).reshape(seq_len, -1)
+        masked = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+        return torch.topk(masked, k=self.top_k, dim=-1, sorted=False)[1]
+
+    def forward(self, tokens: torch.Tensor):
+        with torch.amp.autocast(tokens.device.type, enabled=False):
+            logits = F.linear(tokens.float(), self.weight.float())
+        if self.score_func == "softmax":
+            scores = F.softmax(logits, dim=-1)
+        else:
+            scores = logits.sigmoid()
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        if self.n_group is not None and self.n_group > 1:
+            top_indices = self._group_limited_topk(scores_for_choice)
+        else:
+            top_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+        top_scores = scores.gather(1, top_indices)
+        if self.top_k > 1 and self.norm_topk_prob:
+            top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-20)
+        top_scores = top_scores * self.route_scale
+        return top_indices, top_scores.to(tokens.dtype)
+
+
+class LingBotVideoGroupedExperts(nn.Module):
+    def __init__(self, num_experts, hidden_size, intermediate_size):
+        super().__init__()
+        self.num_experts = num_experts
+        self.w1 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.w2 = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
+        self.w3 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+class LingBotVideoSparseMoeBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        moe_intermediate_size,
+        score_func,
+        norm_topk_prob,
+        n_group,
+        topk_group,
+        routed_scaling_factor,
+        n_shared_experts,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.router = LingBotVideoRouter(
+            hidden_size,
+            num_experts,
+            top_k,
+            score_func,
+            norm_topk_prob,
+            n_group,
+            topk_group,
+            routed_scaling_factor,
+        )
+        self.experts = LingBotVideoGroupedExperts(num_experts, hidden_size, moe_intermediate_size)
+        self.shared_experts = None
+        if n_shared_experts is not None and n_shared_experts > 0:
+            self.shared_experts = LingBotVideoMLP(hidden_size, moe_intermediate_size * n_shared_experts)
+
+    @staticmethod
+    def _reorder_tokens(tokens, top_scores, top_indices, num_experts):
+        top_k = top_indices.shape[1]
+        flat_scores = top_scores.reshape(-1)
+        flat_indices = top_indices.reshape(-1)
+        active_positions = torch.where(flat_scores != 0)[0]
+        active_experts = flat_indices[active_positions]
+        counts = torch.zeros(num_experts, device=tokens.device, dtype=torch.int64)
+        counts.scatter_add_(0, active_experts, torch.ones_like(active_experts, dtype=torch.int64))
+        sort_order = torch.argsort(active_experts, stable=True)
+        sorted_positions = active_positions[sort_order]
+        sorted_scores = flat_scores[sorted_positions]
+        original_token_idx = sorted_positions // top_k
+        permuted_tokens = tokens[original_token_idx]
+        return permuted_tokens, counts, sorted_positions, sorted_scores, tokens.shape[0], top_k
+
+    @staticmethod
+    def _pad_grouped_tokens(tokens, counts, align=8):
+        num_tokens = tokens.shape[0]
+        num_experts = int(counts.shape[0])
+        max_len = _round_up_to_multiple(num_tokens + num_experts * align, align)
+        counts_i64 = counts.to(torch.int64)
+        total_per_expert = torch.clamp_min(counts_i64, align)
+        aligned_counts = ((total_per_expert + align - 1) // align * align).to(torch.int32)
+        write_offsets = torch.cumsum(aligned_counts.to(torch.int64), dim=0) - aligned_counts.to(torch.int64)
+        start_indices = torch.cumsum(counts_i64, dim=0) - counts_i64
+        fill_value = num_tokens
+        permuted_indices = torch.full((max_len,), fill_value, dtype=torch.int64, device=tokens.device)
+        for expert_idx in range(num_experts):
+            length = int(counts_i64[expert_idx].item())
+            if length == 0:
+                continue
+            write_start = int(write_offsets[expert_idx].item())
+            start = int(start_indices[expert_idx].item())
+            permuted_indices[write_start : write_start + length] = torch.arange(
+                start, start + length, device=tokens.device, dtype=torch.int64
+            )
+        tokens_with_pad = torch.vstack((tokens, tokens.new_zeros((tokens.shape[-1],))))
+        input_shape = tokens_with_pad.shape
+        return input_shape, tokens_with_pad[permuted_indices], permuted_indices, aligned_counts
+
+    @staticmethod
+    def _unpad_grouped_tokens(output, input_shape, permuted_indices):
+        unpermuted = output.new_empty(input_shape)
+        unpermuted[permuted_indices, :] = output
+        return unpermuted[:-1]
+
+    def _run_grouped_experts(self, tokens, counts):
+        if not hasattr(torch, "_grouped_mm"):
+            return self._run_experts_for_loop(tokens, counts)
+        input_shape, padded_tokens, permuted_indices, aligned_counts = self._pad_grouped_tokens(tokens, counts)
+        offsets = torch.cumsum(aligned_counts, dim=0, dtype=torch.int32)
+        h = F.silu(
+            torch._grouped_mm(
+                padded_tokens.bfloat16(),
+                self.experts.w1.bfloat16().transpose(-2, -1),
+                offs=offsets,
+            )
+        )
+        h = h * torch._grouped_mm(
+            padded_tokens.bfloat16(),
+            self.experts.w3.bfloat16().transpose(-2, -1),
+            offs=offsets,
+        )
+        out = torch._grouped_mm(
+            h,
+            self.experts.w2.bfloat16().transpose(-2, -1),
+            offs=offsets,
+        ).type_as(padded_tokens)
+        return self._unpad_grouped_tokens(out, input_shape, permuted_indices)
+
+    def _run_experts_for_loop(self, tokens, counts):
+        count_list = counts.tolist()
+        splits = torch.split(tokens, count_list, dim=0)
+        outputs = []
+        for expert_idx, expert_tokens in enumerate(splits):
+            if expert_tokens.numel() == 0:
+                continue
+            h = F.silu(expert_tokens @ self.experts.w1[expert_idx].transpose(-2, -1))
+            h = h * (expert_tokens @ self.experts.w3[expert_idx].transpose(-2, -1))
+            h = h @ self.experts.w2[expert_idx].transpose(-2, -1)
+            outputs.append(h)
+        if not outputs:
+            return tokens.new_zeros(tokens.shape)
+        return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def _restore_tokens(expert_output, sorted_positions, sorted_scores, num_tokens, top_k):
+        dim = expert_output.shape[-1]
+        unsorted = torch.zeros(
+            (num_tokens * top_k, dim),
+            dtype=expert_output.dtype,
+            device=expert_output.device,
+        )
+        unsorted[sorted_positions] = expert_output
+        unsorted = unsorted.reshape(num_tokens, top_k, dim)
+        scores_unsorted = torch.zeros(
+            num_tokens * top_k,
+            dtype=sorted_scores.dtype,
+            device=sorted_scores.device,
+        )
+        scores_unsorted[sorted_positions] = sorted_scores
+        scores_unsorted = scores_unsorted.reshape(num_tokens, top_k, 1)
+        return (unsorted.float() * scores_unsorted).sum(dim=1).to(expert_output.dtype)
+
+    def forward(self, hidden_states: torch.Tensor, padding_mask: torch.Tensor | None = None):
+        B = hidden_states.shape[0]
+        tokens = hidden_states.view(-1, self.hidden_size)
+        top_indices, top_scores = self.router(tokens)
+        if padding_mask is not None:
+            pm = padding_mask.unsqueeze(-1).to(top_scores.dtype)
+            top_scores = top_scores * pm
+            top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-9)
+            top_scores = top_scores * self.router.route_scale
+        permuted_tokens, counts, sorted_positions, sorted_scores, num_tokens, top_k = self._reorder_tokens(
+            tokens, top_scores, top_indices, self.router.num_experts
+        )
+        expert_output = self._run_grouped_experts(permuted_tokens, counts)
+        out = self._restore_tokens(expert_output, sorted_positions, sorted_scores, num_tokens, top_k)
+        out = out.view(B, -1, self.hidden_size)
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+            out = out + shared_output
+        return out
+
+
 class LingBotVideoBlock(nn.Module):
     def __init__(
         self,
@@ -341,13 +557,22 @@ class LingBotVideoBlock(nn.Module):
         self.attn = LingBotVideoAttention(h, num_attention_heads, norm_eps, qkv_bias, out_bias)
         self.norm_post_attn = LingBotVideoRMSNorm(h, norm_eps)
         self.norm2 = LingBotVideoRMSNorm(h, norm_eps)
-        if num_experts > 0:
-            raise NotImplementedError(
-                "LingBotVideoTransformer3DModel in vLLM-Omni currently supports "
-                "the dense checkpoint only. MoE/fused-expert support belongs in "
-                "the follow-up MoE PR."
+        if layer_idx not in mlp_only_layers and (num_experts > 0 and (layer_idx + 1) % decoder_sparse_step == 0):
+            self.ffn = LingBotVideoSparseMoeBlock(
+                h,
+                intermediate_size,
+                num_experts,
+                num_experts_per_tok,
+                moe_intermediate_size,
+                score_func,
+                norm_topk_prob,
+                n_group,
+                topk_group,
+                routed_scaling_factor,
+                n_shared_experts,
             )
-        self.ffn = LingBotVideoMLP(h, intermediate_size)
+        else:
+            self.ffn = LingBotVideoMLP(h, intermediate_size)
         self.norm_post_ffn = LingBotVideoRMSNorm(h, norm_eps)
 
     def forward(
@@ -387,7 +612,10 @@ class LingBotVideoBlock(nn.Module):
         x = x + (gate_msa * self.norm_post_attn(attn_out)).to(x.dtype)
 
         ffn_in = (self.norm2(x) * scale_mlp + shift_mlp).to(bulk_dtype)
-        ffn_out = self.ffn(ffn_in)
+        if isinstance(self.ffn, LingBotVideoSparseMoeBlock):
+            ffn_out = self.ffn(ffn_in, padding_mask=moe_padding_mask)
+        else:
+            ffn_out = self.ffn(ffn_in)
         ffn_normed = self.norm_post_ffn(ffn_out)
         x = x + (gate_mlp * ffn_normed).to(x.dtype)
         return x
