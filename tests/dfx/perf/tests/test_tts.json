@@ -113,7 +113,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_smoke",
         "num_prompts": [
           20
         ],
@@ -142,7 +142,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_smoke",
         "num_prompts": [
           80,
           128,
@@ -185,7 +185,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_smoke",
         "num_prompts": [
           200
         ],
@@ -212,7 +212,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_smoke",
         "num_prompts": [
           100
         ],
@@ -244,7 +244,7 @@
         "dataset_name": "seed-tts-design",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_design",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_design",
         "num_prompts": [
           20
         ],
@@ -272,7 +272,7 @@
         "dataset_name": "seed-tts-design",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_design",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_design",
         "num_prompts": [
           80,
           128,
@@ -313,7 +313,7 @@
         "dataset_name": "seed-tts-design",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_design",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_design",
         "num_prompts": [
           100
         ],
@@ -352,7 +352,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_smoke",
         "num_prompts": [
           20
         ],
@@ -379,7 +379,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_smoke",
         "num_prompts": [
           80
         ],
@@ -409,7 +409,7 @@
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",
         "endpoint": "/v1/audio/speech",
-        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "dataset_path": "benchmarks/tts/datasets/seed_tts_smoke",
         "num_prompts": [
           100
         ],

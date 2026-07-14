@@ -31,7 +31,7 @@ Benchmarks for diffusion image/video models
 
 - **Serving benchmark**: `diffusion/diffusion_benchmark_serving.py`
 - **Key metrics**: request throughput, latency percentiles, SLO attainment, per-stage durations
-- **Recipes**: `diffusion/recipes/` (reference results and directons for Qwen-Image, Wan2.2)
+- **Recipes**: `diffusion/recipes/` (reference results and directions for Qwen-Image, Wan2.2)
 - **Model-specific directories**: `diffusion/glm-image/` for HuggingFace baseline and offline benchmarks
 
 ### [Accuracy](accuracy/README.md) — Image Generation and Editing Quality
@@ -69,7 +69,7 @@ See `vllm_omni/benchmarks/serve.py` for the `vllm bench serve --omni` runner wra
 
 When adding a new benchmark, make sure to maintain the current structure of `benchmarks/`. This includes:
 
-1. Include benchmarks in appropriate modality (`tts/`, `diffusion/`) or other directory (`distrubted/`, `kernels/`, `accuracy/`) or add a new top-level directory.
+1. Include benchmarks in appropriate modality (`tts/`, `diffusion/`) or other directory (`distributed/`, `kernels/`, `accuracy/`) or add a new top-level directory.
 2. For model-specific benchmarks within an existing modality, create a subdirectory under the modality (e.g., `tts/fish-speech/`, `diffusion/glm-image/`).
 3. Update the subdirectory's `README.md` with: new benchmark purpose, any additional prerequisites, usage examples, CLI arguments table, and key metrics
 4. For any new datasets or prompt files, place under the modality's `datasets/` directory if applicable.
