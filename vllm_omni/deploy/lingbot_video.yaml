@@ -10,6 +10,7 @@ stages:
     devices: "0"
     max_num_seqs: 1
     gpu_memory_utilization: 0.70
+    max_model_len: 8192
     enforce_eager: true
     enable_lora: true
     max_lora_rank: 64
