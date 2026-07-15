@@ -1,13 +1,11 @@
-# LingBot-Video deploy: Rewriter LLM (stage 0) + Diffusion DiT (stage 1).
+# LingBot-Video deploy: EXPAND (stage 0) + MAP (stage 1) + Diffusion DiT (stage 2).
 # Topology declared in vllm_omni/model_executor/models/lingbot_video/pipeline.py.
 async_chunk: false
 trust_remote_code: true
 
 stages:
-  # Stage 0: Rewriter LLM (Qwen3.5-27B + LoRA)
-  # Generates structured JSON caption from user prompt.
-  # model overrides the top-level HF repo so this stage loads
-  # Qwen/Qwen3.6-27B instead of the diffusion model.
+  # Stage 0: EXPAND (Qwen3.5-27B, no LoRA)
+  # Generates detailed prose caption from user prompt.
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
@@ -21,10 +19,18 @@ stages:
       temperature: 0
       detokenize: true
 
-  # Stage 1: Diffusion (DiT + VAE)
-  # Receives structured JSON caption from rewriter, encodes + denoises.
+  # Stage 1: MAP (Qwen3.5-27B + rewriter LoRA, shares engine with stage 0)
+  # Converts prose caption to structured JSON caption.
   - stage_id: 1
-    devices: "1"
+    default_sampling_params:
+      max_tokens: 6144
+      temperature: 0
+      detokenize: true
+
+  # Stage 2: Diffusion (DiT + VAE)
+  # Receives structured JSON caption from MAP, encodes + denoises.
+  - stage_id: 2
+    devices: "0"
     max_num_seqs: 1
     enforce_eager: true
     default_sampling_params:
