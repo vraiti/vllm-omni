@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import copy
 import os
@@ -45,6 +46,7 @@ from vllm_omni.engine.stage_engine_startup import (
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
+    StageMetadata,
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
     build_engine_args_dict,
@@ -66,6 +68,96 @@ from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+_METADATA_ATTRS = frozenset(
+    {
+        "stage_id",
+        "stage_type",
+        "model_stage",
+        "engine_input_source",
+        "custom_process_input_func",
+        "final_output",
+        "final_output_type",
+        "default_sampling_params",
+        "is_comprehension",
+        "requires_multimodal_data",
+        "prompt_expand_func",
+        "cfg_kv_collect_func",
+        "replica_id",
+        "engine_output_type",
+        "runtime_cfg",
+    }
+)
+
+
+class _SecondaryStageClientOverlay:
+    """Wraps a primary stage client with a secondary stage's metadata.
+
+    Engine groups let multiple logical stages share one vLLM engine.
+    The orchestrator accesses per-stage metadata (input_sources,
+    custom_process_input_func, etc.) through the pool's stage_client.
+    This overlay ensures the secondary stage exposes its own metadata
+    while delegating all engine operations to the primary client.
+
+    Polling: the overlay's ``get_output_async`` always blocks forever
+    so the orchestrator's per-pool poll loop never fires for the
+    secondary stage.  All outputs from the shared engine are caught
+    by the primary pool's poll; the orchestrator then remaps them to
+    the correct logical stage via ``_remap_engine_group_stage``.
+    """
+
+    _is_secondary_overlay: bool = True
+
+    def __init__(
+        self,
+        primary_client: StagePoolClient,
+        metadata: StageMetadata,
+    ) -> None:
+        object.__setattr__(self, "_primary", primary_client)
+        object.__setattr__(self, "_no_poll_event", asyncio.Event())
+        for attr in _METADATA_ATTRS:
+            if hasattr(metadata, attr):
+                object.__setattr__(self, attr, getattr(metadata, attr))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_primary"), name)
+
+    async def get_output_async(self) -> Any:
+        await object.__getattribute__(self, "_no_poll_event").wait()
+        raise RuntimeError("secondary overlay should never be polled")
+
+    def process_engine_inputs(
+        self,
+        source_outputs: list[Any],
+        prompt: Any = None,
+        streaming_context: Any = None,
+    ) -> list[Any]:
+        import inspect
+
+        cpif = object.__getattribute__(self, "custom_process_input_func")
+        if cpif is not None:
+            sig = inspect.signature(cpif)
+            if "streaming_context" in sig.parameters:
+                return cpif(
+                    source_outputs,
+                    prompt,
+                    object.__getattribute__(self, "requires_multimodal_data"),
+                    streaming_context,
+                )
+            return cpif(
+                source_outputs,
+                prompt,
+                object.__getattribute__(self, "requires_multimodal_data"),
+            )
+
+        input_src = object.__getattribute__(self, "engine_input_source")
+        if not input_src:
+            raise ValueError(f"engine_input_source empty for stage {object.__getattribute__(self, 'stage_id')}")
+        return object.__getattribute__(self, "_primary").process_engine_inputs(
+            source_outputs,
+            prompt,
+            streaming_context,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -715,7 +807,8 @@ class StageRuntime:
 
             if is_secondary:
                 primary_idx = plan.shares_engine_with_stage
-                clients = list(group_clients[primary_idx])
+                secondary_metadata = plan.replicas[0].metadata
+                clients = [_SecondaryStageClientOverlay(c, secondary_metadata) for c in group_clients[primary_idx]]
                 stage_vllm_config = group_vllm_configs[primary_idx]
                 owns_clients = False
             else:

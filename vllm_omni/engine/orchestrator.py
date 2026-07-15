@@ -254,6 +254,19 @@ class Orchestrator:
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
 
+        self._engine_group_secondaries: set[int] = set()
+        self._engine_group_primary: dict[int, int] = {}
+        for sid, pool in enumerate(stage_pools):
+            client = pool.stage_client
+            if getattr(client, "_is_secondary_overlay", False):
+                self._engine_group_secondaries.add(sid)
+                primary = getattr(client, "_primary", None)
+                if primary is not None:
+                    for pid, ppool in enumerate(stage_pools):
+                        if pid != sid and any(c is primary for c in (ppool.stage_client, *ppool.clients)):
+                            self._engine_group_primary[sid] = pid
+                            break
+
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
         self._fatal_error: str | None = None
@@ -762,6 +775,15 @@ class Orchestrator:
             else:
                 await asyncio.sleep(0)
 
+    def _remap_engine_group_stage(self, stage_id: int, req_state: OrchestratorRequestState) -> int:
+        """If the shared engine produced output for a secondary stage, return that stage_id."""
+        if not self._engine_group_secondaries:
+            return stage_id
+        current = max(req_state.stage_submit_ts.keys()) if req_state.stage_submit_ts else 0
+        if current != stage_id and current in self._engine_group_secondaries:
+            return current
+        return stage_id
+
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
         pool = self.stage_pools[stage_id]
@@ -776,22 +798,25 @@ class Orchestrator:
                 )
                 continue
 
+            eff_stage = self._remap_engine_group_stage(stage_id, req_state)
+            eff_pool = self.stage_pools[eff_stage] if eff_stage != stage_id else pool
+
             if getattr(output, "error", None) is not None:
-                await self._handle_stage_error(stage_id, output)
+                await self._handle_stage_error(eff_stage, output)
                 continue
 
             stage_metrics = None
             if output.finished:
-                stage_metrics = pool.build_stage_metrics(
+                stage_metrics = eff_pool.build_stage_metrics(
                     [output],
-                    submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
+                    submit_ts=req_state.stage_submit_ts.get(eff_stage, _time.time()),
                     request_timestamp=req_state.request_timestamp,
                     replica_id=replica_id,
-                    sampling_params=req_state.sampling_params_list[stage_id],
+                    sampling_params=req_state.sampling_params_list[eff_stage],
                 )
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
-            await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+            await self._route_output(eff_stage, replica_id, output, req_state, stage_metrics)
 
     async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
@@ -1449,6 +1474,15 @@ class Orchestrator:
                 await next_pool.submit_update(req_id, req_state, request)
             else:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                if next_logical in self._engine_group_primary:
+                    primary_pool = self.stage_pools[self._engine_group_primary[next_logical]]
+                    primary_pool.output_processor.add_request(
+                        request=request,
+                        prompt=None,
+                        parent_req=None,
+                        request_index=0,
+                        queue=None,
+                    )
 
         req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
