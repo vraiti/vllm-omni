@@ -339,6 +339,14 @@ class StageRuntime:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
 
+        engine_group_primary: dict[str, int] = {}
+        for idx, cfg in enumerate(self._stage_configs):
+            group = getattr(cfg, "engine_group", None)
+            if group is not None and group not in engine_group_primary:
+                engine_group_primary[group] = idx
+
+        group_build_cache: dict[str, tuple[Any, type | None, dict | None]] = {}
+
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
             base_metadata = extract_stage_metadata(stage_cfg)
             stage_id = int(base_metadata.stage_id)
@@ -349,6 +357,10 @@ class StageRuntime:
                     "Stage ids must be contiguous and zero-based because the "
                     "orchestrator indexes stage pools by stage_id."
                 )
+
+            group = getattr(stage_cfg, "engine_group", None)
+            is_primary = group is None or engine_group_primary.get(group) == stage_idx
+            shares_engine_with: int | None = None if is_primary else engine_group_primary[group]
 
             stage_connector_spec = get_stage_connector_spec(
                 omni_transfer_config=omni_transfer_config,
@@ -364,28 +376,33 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
-                engine_args_dict = build_engine_args_dict(
-                    stage_cfg,
-                    self._model,
-                    stage_connector_spec=stage_connector_spec,
-                    cli_tokenizer=self._tokenizer,
-                )
-                inject_omni_kv_connector_config(
-                    engine_args_dict,
-                    omni_kv_connector,
-                    stage_id,
-                )
-                _inject_inferred_kv_tp_topology(
-                    engine_args_dict.get("omni_kv_config"),
-                    stage_id,
-                    self._stage_configs,
-                )
-                stage_vllm_config, executor_class = build_vllm_config(
-                    stage_cfg,
-                    self._model,
-                    stage_connector_spec=stage_connector_spec,
-                    engine_args_dict=engine_args_dict,
-                )
+                if is_primary:
+                    engine_args_dict = build_engine_args_dict(
+                        stage_cfg,
+                        self._model,
+                        stage_connector_spec=stage_connector_spec,
+                        cli_tokenizer=self._tokenizer,
+                    )
+                    inject_omni_kv_connector_config(
+                        engine_args_dict,
+                        omni_kv_connector,
+                        stage_id,
+                    )
+                    _inject_inferred_kv_tp_topology(
+                        engine_args_dict.get("omni_kv_config"),
+                        stage_id,
+                        self._stage_configs,
+                    )
+                    stage_vllm_config, executor_class = build_vllm_config(
+                        stage_cfg,
+                        self._model,
+                        stage_connector_spec=stage_connector_spec,
+                        engine_args_dict=engine_args_dict,
+                    )
+                    if group is not None:
+                        group_build_cache[group] = (stage_vllm_config, executor_class, engine_args_dict)
+                else:
+                    stage_vllm_config, executor_class, engine_args_dict = group_build_cache[group]
 
             for replica_id in range(num_replicas):
                 replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg
@@ -417,6 +434,7 @@ class StageRuntime:
                     stage_idx=stage_idx,
                     stage_id=stage_id,
                     replicas=replicas,
+                    shares_engine_with_stage=shares_engine_with,
                 )
             )
 
@@ -446,6 +464,8 @@ class StageRuntime:
 
         init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
         for plan in stage_plans:
+            if plan.shares_engine_with_stage is not None:
+                continue
             for replica in plan.replicas:
                 init_groups.setdefault(self._replica_init_group_key(replica), []).append((plan.stage_idx, replica))
 
@@ -687,18 +707,34 @@ class StageRuntime:
     ) -> list[StagePool]:
         """Assemble logical stage pools."""
         stage_pools: list[StagePool] = []
+        group_clients: dict[int, list[StagePoolClient]] = {}
+        group_vllm_configs: dict[int, Any] = {}
 
         for plan in stage_plans:
-            replica_clients = initialized_clients_by_stage[plan.stage_idx]
-            first_client = replica_clients[0] if replica_clients else None
-            if first_client is None:
-                raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
+            is_secondary = plan.shares_engine_with_stage is not None
 
-            clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
-            stage_vllm_config = None
+            if is_secondary:
+                primary_idx = plan.shares_engine_with_stage
+                clients = list(group_clients[primary_idx])
+                stage_vllm_config = group_vllm_configs[primary_idx]
+                owns_clients = False
+            else:
+                replica_clients = initialized_clients_by_stage[plan.stage_idx]
+                first_client = replica_clients[0] if replica_clients else None
+                if first_client is None:
+                    raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
+                clients = [client for client in replica_clients if client is not None]
+                stage_vllm_config = None
+                if plan.replicas[0].metadata.stage_type != "diffusion":
+                    stage_vllm_config = plan.replicas[0].stage_vllm_config
+                    if stage_vllm_config is None:
+                        raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
+                group_clients[plan.stage_idx] = clients
+                group_vllm_configs[plan.stage_idx] = stage_vllm_config
+                owns_clients = True
+
             output_processor = None
             if plan.replicas[0].metadata.stage_type != "diffusion":
-                stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
                 output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
@@ -709,6 +745,7 @@ class StageRuntime:
                     clients,
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
+                    owns_clients=owns_clients,
                 )
             )
 

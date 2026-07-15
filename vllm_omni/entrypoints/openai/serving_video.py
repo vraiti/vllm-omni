@@ -117,19 +117,20 @@ class OmniOpenAIServingVideo:
         return "lingbot-video" in name.lower()
 
     def _format_lingbot_rewriter_prompt(self, raw_prompt: str, num_frames: int) -> str:
-        """Format the user prompt for the LingBot-Video rewriter LLM stage.
+        """Format the user prompt for the LingBot-Video EXPAND stage.
 
-        Wraps the raw prompt with the step-2 system prompt and Qwen3 chat
-        template (thinking disabled).
+        Wraps the raw prompt with the step-1 EXPAND system prompt and
+        Qwen3 chat template (thinking disabled).  The EXPAND output is
+        then forwarded to the MAP stage by the expand_to_map bridge.
         """
         from vllm_omni.diffusion.models.lingbot_video.rewriter_prompts import (
-            _step2_text,
+            _step1_text,
         )
 
         fps = 24
         duration = max(1, min(30, num_frames // fps))
-        step2 = _step2_text("t2v", raw_prompt, duration)
-        return f"<|im_start|>user\n{step2}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        step1 = _step1_text("t2v", raw_prompt, duration)
+        return f"<|im_start|>user\n{step1}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
     async def _run_and_extract(
         self,
@@ -450,9 +451,9 @@ class OmniOpenAIServingVideo:
             replace_diffusion_params=True,
         )
 
-        if self._is_lingbot_video() and len(sampling_params_list) > 1:
+        if self._is_lingbot_video() and len(sampling_params_list) > 2:
             lora = LoRARequest("rewriter-lora", 1, "robbyant/lingbot-video-rewriter-lora")
-            sampling_params_list[0].lora_request = lora
+            sampling_params_list[1].lora_request = lora
 
         result = None
         async for output in engine_client.generate(

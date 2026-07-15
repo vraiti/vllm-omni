@@ -236,6 +236,7 @@ class StagePipelineConfig:
     # by ``stage_init_utils._resolve_model_tokenizer_paths``.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    engine_group: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -299,6 +300,26 @@ class PipelineConfig:
                     errors.append(f"Stage {stage.stage_id} references itself")
         if not any(not s.input_sources for s in self.stages):
             errors.append("No entry point (stage with empty input_sources)")
+
+        groups: dict[str, list[StagePipelineConfig]] = {}
+        for stage in self.stages:
+            if stage.engine_group is not None:
+                groups.setdefault(stage.engine_group, []).append(stage)
+        for group_name, members in groups.items():
+            if len(members) < 2:
+                errors.append(
+                    f"engine_group {group_name!r} has only {len(members)} "
+                    f"member(s); need at least 2 to form a sharing group"
+                )
+            non_llm = {m.execution_type for m in members} - {StageExecutionType.LLM_AR}
+            if non_llm:
+                errors.append(
+                    f"engine_group {group_name!r} contains non-LLM_AR stage(s); only LLM_AR stages can share an engine"
+                )
+            archs = {m.model_arch for m in members}
+            if len(archs) > 1:
+                errors.append(f"engine_group {group_name!r} has mixed model_arch values: {archs}")
+
         return errors
 
 
@@ -908,6 +929,7 @@ def merge_pipeline_deploy(
                 yaml_engine_args=engine_args,
                 yaml_runtime=runtime,
                 yaml_extras=extras,
+                engine_group=ps.engine_group,
             )
         )
     return result
@@ -935,6 +957,7 @@ class StageConfig:
     yaml_runtime: dict[str, Any] = field(default_factory=dict)
     yaml_extras: dict[str, Any] = field(default_factory=dict)
     runtime_overrides: dict[str, Any] = field(default_factory=dict)
+    engine_group: str | None = None
 
     def to_omegaconf(self) -> Any:
         """TODO(@lishunyang12): remove once engine consumes ResolvedStageConfig directly."""
@@ -994,6 +1017,8 @@ class StageConfig:
 
         if self.custom_process_input_func:
             config_dict["custom_process_input_func"] = self.custom_process_input_func
+        if self.engine_group is not None:
+            config_dict["engine_group"] = self.engine_group
 
         # Pass through extra YAML fields (default_sampling_params,
         # output_connectors, input_connectors, tts_args, etc.)

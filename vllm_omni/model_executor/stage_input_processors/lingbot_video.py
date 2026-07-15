@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Stage input processor for LingBot-Video: Rewriter LLM → Diffusion."""
+"""Stage input processors for LingBot-Video.
 
+Bridge functions:
+  expand_to_map  — Stage 0 (EXPAND) → Stage 1 (MAP)
+  rewriter_to_dit — Stage 1 (MAP)   → Stage 2 (DIFFUSION)
+"""
+
+from __future__ import annotations
+
+import re
 from typing import Any
 
 from vllm.inputs import TextPrompt
@@ -11,6 +19,56 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
 
+_DURATION_RE = re.compile(r"Video Duration:\s*(\d+)\s*seconds", re.IGNORECASE)
+
+
+def expand_to_map(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | list | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Convert EXPAND output to MAP input.
+
+    Stage 0 (EXPAND, no LoRA) produces a detailed prose caption.
+    This bridge wraps it with the step-2 MAP system prompt and
+    Qwen3 chat template so stage 1 (MAP, with LoRA) can produce
+    the structured JSON caption.
+    """
+    del streaming_context, requires_multimodal_data
+
+    if not source_outputs:
+        return []
+
+    expand_output = source_outputs[0]
+    detailed_caption = expand_output.outputs[0].text
+
+    if not detailed_caption or not detailed_caption.strip():
+        logger.warning("[expand_to_map] EXPAND stage produced empty output")
+        return []
+
+    dur = 5
+    if isinstance(prompt, dict):
+        prompt_text = prompt.get("prompt", "")
+        m = _DURATION_RE.search(prompt_text)
+        if m:
+            dur = int(m.group(1))
+
+    from vllm_omni.diffusion.models.lingbot_video.rewriter_prompts import (
+        _step2_text,
+    )
+
+    step2 = _step2_text("t2v", detailed_caption, dur)
+    formatted = f"<|im_start|>user\n{step2}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    logger.info(
+        "[expand_to_map] EXPAND produced %d chars, formatting MAP prompt with duration=%ds",
+        len(detailed_caption),
+        dur,
+    )
+
+    return [{"prompt": formatted}]
+
 
 def rewriter_to_dit(
     source_outputs: list[Any],
@@ -19,10 +77,10 @@ def rewriter_to_dit(
     streaming_context: Any | None = None,
     **kwargs: Any,
 ) -> dict[str, Any] | None:
-    """Convert rewriter LLM output to diffusion stage input.
+    """Convert MAP LLM output to diffusion stage input.
 
-    Stage 0 (Qwen3.5 + rewriter LoRA) generates a structured JSON caption.
-    This bridge passes that caption text as the diffusion prompt.
+    Stage 1 (MAP, Qwen3.5 + rewriter LoRA) generates a structured JSON
+    caption.  This bridge passes that caption text as the diffusion prompt.
     """
     del streaming_context, requires_multimodal_data, kwargs
 
@@ -33,11 +91,11 @@ def rewriter_to_dit(
     generated_text = rewriter_output.outputs[0].text
 
     if not generated_text or not generated_text.strip():
-        logger.warning("[rewriter_to_dit] Rewriter produced empty output")
+        logger.warning("[rewriter_to_dit] MAP stage produced empty output")
         return None
 
     logger.info(
-        "[rewriter_to_dit] Rewriter produced %d chars of caption JSON",
+        "[rewriter_to_dit] MAP produced %d chars of caption JSON",
         len(generated_text),
     )
 

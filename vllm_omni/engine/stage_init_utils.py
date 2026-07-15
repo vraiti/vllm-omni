@@ -61,6 +61,7 @@ class LogicalStageInitPlan:
     stage_idx: int
     stage_id: int
     replicas: list[ReplicaInitPlan]
+    shares_engine_with_stage: int | None = None
 
 
 def _resolve_model_to_local_path(model: str) -> str:

@@ -707,6 +707,9 @@ class AsyncOmniEngine:
             )
         params = effective_sampling_params_list[0]
 
+        if lora_request is None:
+            lora_request = getattr(params, "lora_request", None)
+
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
         original_prompt = prompt

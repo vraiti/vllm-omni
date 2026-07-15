@@ -81,6 +81,7 @@ class StagePool:
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
+        owns_clients: bool = True,
     ) -> None:
         if isinstance(clients, list):
             normalized_clients: list[StagePoolClient] = list(clients)
@@ -90,6 +91,7 @@ class StagePool:
         # Allow empty pools when running in distributed head mode for a
         # non-self stage; clients will arrive via add_client(...).
         self.stage_id = stage_id
+        self._owns_clients = owns_clients
         # Slots can become None after a dynamic remove_client (distributed mode);
         # iterate via live_replica_ids() to skip holes.
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
@@ -1194,6 +1196,8 @@ class StagePool:
 
     def shutdown_replica(self, replica_id: int) -> None:
         """Shutdown one backend handle in this stage pool."""
+        if not self._owns_clients:
+            return
         if replica_id >= len(self.clients):
             return
         client = self.clients[replica_id]
