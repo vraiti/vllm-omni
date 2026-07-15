@@ -9,7 +9,7 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
-    gpu_memory_utilization: 0.55
+    gpu_memory_utilization: 0.70
     enforce_eager: true
     enable_lora: true
     max_lora_rank: 64
