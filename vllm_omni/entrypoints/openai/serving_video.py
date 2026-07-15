@@ -176,6 +176,8 @@ class OmniOpenAIServingVideo:
             num_frames = vp.num_frames or 121
             formatted = self._format_lingbot_rewriter_prompt(request.prompt, num_frames)
             prompt = OmniTextPrompt(prompt=formatted, modalities=["video"])
+            if vp.num_frames is None:
+                vp.num_frames = num_frames
 
         if vp.width is not None and vp.height is not None:
             gen_params.width = vp.width
