@@ -103,12 +103,23 @@ class Qwen3OmniDuplexAdapter(DuplexAdapter):
                 sampling_params_list=sampling_params_list,
             )
 
+            stage0_stop_count = 0
+
             async for output in result_gen:
                 stage_id = getattr(output, "stage_id", None)
 
                 if stage_id == 0 and output.outputs:
                     first = output.outputs[0]
                     token_ids = list(first.token_ids)
+                    finish_reason = getattr(first, "finish_reason", None)
+
+                    if finish_reason:
+                        stage0_stop_count += 1
+
+                    if stage0_stop_count >= 2 and token_ids and not finish_reason:
+                        logger.info("stage0 started new response after %d stops, breaking", stage0_stop_count)
+                        break
+
                     if token_ids:
                         input_stream.put_nowait(token_ids)
                         self._pending_thinker_tokens.extend(token_ids)
@@ -166,7 +177,11 @@ class Qwen3OmniDuplexAdapter(DuplexAdapter):
             elif isinstance(turn, _AssistantTurn):
                 prompt_token_ids.extend(tokenizer.encode("<|im_start|>assistant\n"))
                 prompt_token_ids.extend(turn.token_ids)
-                prompt_token_ids.extend(tokenizer.encode("<|im_end|>\n"))
+                im_end_ids = tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
+                if turn.token_ids and turn.token_ids[-1] == im_end_ids[0]:
+                    prompt_token_ids.extend(im_end_ids[1:])
+                else:
+                    prompt_token_ids.extend(im_end_ids)
 
         prompt_token_ids.extend(
             tokenizer.encode(f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n")

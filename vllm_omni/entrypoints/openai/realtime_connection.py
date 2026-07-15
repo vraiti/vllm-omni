@@ -78,12 +78,24 @@ class RealtimeConnection(VllmRealtimeConnection):
                 sampling_params_list=sampling_params_list,
             )
 
+            stage0_stop_count = 0
+
             async for output in result_gen:
                 stage_id = getattr(output, "stage_id", None)
                 if stage_id == 0 and output.outputs:
                     first_output = output.outputs[0]
                     new_token_ids = list(first_output.token_ids)
                     finish_reason = getattr(first_output, "finish_reason", None)
+
+                    if finish_reason:
+                        stage0_stop_count += 1
+
+                    if stage0_stop_count >= 2 and new_token_ids and not finish_reason:
+                        logger.info(
+                            "[rt-debug] stage0 started new response after %d stops, breaking", stage0_stop_count
+                        )
+                        break
+
                     if new_token_ids or finish_reason:
                         logger.info(
                             "[rt-debug] stage0 tokens=%s finish=%s",
