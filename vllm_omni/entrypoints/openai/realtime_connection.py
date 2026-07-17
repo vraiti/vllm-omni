@@ -9,10 +9,14 @@ from uuid import uuid4
 
 import numpy as np
 from scipy.signal import resample_poly
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.speech_to_text.realtime.connection import (
     RealtimeConnection as VllmRealtimeConnection,
 )
+from vllm.inputs import TokensPrompt
 from vllm.logger import init_logger
+from vllm.renderers.inputs.preprocess import parse_model_prompt
+from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -24,6 +28,7 @@ from vllm_omni.experimental.fullduplex.qwen3_omni.audio_utils import (
 logger = init_logger(__name__)
 
 MODEL_INPUT_RATE = 16000
+AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
 
 def _event_id() -> str:
@@ -39,6 +44,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._committed_audio: list[np.ndarray] = []
         self._client_event_id: str | None = None
         self._client_input_rate: int = 24000
+        self._conversation_history: list[tuple[np.ndarray, str]] = []
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -144,14 +150,55 @@ class RealtimeConnection(VllmRealtimeConnection):
             self._audio_buffer = committed_audio + self._audio_buffer
             return
 
-        async def audio_iter() -> AsyncGenerator[np.ndarray, None]:
-            for chunk in committed_audio:
-                yield chunk
-
+        current_audio = np.concatenate(committed_audio)
         input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
-        streaming_input_gen = self.serving.transcribe_realtime(audio_iter(), input_stream)
+        streaming_input_gen = self._build_prompt(current_audio)
 
-        self.generation_task = asyncio.create_task(self._run_generation(streaming_input_gen, input_stream))
+        self.generation_task = asyncio.create_task(
+            self._run_generation(
+                streaming_input_gen,
+                input_stream,
+                current_audio,
+            ),
+        )
+
+    async def _build_prompt(
+        self,
+        current_audio: np.ndarray,
+    ) -> AsyncGenerator[StreamingInput, None]:
+        model_config = self.serving.model_config
+        renderer = self.serving.renderer
+        tokenizer = cached_tokenizer_from_config(model_config)
+
+        parts: list[str] = []
+        audio_arrays: list[np.ndarray] = []
+
+        for user_audio, assistant_text in self._conversation_history:
+            parts.append(f"<|im_start|>user\n{AUDIO_PLACEHOLDER}<|im_end|>\n")
+            parts.append(
+                f"<|im_start|>assistant\n{assistant_text}<|im_end|>\n",
+            )
+            audio_arrays.append(user_audio)
+
+        parts.append(f"<|im_start|>user\n{AUDIO_PLACEHOLDER}<|im_end|>\n")
+        parts.append("<|im_start|>assistant\n")
+        audio_arrays.append(current_audio)
+
+        prompt_text = "".join(parts)
+        prompt_token_ids = tokenizer.encode(prompt_text)
+
+        if len(audio_arrays) == 1:
+            mm_data = {"audio": audio_arrays[0]}
+        else:
+            mm_data = {"audio": audio_arrays}
+
+        prompt = TokensPrompt(
+            prompt_token_ids=prompt_token_ids,
+            multi_modal_data=mm_data,
+        )
+        parsed = parse_model_prompt(model_config, prompt)
+        (engine_input,) = await renderer.render_cmpl_async([parsed])
+        yield StreamingInput(prompt=engine_input)
 
     def _extract_audio_chunks_with_ref(self, output) -> tuple[list[np.ndarray], int]:
         chunks, sr, self._realtime_audio_ref = extract_audio_chunks(output, self._realtime_audio_ref)
@@ -161,6 +208,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         self,
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
+        current_audio: np.ndarray | None = None,
     ):
         response_id = f"resp_{uuid4().hex[:24]}"
         item_id = f"item_{uuid4().hex[:24]}"
@@ -258,6 +306,14 @@ class RealtimeConnection(VllmRealtimeConnection):
             )
             if full_text:
                 logger.info("generated text: %.200s", full_text)
+            if current_audio is not None and full_text:
+                self._conversation_history.append(
+                    (current_audio, full_text),
+                )
+                logger.info(
+                    "conversation history: %d turns",
+                    len(self._conversation_history),
+                )
             await self._send_response_done(
                 response_id,
                 item_id,
