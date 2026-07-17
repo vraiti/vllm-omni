@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import AsyncGenerator
 from typing import cast
 from uuid import uuid4
 
 import numpy as np
-from vllm.entrypoints.openai.engine.protocol import UsageInfo
-from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
-from vllm.entrypoints.speech_to_text.realtime.protocol import TranscriptionDelta, TranscriptionDone
+from scipy.signal import resample_poly
+from vllm.entrypoints.speech_to_text.realtime.connection import (
+    RealtimeConnection as VllmRealtimeConnection,
+)
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -21,21 +23,103 @@ from vllm_omni.experimental.fullduplex.qwen3_omni.audio_utils import (
 
 logger = init_logger(__name__)
 
+MODEL_INPUT_RATE = 16000
+
+
+def _event_id() -> str:
+    return f"event_{uuid4().hex[:24]}"
+
 
 class RealtimeConnection(VllmRealtimeConnection):
-    """Omni realtime connection with audio-only server events.
-
-    Reuses upstream vLLM websocket/session lifecycle and only customizes
-    generation output handling to emit audio deltas.
-    """
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
+        self._committed_audio: list[np.ndarray] = []
+        self._client_event_id: str | None = None
+        self._client_input_rate: int = 24000
 
-    async def start_generation(self):
-        await super().start_generation()
+    async def handle_event(self, event: dict):
+        event_type = event.get("type")
+
+        if event_type == "session.update":
+            session = event.get("session", event)
+            model = session.get("model") or event.get("model")
+            if model is not None:
+                err = self._check_model(model)
+                if err is not None:
+                    await self.send_error(err.error.message, "model_not_found")
+                    return
+                self._is_model_validated = True
+            else:
+                self._is_model_validated = True
+            audio_cfg = session.get("audio", {})
+            input_fmt = audio_cfg.get("input", {}).get("format", {})
+            if isinstance(input_fmt, dict):
+                rate = input_fmt.get("rate")
+                if rate and isinstance(rate, int):
+                    self._client_input_rate = rate
+
+        elif event_type == "input_audio_buffer.append":
+            audio_b64 = event.get("audio", "")
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+                audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                if len(audio_array) == 0:
+                    return
+                if self._client_input_rate != MODEL_INPUT_RATE:
+                    audio_array = resample_poly(
+                        audio_array,
+                        up=MODEL_INPUT_RATE,
+                        down=self._client_input_rate,
+                    ).astype(np.float32)
+                self._audio_buffer.append(audio_array)
+            except Exception as e:
+                logger.error("Failed to decode audio: %s", e)
+                await self.send_error("Invalid audio data", "invalid_audio")
+
+        elif event_type == "input_audio_buffer.commit":
+            self._committed_audio = self._audio_buffer
+            self._audio_buffer = []
+
+        elif event_type == "response.create":
+            if not self._committed_audio:
+                await self.send_error("No audio committed", "no_audio_committed")
+                return
+            client_event_id = event.get("event_id")
+            metadata = event.get("response", {})
+            if isinstance(metadata, dict):
+                meta_inner = metadata.get("metadata", {})
+                if isinstance(meta_inner, dict) and not client_event_id:
+                    client_event_id = meta_inner.get("client_event_id")
+            self._client_event_id = client_event_id
+            await self.start_generation(self._committed_audio)
+            self._committed_audio = []
+
+        elif event_type == "response.cancel":
+            if self.generation_task and not self.generation_task.done():
+                self.generation_task.cancel()
+
+        elif event_type == "input_audio_buffer.clear":
+            self._audio_buffer.clear()
+
+        else:
+            pass
+
+    async def start_generation(self, committed_audio: list[np.ndarray]):
+        if self.generation_task is not None and not self.generation_task.done():
+            logger.warning("Generation already in progress, ignoring commit")
+            self._audio_buffer = committed_audio + self._audio_buffer
+            return
+
+        async def audio_iter() -> AsyncGenerator[np.ndarray, None]:
+            for chunk in committed_audio:
+                yield chunk
+
+        input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
+        streaming_input_gen = self.serving.transcribe_realtime(audio_iter(), input_stream)
+
+        self.generation_task = asyncio.create_task(self._run_generation(streaming_input_gen, input_stream))
 
     def _extract_audio_chunks_with_ref(self, output) -> tuple[list[np.ndarray], int]:
         chunks, sr, self._realtime_audio_ref = extract_audio_chunks(output, self._realtime_audio_ref)
@@ -46,32 +130,24 @@ class RealtimeConnection(VllmRealtimeConnection):
         streaming_input_gen: AsyncGenerator,
         input_stream: asyncio.Queue[list[int]],
     ):
-        request_id = f"rt-{self.connection_id}-{uuid4()}"
-        sent_audio = False
-        audio_done_sent = False
+        response_id = f"resp_{uuid4().hex[:24]}"
+        item_id = f"item_{uuid4().hex[:24]}"
         full_text = ""
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
+        response_done_sent = False
 
-        # Coerce cumulative outputs to delta outputs; this ensures
-        # we don't emit redundant MM data & drain after emitting.
         sampling_params_list = list(self.engine.default_sampling_params_list)
         sampling_params_list = coerce_param_message_types(
             sampling_params_list,
             is_streaming=True,
         )
 
-        sp0 = sampling_params_list[0]
-        logger.info(
-            "[rt-debug] stage0 sampling_params: stop_token_ids=%s eos_token_id=%s ignore_eos=%s max_tokens=%s",
-            getattr(sp0, "stop_token_ids", "N/A"),
-            getattr(sp0, "eos_token_id", "N/A"),
-            getattr(sp0, "ignore_eos", "N/A"),
-            getattr(sp0, "max_tokens", "N/A"),
-        )
-
         try:
+            await self._send_response_created(response_id, item_id)
+
+            request_id = f"rt-{self.connection_id}-{uuid4()}"
             result_gen = self.engine.generate(
                 prompt=streaming_input_gen,
                 request_id=request_id,
@@ -91,17 +167,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                         stage0_stop_count += 1
 
                     if stage0_stop_count >= 2 and new_token_ids and not finish_reason:
-                        logger.info(
-                            "[rt-debug] stage0 started new response after %d stops, breaking", stage0_stop_count
-                        )
                         break
 
-                    if new_token_ids or finish_reason:
-                        logger.info(
-                            "[rt-debug] stage0 tokens=%s finish=%s",
-                            new_token_ids,
-                            finish_reason,
-                        )
                     if new_token_ids:
                         input_stream.put_nowait(new_token_ids)
 
@@ -116,43 +183,171 @@ class RealtimeConnection(VllmRealtimeConnection):
                     completion_tokens_len += len(new_token_ids)
 
                     if delta_text:
-                        await self.send(TranscriptionDelta(delta=delta_text))
+                        await self.send_json(
+                            {
+                                "event_id": _event_id(),
+                                "type": "response.output_text.delta",
+                                "response_id": response_id,
+                                "item_id": item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": delta_text,
+                            }
+                        )
 
-                audio_chunks, sample_rate = self._extract_audio_chunks_with_ref(output)
-
+                audio_chunks, _ = self._extract_audio_chunks_with_ref(output)
                 for chunk in audio_chunks:
-                    sent_audio = True
                     await self.send_json(
                         {
-                            "type": "response.audio.delta",
-                            "audio": pcm16_b64(chunk),
-                            "format": "pcm16",
-                            "sample_rate_hz": sample_rate,
+                            "event_id": _event_id(),
+                            "type": "response.output_audio.delta",
+                            "response_id": response_id,
+                            "item_id": item_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": pcm16_b64(chunk),
                         }
                     )
 
                 if not self._is_connected:
                     break
 
-            usage = UsageInfo(
-                prompt_tokens=prompt_token_ids_len,
-                completion_tokens=completion_tokens_len,
-                total_tokens=prompt_token_ids_len + completion_tokens_len,
+            await self._send_response_done(
+                response_id,
+                item_id,
+                "completed",
+                prompt_token_ids_len,
+                completion_tokens_len,
             )
-            await self.send(TranscriptionDone(text=full_text, usage=usage))
+            response_done_sent = True
 
-            if sent_audio:
-                await self.send_json({"type": "response.audio.done", "has_audio": True})
-                audio_done_sent = True
         except Exception as e:
             logger.exception("Error in generation: %s", e)
-            await self.send_error(str(e), "processing_error")
+            await self.send_json(
+                {
+                    "event_id": _event_id(),
+                    "type": "error",
+                    "error": {"message": str(e), "type": "processing_error"},
+                }
+            )
         finally:
-            if self._is_connected and not audio_done_sent:
+            if self._is_connected and not response_done_sent:
                 try:
-                    await self.send_json({"type": "response.audio.done", "has_audio": sent_audio})
+                    await self._send_response_done(
+                        response_id,
+                        item_id,
+                        "failed",
+                        prompt_token_ids_len,
+                        completion_tokens_len,
+                    )
                 except Exception:
-                    logger.exception("Failed to send response.audio.done")
+                    logger.exception("Failed to send response.done")
+
+    async def _send_response_created(self, response_id: str, item_id: str) -> None:
+        metadata: dict | None = None
+        if self._client_event_id:
+            metadata = {"client_event_id": self._client_event_id}
+        await self.send_json(
+            {
+                "event_id": _event_id(),
+                "type": "response.created",
+                "response": {
+                    "id": response_id,
+                    "object": "realtime.response",
+                    "status": "in_progress",
+                    "output": [],
+                    "metadata": metadata,
+                },
+            }
+        )
+        await self.send_json(
+            {
+                "event_id": _event_id(),
+                "type": "response.output_item.added",
+                "response_id": response_id,
+                "output_index": 0,
+                "item": {
+                    "id": item_id,
+                    "object": "realtime.item",
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }
+        )
+        await self.send_json(
+            {
+                "event_id": _event_id(),
+                "type": "response.content_part.added",
+                "response_id": response_id,
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "audio"},
+            }
+        )
+
+    async def _send_response_done(
+        self,
+        response_id: str,
+        item_id: str,
+        status: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> None:
+        await self.send_json(
+            {
+                "event_id": _event_id(),
+                "type": "response.output_audio.done",
+                "response_id": response_id,
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+            }
+        )
+        await self.send_json(
+            {
+                "event_id": _event_id(),
+                "type": "response.output_item.done",
+                "response_id": response_id,
+                "output_index": 0,
+                "item": {
+                    "id": item_id,
+                    "object": "realtime.item",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }
+        )
+        await self.send_json(
+            {
+                "event_id": _event_id(),
+                "type": "response.done",
+                "response": {
+                    "id": response_id,
+                    "object": "realtime.response",
+                    "status": status,
+                    "output": [
+                        {
+                            "id": item_id,
+                            "object": "realtime.item",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [],
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                },
+            }
+        )
 
     async def send_json(self, payload: dict):
         await self.websocket.send_text(json.dumps(payload))
