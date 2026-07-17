@@ -210,8 +210,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        # Remove finished requests before the upstream scheduler sees them.
-        # Upstream vllm asserts on scheduling finished requests; omni allows
+        # Remove FINISHED_ABORTED requests before the upstream scheduler sees
+        # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
         for queue in (self.waiting, self.running):

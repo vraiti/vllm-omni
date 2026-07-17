@@ -104,7 +104,7 @@ async def _run_duplex_roundtrip(
             ):
                 continue
 
-            if etype == "response.audio.delta":
+            if etype == "response.output_audio.delta":
                 delta_events += 1
                 audio_b64 = event.get("delta", "") or event.get("audio", "")
                 if audio_b64:
@@ -178,7 +178,7 @@ async def test_duplex_barge_in(server_params):
             if event.get("type") == "response.created":
                 got_created = True
                 break
-            if event.get("type") == "response.audio.delta":
+            if event.get("type") == "response.output_audio.delta":
                 got_created = True
                 break
 

@@ -227,7 +227,7 @@ class DuplexRealtimeHandler:
                     await self._send_event(
                         {
                             "event_id": _event_id(),
-                            "type": "response.audio.delta",
+                            "type": "response.output_audio.delta",
                             "response_id": response_id,
                             "item_id": item_id,
                             "output_index": 0,
