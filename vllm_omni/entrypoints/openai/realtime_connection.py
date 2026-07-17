@@ -35,6 +35,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
+        self._audio_buffer: list[np.ndarray] = []
         self._committed_audio: list[np.ndarray] = []
         self._client_event_id: str | None = None
         self._client_input_rate: int = 24000
