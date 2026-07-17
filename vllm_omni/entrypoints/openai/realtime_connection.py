@@ -42,6 +42,8 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
+        if event_type != "input_audio_buffer.append":
+            logger.info("WS recv: %s", event_type)
 
         if event_type == "session.update":
             session = event.get("session", event)
@@ -68,25 +70,29 @@ class RealtimeConnection(VllmRealtimeConnection):
                 audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                 if len(audio_array) == 0:
                     return
-                if self._client_input_rate != MODEL_INPUT_RATE:
-                    audio_array = resample_poly(
-                        audio_array,
-                        up=MODEL_INPUT_RATE,
-                        down=self._client_input_rate,
-                    ).astype(np.float32)
                 self._audio_buffer.append(audio_array)
             except Exception as e:
                 logger.error("Failed to decode audio: %s", e)
                 await self.send_error("Invalid audio data", "invalid_audio")
 
         elif event_type == "input_audio_buffer.commit":
-            self._committed_audio = self._audio_buffer
+            if not self._audio_buffer:
+                self._committed_audio = []
+                logger.info("commit: empty buffer")
+            else:
+                audio = np.concatenate(self._audio_buffer)
+                if self._client_input_rate != MODEL_INPUT_RATE:
+                    audio = resample_poly(
+                        audio,
+                        up=MODEL_INPUT_RATE,
+                        down=self._client_input_rate,
+                    ).astype(np.float32)
+                duration = len(audio) / MODEL_INPUT_RATE
+                logger.info("commit: %.2fs audio", duration)
+                self._committed_audio = [audio]
             self._audio_buffer = []
 
         elif event_type == "response.create":
-            if not self._committed_audio:
-                await self.send_error("No audio committed", "no_audio_committed")
-                return
             client_event_id = event.get("event_id")
             metadata = event.get("response", {})
             if isinstance(metadata, dict):
@@ -94,6 +100,31 @@ class RealtimeConnection(VllmRealtimeConnection):
                 if isinstance(meta_inner, dict) and not client_event_id:
                     client_event_id = meta_inner.get("client_event_id")
             self._client_event_id = client_event_id
+
+            if not self._committed_audio:
+                logger.warning(
+                    "response.create with no committed audio (client_event_id=%s), sending empty completed response",
+                    client_event_id,
+                )
+                response_id = f"resp_{uuid4().hex[:24]}"
+                item_id = f"item_{uuid4().hex[:24]}"
+                await self._send_response_created(response_id, item_id)
+                await self._send_response_done(
+                    response_id,
+                    item_id,
+                    "completed",
+                    0,
+                    0,
+                )
+                return
+
+            gen_in_progress = self.generation_task is not None and not self.generation_task.done()
+            logger.info(
+                "response.create: client_event_id=%s, committed_chunks=%d, gen_in_progress=%s",
+                client_event_id,
+                len(self._committed_audio),
+                gen_in_progress,
+            )
             await self.start_generation(self._committed_audio)
             self._committed_audio = []
 
@@ -146,6 +177,11 @@ class RealtimeConnection(VllmRealtimeConnection):
         )
 
         try:
+            logger.info(
+                "generation start: response_id=%s, client_event_id=%s",
+                response_id,
+                self._client_event_id,
+            )
             await self._send_response_created(response_id, item_id)
 
             request_id = f"rt-{self.connection_id}-{uuid4()}"
@@ -213,6 +249,15 @@ class RealtimeConnection(VllmRealtimeConnection):
                 if not self._is_connected:
                     break
 
+            logger.info(
+                "generation done: response_id=%s, text_len=%d, prompt_tokens=%d, completion_tokens=%d",
+                response_id,
+                len(full_text),
+                prompt_token_ids_len,
+                completion_tokens_len,
+            )
+            if full_text:
+                logger.info("generated text: %.200s", full_text)
             await self._send_response_done(
                 response_id,
                 item_id,
@@ -232,6 +277,14 @@ class RealtimeConnection(VllmRealtimeConnection):
                 }
             )
         finally:
+            discarded = sum(len(c) for c in self._audio_buffer)
+            if discarded:
+                logger.info(
+                    "clearing %.2fs of audio buffered during generation",
+                    discarded / MODEL_INPUT_RATE,
+                )
+            self._audio_buffer.clear()
+
             if self._is_connected and not response_done_sent:
                 try:
                     await self._send_response_done(

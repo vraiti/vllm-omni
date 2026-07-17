@@ -21,7 +21,6 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP, SupportsRealtime
-from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
 )
@@ -30,7 +29,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
-from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -228,45 +226,22 @@ class Qwen3OmniMoeForConditionalGeneration(
         input_stream: asyncio.Queue[list[int]],
         model_config: ModelConfig,
     ) -> AsyncGenerator[PromptType, None]:
-        processor = cached_processor_from_config(model_config)
-        feature_extractor = processor.feature_extractor
-        sampling_rate = feature_extractor.sampling_rate
         tokenizer = cached_tokenizer_from_config(model_config)
-
-        # Use a small segment size for low-latency streaming.
-        segment_duration_s = 5.0
-        buffer = Qwen3ASRRealtimeBuffer(
-            sampling_rate=sampling_rate,
-            segment_duration_s=segment_duration_s,
-        )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
         prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
 
         prompt_token_ids = tokenizer.encode(prompt_template)
 
-        # In non-async-chunk (full-payload) mode the engine treats each
-        # streaming TokensPrompt as a fresh decode, so mid-stream segment
-        # yields cause the thinker to emit duplicate responses and the
-        # talker to emit duplicate audio. Defer all audio to the final
-        # flush so the thinker sees one complete prompt.
-        async_chunk = getattr(model_config, "async_chunk", False)
-
+        chunks: list[np.ndarray] = []
         async for audio_chunk in audio_stream:
-            buffer.write_audio(audio_chunk)
+            chunks.append(audio_chunk)
 
-            if async_chunk:
-                while (segment := buffer.read_audio()) is not None:
-                    yield TokensPrompt(
-                        prompt_token_ids=prompt_token_ids,
-                        multi_modal_data={"audio": segment},
-                    )
-
-        remaining = buffer.flush()
-        if remaining is not None and len(remaining) > 0:
+        if chunks:
+            audio = np.concatenate(chunks)
             yield TokensPrompt(
                 prompt_token_ids=prompt_token_ids,
-                multi_modal_data={"audio": remaining},
+                multi_modal_data={"audio": audio},
             )
 
     # ==================== Device utilities ====================
