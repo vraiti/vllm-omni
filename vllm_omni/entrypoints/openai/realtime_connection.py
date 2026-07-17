@@ -1,18 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 from collections.abc import AsyncGenerator
+from http import HTTPStatus
 from typing import cast
 from uuid import uuid4
 
 import numpy as np
+from fastapi import WebSocket
 from scipy.signal import resample_poly
+from starlette.websockets import WebSocketDisconnect
 from vllm.engine.protocol import StreamingInput
-from vllm.entrypoints.speech_to_text.realtime.connection import (
-    RealtimeConnection as VllmRealtimeConnection,
-)
 from vllm.inputs import TokensPrompt
 from vllm.logger import init_logger
 from vllm.renderers.inputs.preprocess import parse_model_prompt
@@ -20,9 +22,10 @@ from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
-from vllm_omni.experimental.fullduplex.qwen3_omni.audio_utils import (
+from vllm_omni.experimental.fullduplex.omni.audio_utils import (
     extract_audio_chunks,
     pcm16_b64,
+    pcm16_b64_to_f32,
 )
 
 logger = init_logger(__name__)
@@ -35,16 +38,57 @@ def _event_id() -> str:
     return f"event_{uuid4().hex[:24]}"
 
 
-class RealtimeConnection(VllmRealtimeConnection):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.engine = cast(AsyncOmni, self.serving.engine_client)
+class RealtimeConnection:
+    def __init__(self, websocket: WebSocket, serving) -> None:
+        self.websocket = websocket
+        self.connection_id = f"ws-{uuid4()}"
+        self.serving = serving
+        self.engine = cast(AsyncOmni, serving.engine_client)
+        self.generation_task: asyncio.Task | None = None
+        self._is_connected = False
+        self._is_model_validated = False
         self._realtime_audio_ref: np.ndarray | None = None
         self._audio_buffer: list[np.ndarray] = []
         self._committed_audio: list[np.ndarray] = []
         self._client_event_id: str | None = None
         self._client_input_rate: int = 24000
         self._conversation_history: list[tuple[np.ndarray, str]] = []
+
+    async def handle_connection(self):
+        await self.websocket.accept()
+        self._is_connected = True
+
+        await self.send_json(
+            {
+                "event_id": _event_id(),
+                "type": "session.created",
+                "session": {
+                    "id": self.connection_id,
+                    "object": "realtime.session",
+                },
+            }
+        )
+
+        try:
+            while True:
+                message = await self.websocket.receive_text()
+                try:
+                    event = json.loads(message)
+                    await self.handle_event(event)
+                except json.JSONDecodeError:
+                    await self._send_error("Invalid JSON", "invalid_json")
+                except Exception as e:
+                    logger.exception("Error handling event: %s", e)
+                    await self._send_error(str(e), "processing_error")
+        except WebSocketDisconnect:
+            logger.debug("WebSocket disconnected: %s", self.connection_id)
+        except Exception as e:
+            logger.exception("Unexpected error in connection: %s", e)
+        finally:
+            self._is_connected = False
+            self._audio_buffer.clear()
+            if self.generation_task and not self.generation_task.done():
+                self.generation_task.cancel()
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
@@ -55,13 +99,16 @@ class RealtimeConnection(VllmRealtimeConnection):
             session = event.get("session", event)
             model = session.get("model") or event.get("model")
             if model is not None:
-                err = self._check_model(model)
-                if err is not None:
-                    await self.send_error(err.error.message, "model_not_found")
+                if not self.serving._is_model_supported(model):
+                    err = self.serving.create_error_response(
+                        message=f"The model `{model}` does not exist.",
+                        err_type="NotFoundError",
+                        status_code=HTTPStatus.NOT_FOUND,
+                        param="model",
+                    )
+                    await self._send_error(err.error.message, "model_not_found")
                     return
-                self._is_model_validated = True
-            else:
-                self._is_model_validated = True
+            self._is_model_validated = True
             audio_cfg = session.get("audio", {})
             input_fmt = audio_cfg.get("input", {}).get("format", {})
             if isinstance(input_fmt, dict):
@@ -72,14 +119,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         elif event_type == "input_audio_buffer.append":
             audio_b64 = event.get("audio", "")
             try:
-                audio_bytes = base64.b64decode(audio_b64)
-                audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                audio_array = pcm16_b64_to_f32(audio_b64)
                 if len(audio_array) == 0:
                     return
                 self._audio_buffer.append(audio_array)
             except Exception as e:
                 logger.error("Failed to decode audio: %s", e)
-                await self.send_error("Invalid audio data", "invalid_audio")
+                await self._send_error("Invalid audio data", "invalid_audio")
 
         elif event_type == "input_audio_buffer.commit":
             if not self._audio_buffer:
@@ -140,9 +186,6 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         elif event_type == "input_audio_buffer.clear":
             self._audio_buffer.clear()
-
-        else:
-            pass
 
     async def start_generation(self, committed_audio: list[np.ndarray]):
         if self.generation_task is not None and not self.generation_task.done():
@@ -456,6 +499,15 @@ class RealtimeConnection(VllmRealtimeConnection):
                         "total_tokens": prompt_tokens + completion_tokens,
                     },
                 },
+            }
+        )
+
+    async def _send_error(self, message: str, code: str | None = None) -> None:
+        await self.send_json(
+            {
+                "event_id": _event_id(),
+                "type": "error",
+                "error": {"message": message, "code": code},
             }
         )
 

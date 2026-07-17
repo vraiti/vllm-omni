@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 from uuid import uuid4
 
@@ -13,23 +14,24 @@ import numpy as np
 from vllm.engine.protocol import StreamingInput
 from vllm.inputs import TokensPrompt
 from vllm.logger import init_logger
-from vllm.model_executor.models.qwen3_omni_moe_thinker import (
-    Qwen3OmniMoeThinkerForConditionalGeneration,
-)
+from vllm.model_executor.model_loader import get_model_cls
 from vllm.renderers.inputs.preprocess import parse_model_prompt
 from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.experimental.fullduplex.core.adapter import (
+    AudioChunk,
     DuplexAdapter,
     DuplexCapability,
     OutputChunk,
 )
 from vllm_omni.experimental.fullduplex.core.session import DuplexSession
-from vllm_omni.experimental.fullduplex.qwen3_omni.audio_utils import (
+from vllm_omni.experimental.fullduplex.omni.audio_utils import (
     extract_audio_chunks,
 )
 
 logger = init_logger(__name__)
+
+_INPUT_SAMPLE_RATE = 16000
 
 
 @dataclass
@@ -43,8 +45,8 @@ class _AssistantTurn:
     complete: bool
 
 
-class Qwen3OmniDuplexAdapter(DuplexAdapter):
-    """DuplexAdapter for Qwen3-Omni audio-in / audio+text-out streaming."""
+class OmniDuplexAdapter(DuplexAdapter):
+    """Model-agnostic DuplexAdapter for audio-in / audio+text-out streaming."""
 
     _MAX_HISTORY_TOKENS = 4096
     _MAX_HISTORY_AUDIO_S = 60.0
@@ -60,6 +62,18 @@ class Qwen3OmniDuplexAdapter(DuplexAdapter):
         self._pending_thinker_tokens: list[int] = []
         self._pending_audio: np.ndarray | None = None
         self._interrupted: bool = False
+
+    @cached_property
+    def _model_cls(self):
+        return get_model_cls(self._serving.model_config)
+
+    @cached_property
+    def _tokenizer(self):
+        return cached_tokenizer_from_config(self._serving.model_config)
+
+    @cached_property
+    def _audio_placeholder(self):
+        return self._model_cls.get_placeholder_str("audio", 0)
 
     def capabilities(self) -> DuplexCapability:
         return DuplexCapability(
@@ -117,7 +131,7 @@ class Qwen3OmniDuplexAdapter(DuplexAdapter):
                         stage0_stop_count += 1
 
                     if stage0_stop_count >= 2 and token_ids and not finish_reason:
-                        logger.info("stage0 started new response after %d stops, breaking", stage0_stop_count)
+                        logger.debug("stage0 started new response after %d stops, breaking", stage0_stop_count)
                         break
 
                     if token_ids:
@@ -131,7 +145,7 @@ class Qwen3OmniDuplexAdapter(DuplexAdapter):
                 for chunk in chunks:
                     yield OutputChunk(
                         "audio",
-                        {"pcm_f32": chunk, "sample_rate": sr},
+                        AudioChunk(pcm_f32=chunk, sample_rate=sr),
                     )
         finally:
             if self._pending_audio is not None:
@@ -163,9 +177,8 @@ class Qwen3OmniDuplexAdapter(DuplexAdapter):
         audio: np.ndarray,
         input_stream: asyncio.Queue[list[int]],
     ):
-        model_config = self._serving.model_config
-        tokenizer = cached_tokenizer_from_config(model_config)
-        audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
+        tokenizer = self._tokenizer
+        audio_placeholder = self._audio_placeholder
 
         prompt_token_ids: list[int] = []
         audio_list: list[np.ndarray] = []
@@ -190,46 +203,18 @@ class Qwen3OmniDuplexAdapter(DuplexAdapter):
 
         mm_audio: np.ndarray | list[np.ndarray] = audio_list[0] if len(audio_list) == 1 else audio_list
 
-        if isinstance(mm_audio, np.ndarray):
-            logger.info(
-                "[duplex-debug] single audio: shape=%s dtype=%s ndim=%d",
-                mm_audio.shape,
-                mm_audio.dtype,
-                mm_audio.ndim,
-            )
-        else:
-            logger.info(
-                "[duplex-debug] %d audios: shapes=%s",
-                len(mm_audio),
-                [a.shape for a in mm_audio],
-            )
-
-        audio_pad_id = tokenizer.encode("<|audio_pad|>", add_special_tokens=False)
-        pad_positions = [i for i, t in enumerate(prompt_token_ids) if t in audio_pad_id]
-        logger.info(
-            "[duplex-debug] prompt len=%d, audio_pad_id=%s, pad_positions=%s, first_20_tokens=%s",
-            len(prompt_token_ids),
-            audio_pad_id,
-            pad_positions,
-            prompt_token_ids[:20],
-        )
-
         prompt = TokensPrompt(
             prompt_token_ids=prompt_token_ids,
             multi_modal_data={"audio": mm_audio},
         )
-        parsed = parse_model_prompt(model_config, prompt)
-        try:
-            (engine_input,) = await self._serving.renderer.render_cmpl_async([parsed])
-        except Exception:
-            logger.exception("[duplex-debug] render_cmpl_async failed")
-            raise
+        parsed = parse_model_prompt(self._serving.model_config, prompt)
+        (engine_input,) = await self._serving.renderer.render_cmpl_async([parsed])
         yield StreamingInput(prompt=engine_input)
 
     def _trim_history(self) -> None:
         while len(self._history) >= 2:
             text_total = sum(len(t.token_ids) for t in self._history if isinstance(t, _AssistantTurn))
-            audio_total = sum(len(t.audio) / 16000 for t in self._history if isinstance(t, _UserTurn))
+            audio_total = sum(len(t.audio) / _INPUT_SAMPLE_RATE for t in self._history if isinstance(t, _UserTurn))
             if text_total <= self._MAX_HISTORY_TOKENS and audio_total <= self._MAX_HISTORY_AUDIO_S:
                 break
             self._history.pop(0)

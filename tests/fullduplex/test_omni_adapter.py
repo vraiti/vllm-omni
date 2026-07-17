@@ -13,10 +13,10 @@ from vllm_omni.experimental.fullduplex.core.session import (
     DuplexSession,
     DuplexSessionConfig,
 )
-from vllm_omni.experimental.fullduplex.qwen3_omni.adapter import (
-    Qwen3OmniDuplexAdapter,
+from vllm_omni.experimental.fullduplex.omni.adapter import (
+    OmniDuplexAdapter,
 )
-from vllm_omni.experimental.fullduplex.qwen3_omni.audio_utils import (
+from vllm_omni.experimental.fullduplex.omni.audio_utils import (
     numpy_audio_prefix_match,
     pcm16_b64,
     pcm16_b64_to_f32,
@@ -129,9 +129,7 @@ class _FakeEngine:
 
 
 class _FakeServing:
-    async def transcribe_realtime(self, audio_stream, input_stream):
-        async for chunk in audio_stream:
-            yield chunk
+    pass
 
 
 def _make_audio_output(samples: list[float], sr: int = 24000, stage_id: int = 2):
@@ -193,7 +191,7 @@ async def test_basic_audio_roundtrip():
             _make_audio_output([0.1, 0.2, 0.3]),
         ]
     )
-    adapter = Qwen3OmniDuplexAdapter(engine, _FakeServing())
+    adapter = OmniDuplexAdapter(engine, _FakeServing())
     session = DuplexSession("s", _AUDIO_CFG)
     rt = DuplexRuntime(session, adapter)
     out, emit = _collector()
@@ -226,7 +224,7 @@ async def test_barge_in_aborts_generation():
         [_make_audio_output([float(i)]) for i in range(10)],
         delay=0.02,
     )
-    adapter = Qwen3OmniDuplexAdapter(engine, _FakeServing())
+    adapter = OmniDuplexAdapter(engine, _FakeServing())
     session = DuplexSession("s", _AUDIO_CFG)
     rt = DuplexRuntime(session, adapter)
     out, emit = _collector()
@@ -254,7 +252,7 @@ async def test_new_response_supersedes_inflight():
         [_make_audio_output([float(i)]) for i in range(5)],
         delay=0.02,
     )
-    adapter = Qwen3OmniDuplexAdapter(engine, _FakeServing())
+    adapter = OmniDuplexAdapter(engine, _FakeServing())
     session = DuplexSession("s", _AUDIO_CFG)
     rt = DuplexRuntime(session, adapter)
     out, emit = _collector()
@@ -285,7 +283,7 @@ async def test_text_output_alongside_audio():
             _make_audio_output([0.5, -0.5]),
         ]
     )
-    adapter = Qwen3OmniDuplexAdapter(engine, _FakeServing())
+    adapter = OmniDuplexAdapter(engine, _FakeServing())
     session = DuplexSession("s", _AUDIO_CFG)
     rt = DuplexRuntime(session, adapter)
     out, emit = _collector()
@@ -310,7 +308,7 @@ async def test_text_output_alongside_audio():
 @pytest.mark.asyncio
 async def test_on_barge_in_clears_buffer():
     engine = _FakeEngine([_make_audio_output([1.0])])
-    adapter = Qwen3OmniDuplexAdapter(engine, _FakeServing())
+    adapter = OmniDuplexAdapter(engine, _FakeServing())
 
     adapter._audio_buffer.append(_audio_chunk())
     adapter._pending_text = "some query"
@@ -324,7 +322,7 @@ async def test_on_barge_in_clears_buffer():
 
 @pytest.mark.asyncio
 async def test_should_respond_requires_audio():
-    adapter = Qwen3OmniDuplexAdapter(_FakeEngine([]), _FakeServing())
+    adapter = OmniDuplexAdapter(_FakeEngine([]), _FakeServing())
     session = DuplexSession("s", _AUDIO_CFG)
 
     assert adapter.should_respond(session) is False
@@ -335,7 +333,7 @@ async def test_should_respond_requires_audio():
 
 @pytest.mark.asyncio
 async def test_capabilities():
-    adapter = Qwen3OmniDuplexAdapter(_FakeEngine([]), _FakeServing())
+    adapter = OmniDuplexAdapter(_FakeEngine([]), _FakeServing())
     caps = adapter.capabilities()
     assert "audio" in caps.input_modalities
     assert "audio" in caps.output_modalities

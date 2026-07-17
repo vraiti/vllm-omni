@@ -8,6 +8,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 from vllm_omni.experimental.fullduplex.core.session import DuplexSession
 
 
@@ -17,6 +19,12 @@ class DuplexCapability:
     output_modalities: frozenset[str]
 
     proactive: bool = False
+
+
+@dataclass
+class AudioChunk:
+    pcm_f32: np.ndarray
+    sample_rate: int
 
 
 @dataclass

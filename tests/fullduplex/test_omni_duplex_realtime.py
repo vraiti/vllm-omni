@@ -95,30 +95,27 @@ async def _run_duplex_roundtrip(
             event = json.loads(message)
             etype = event.get("type")
 
-            if etype == "response.created":
+            if etype in (
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_item.done",
+                "response.output_audio.done",
+            ):
                 continue
 
             if etype == "response.audio.delta":
                 delta_events += 1
-                sr = event.get("sample_rate_hz")
-                if isinstance(sr, int) and sr > 0:
-                    output_sr = sr
-                audio_b64 = event.get("audio", "")
+                audio_b64 = event.get("delta", "") or event.get("audio", "")
                 if audio_b64:
                     incremental.append(base64.b64decode(audio_b64))
                 continue
 
-            if etype == "transcription.delta":
+            if etype == "response.output_text.delta":
                 d = event.get("delta", "")
                 if d:
                     text_chunks.append(d)
                 continue
-
-            if etype == "transcription.done":
-                continue
-
-            if etype == "response.audio.done":
-                break
 
             if etype == "response.done":
                 break
@@ -198,7 +195,7 @@ async def test_duplex_barge_in(server_params):
             if etype == "response.done" and event.get("response", {}).get("status") == "cancelled":
                 cancelled = True
                 break
-            if etype in ("response.audio.done", "response.done"):
+            if etype in ("response.output_audio.done", "response.done"):
                 break
 
         assert cancelled, "Expected cancelled response after barge-in"
