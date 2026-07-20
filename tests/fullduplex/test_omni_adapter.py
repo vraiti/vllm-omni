@@ -238,12 +238,11 @@ async def test_barge_in_aborts_generation():
 
     await rt.run(feed(), emit)
 
-    types = [e["type"] for e in out]
-    assert ev.RESPONSE_CANCELLED in types
-    assert ev.RESPONSE_DONE not in types
-
     audio_deltas = [e for e in out if e["type"] == ev.RESPONSE_DELTA and e.get("modality") == "audio"]
     assert len(audio_deltas) < 10
+    done = [e for e in out if e["type"] == ev.RESPONSE_DONE]
+    assert len(done) == 1
+    assert done[0]["status"] == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -271,8 +270,11 @@ async def test_new_response_supersedes_inflight():
     created = [e for e in out if e["type"] == ev.RESPONSE_CREATED]
     done = [e for e in out if e["type"] == ev.RESPONSE_DONE]
     assert len(created) == 2
-    assert len(done) == 1
-    assert done[0]["response_index"] == created[-1]["response_index"]
+    assert len(done) == 2
+    assert done[0]["status"] == "cancelled"
+    assert done[0]["response_index"] == created[0]["response_index"]
+    assert done[1]["status"] == "completed"
+    assert done[1]["response_index"] == created[1]["response_index"]
 
 
 @pytest.mark.asyncio

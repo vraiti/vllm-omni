@@ -55,6 +55,9 @@ class _FakeAdapter:
     async def on_playback_ack(self, session, cursor):
         pass
 
+    def get_usage(self, session):
+        return 0, 0
+
 
 @pytest.mark.asyncio
 async def test_runtime_basic_response():
@@ -75,7 +78,9 @@ async def test_runtime_barge_in_drops_stale_output():
     await rt.run(_feed([{"type": ev.INPUT_COMMIT}, {"type": ev.CLOSE}]), emit)
     data = [e["data"] for e in out if e["type"] == ev.RESPONSE_DELTA]
     assert data == ["a"]
-    assert ev.RESPONSE_DONE not in [e["type"] for e in out]
+    done = [e for e in out if e["type"] == ev.RESPONSE_DONE]
+    assert len(done) == 1
+    assert done[0]["status"] == "cancelled"
 
 
 class _SlowAdapter:
@@ -99,6 +104,9 @@ class _SlowAdapter:
     async def on_playback_ack(self, session, cursor):
         pass
 
+    def get_usage(self, session):
+        return 0, 0
+
 
 @pytest.mark.asyncio
 async def test_runtime_cancel_event_interrupts_active_response():
@@ -114,10 +122,10 @@ async def test_runtime_cancel_event_interrupts_active_response():
 
     await rt.run(feed(), emit)
     deltas = [e["data"] for e in out if e["type"] == ev.RESPONSE_DELTA]
-    types = [e["type"] for e in out]
     assert len(deltas) < 5
-    assert ev.RESPONSE_CANCELLED in types
-    assert ev.RESPONSE_DONE not in types
+    done = [e for e in out if e["type"] == ev.RESPONSE_DONE]
+    assert len(done) == 1
+    assert done[0]["status"] == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -138,10 +146,12 @@ async def test_runtime_new_response_supersedes_inflight_without_blocking():
     await rt.run(feed(), emit)
     created = [e for e in out if e["type"] == ev.RESPONSE_CREATED]
     done = [e for e in out if e["type"] == ev.RESPONSE_DONE]
-    # two responses created; only the latest one completes (the first was cancelled)
     assert len(created) == 2
-    assert len(done) == 1
-    assert done[0]["response_index"] == created[-1]["response_index"]
+    assert len(done) == 2
+    assert done[0]["status"] == "cancelled"
+    assert done[0]["response_index"] == created[0]["response_index"]
+    assert done[1]["status"] == "completed"
+    assert done[1]["response_index"] == created[1]["response_index"]
 
 
 @pytest.mark.asyncio

@@ -16,7 +16,6 @@ CLOSE = "close"
 RESPONSE_CREATED = "response.created"
 RESPONSE_DELTA = "response.delta"
 RESPONSE_DONE = "response.done"
-RESPONSE_CANCELLED = "response.cancelled"
 ERROR = "error"
 
 
@@ -42,10 +41,6 @@ def done(
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
     }
-
-
-def cancelled(response_index: int) -> dict[str, Any]:
-    return {"type": RESPONSE_CANCELLED, "response_index": response_index}
 
 
 def error(message: str) -> dict[str, Any]:
