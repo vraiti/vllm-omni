@@ -737,6 +737,11 @@ class Orchestrator:
                                 )
                                 if req_state.streaming.enabled:
                                     await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+                            # OmniSchedulerMixin.make_stats() already throttles
+                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
+                            # being non-None means this replica passed its own gate.
+                            # A second global throttle here would drop stats for
+                            # other (stage, replica) pairs in the same 1s window.
                             record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
                             iteration_stats = IterationStats() if record_stats else None
                             raw_output = await pool.process_llm_raw_outputs(
@@ -758,6 +763,15 @@ class Orchestrator:
                                 stage_id,
                                 e,
                             )
+                            # TODO: Fault handling is intentionally fail-stop at
+                            # the orchestrator level today. If one replica in a
+                            # logical stage dies, we promote it to `_fatal_error`,
+                            # notify requests already admitted to that stage, and
+                            # re-raise so `run()` shuts down all stages. This is
+                            # conservative but means a single unhealthy replica in
+                            # a multi-replica deployment can take down otherwise
+                            # healthy replicas in other stages. Revisit this when
+                            # adding per-replica fault isolation / eviction.
                             self._fatal_error = str(e)
                             self._fatal_error_stage_id = stage_id
                             for req_id, req_state in list(self.request_states.items()):
