@@ -1619,8 +1619,8 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.close()
         return
 
-    mode = websocket.query_params.get("mode", "default")
-    if mode == "duplex":
+    args = websocket.app.state.args
+    if getattr(args, "realtime_fullduplex", False):
         from vllm_omni.experimental.fullduplex.omni.transport import (
             DuplexRealtimeHandler,
         )

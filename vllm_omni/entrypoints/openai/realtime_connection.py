@@ -93,11 +93,11 @@ class RealtimeConnection:
     async def handle_event(self, event: dict):
         event_type = event.get("type")
         if event_type != "input_audio_buffer.append":
-            logger.info("WS recv: %s", event_type)
+            logger.debug("WS recv: %s", event_type)
 
         if event_type == "session.update":
-            session = event.get("session", event)
-            model = session.get("model") or event.get("model")
+            session = event.get("session", {})
+            model = session.get("model")
             if model is not None:
                 if not self.serving._is_model_supported(model):
                     err = self.serving.create_error_response(
