@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from http import HTTPStatus
 from typing import Any
@@ -49,15 +50,10 @@ class DuplexRealtimeHandler:
         self._is_connected = False
         self._session_id = str(uuid4())
         self._adapter: OmniDuplexAdapter | None = None
-        self._is_model_validated = False
         self._client_input_rate: int = 24000
         self._client_event_id: str | None = None
         self._response_id: str | None = None
         self._item_id: str | None = None
-        self._sent_audio = False
-        self._full_text = ""
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
 
     async def handle_connection(self) -> None:
         from starlette.websockets import WebSocketDisconnect
@@ -87,10 +83,22 @@ class DuplexRealtimeHandler:
         runtime = DuplexRuntime(session, adapter)
 
         try:
-            await asyncio.gather(
-                self._read_loop(),
+            read_task = asyncio.create_task(self._read_loop())
+            runtime_task = asyncio.create_task(
                 runtime.run(self._event_iter(), self._emit),
             )
+            finished, pending = await asyncio.wait(
+                [read_task, runtime_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+            for t in finished:
+                exc = t.exception()
+                if exc is not None and not isinstance(exc, WebSocketDisconnect):
+                    raise exc
         except WebSocketDisconnect:
             logger.info("Duplex client disconnected: %s", self._session_id)
         except Exception:
@@ -124,8 +132,8 @@ class DuplexRealtimeHandler:
         etype = event.get("type", "")
 
         if etype == "session.update":
-            session_cfg = event.get("session", event)
-            model = session_cfg.get("model") or event.get("model")
+            session_cfg = event.get("session", {})
+            model = session_cfg.get("model")
             if model is not None:
                 if not self._serving._is_model_supported(model):
                     err = self._serving.create_error_response(
@@ -136,13 +144,22 @@ class DuplexRealtimeHandler:
                     )
                     await self._send_error(err.error.message, "model_not_found")
                     return None
-            self._is_model_validated = True
             audio_cfg = session_cfg.get("audio", {})
             input_fmt = audio_cfg.get("input", {}).get("format", {})
             if isinstance(input_fmt, dict):
                 rate = input_fmt.get("rate")
                 if rate and isinstance(rate, int):
                     self._client_input_rate = rate
+            await self._send_event(
+                {
+                    "event_id": _event_id(),
+                    "type": "session.updated",
+                    "session": {
+                        "id": self._session_id,
+                        "object": "realtime.session",
+                    },
+                }
+            )
             return None
 
         if etype == "input_audio_buffer.append":
@@ -163,11 +180,24 @@ class DuplexRealtimeHandler:
             }
 
         if etype == "input_audio_buffer.commit":
+            await self._send_event(
+                {
+                    "event_id": _event_id(),
+                    "type": "input_audio_buffer.committed",
+                    "item_id": f"item_{uuid4().hex[:24]}",
+                }
+            )
             return {"type": ev.INPUT_COMMIT}
 
         if etype == "input_audio_buffer.clear":
             if self._adapter is not None:
                 self._adapter._audio_buffer.clear()
+            await self._send_event(
+                {
+                    "event_id": _event_id(),
+                    "type": "input_audio_buffer.cleared",
+                }
+            )
             return None
 
         if etype == "response.create":
@@ -204,10 +234,6 @@ class DuplexRealtimeHandler:
         etype = event.get("type")
 
         if etype == ev.RESPONSE_CREATED:
-            self._sent_audio = False
-            self._full_text = ""
-            self._prompt_tokens = 0
-            self._completion_tokens = 0
             response_id = f"resp_{uuid4().hex[:24]}"
             item_id = f"item_{uuid4().hex[:24]}"
             self._response_id = response_id
@@ -223,7 +249,6 @@ class DuplexRealtimeHandler:
             if modality == "audio" and isinstance(data, AudioChunk):
                 pcm_f32 = data.pcm_f32
                 if pcm_f32 is not None:
-                    self._sent_audio = True
                     await self._send_event(
                         {
                             "event_id": _event_id(),
@@ -237,7 +262,6 @@ class DuplexRealtimeHandler:
                     )
 
             elif modality == "text" and data:
-                self._full_text += data
                 await self._send_event(
                     {
                         "event_id": _event_id(),
@@ -256,9 +280,9 @@ class DuplexRealtimeHandler:
             await self._send_response_done(
                 response_id,
                 item_id,
-                "completed",
-                self._prompt_tokens,
-                self._completion_tokens,
+                event.get("status", "completed"),
+                event.get("prompt_tokens", 0),
+                event.get("completion_tokens", 0),
             )
 
         elif etype == ev.RESPONSE_CANCELLED:
@@ -268,8 +292,8 @@ class DuplexRealtimeHandler:
                 response_id,
                 item_id,
                 "cancelled",
-                self._prompt_tokens,
-                self._completion_tokens,
+                0,
+                0,
             )
 
         elif etype == ev.ERROR:
@@ -343,6 +367,7 @@ class DuplexRealtimeHandler:
         prompt_tokens: int,
         completion_tokens: int,
     ) -> None:
+        item_status = "incomplete" if status in ("cancelled", "failed") else "completed"
         await self._send_event(
             {
                 "event_id": _event_id(),
@@ -363,7 +388,7 @@ class DuplexRealtimeHandler:
                     "id": item_id,
                     "object": "realtime.item",
                     "type": "message",
-                    "status": "completed",
+                    "status": item_status,
                     "role": "assistant",
                     "content": [],
                 },
@@ -382,7 +407,7 @@ class DuplexRealtimeHandler:
                             "id": item_id,
                             "object": "realtime.item",
                             "type": "message",
-                            "status": "completed",
+                            "status": item_status,
                             "role": "assistant",
                             "content": [],
                         }

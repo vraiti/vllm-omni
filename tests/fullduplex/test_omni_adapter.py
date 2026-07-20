@@ -311,13 +311,11 @@ async def test_on_barge_in_clears_buffer():
     adapter = OmniDuplexAdapter(engine, _FakeServing())
 
     adapter._audio_buffer.append(_audio_chunk())
-    adapter._pending_text = "some query"
 
     session = DuplexSession("s", _AUDIO_CFG)
     await adapter.on_barge_in(session)
 
     assert len(adapter._audio_buffer) == 0
-    assert adapter._pending_text is None
 
 
 @pytest.mark.asyncio

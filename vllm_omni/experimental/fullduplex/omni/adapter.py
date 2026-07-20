@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import cached_property
@@ -55,13 +54,13 @@ class OmniDuplexAdapter(DuplexAdapter):
         self._engine = engine
         self._serving = serving
         self._audio_buffer: list[np.ndarray] = []
-        self._pending_text: str | None = None
         self._realtime_audio_ref: np.ndarray | None = None
         self._active_request_id: str | None = None
         self._history: list[_UserTurn | _AssistantTurn] = []
         self._pending_thinker_tokens: list[int] = []
         self._pending_audio: np.ndarray | None = None
         self._interrupted: bool = False
+        self._prompt_token_count: int = 0
 
     @cached_property
     def _model_cls(self):
@@ -85,8 +84,6 @@ class OmniDuplexAdapter(DuplexAdapter):
     async def on_input(self, session: DuplexSession, modality: str, data: Any) -> None:
         if modality == "audio":
             self._audio_buffer.append(data)
-        elif modality == "text":
-            self._pending_text = data
 
     def should_respond(self, session: DuplexSession) -> bool:
         return len(self._audio_buffer) > 0
@@ -97,7 +94,6 @@ class OmniDuplexAdapter(DuplexAdapter):
 
         audio = np.concatenate(self._audio_buffer)
         self._audio_buffer.clear()
-        self._pending_text = None
         self._realtime_audio_ref = None
         self._pending_audio = audio
         self._pending_thinker_tokens = []
@@ -105,10 +101,9 @@ class OmniDuplexAdapter(DuplexAdapter):
 
         request_id = f"dx-{uuid4()}"
         self._active_request_id = request_id
-        input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
 
         try:
-            streaming_input_gen = self._build_streaming_input(audio, input_stream)
+            streaming_input_gen = self._build_streaming_input(audio)
             sampling_params_list = self._build_sampling_params()
 
             result_gen = self._engine.generate(
@@ -135,7 +130,6 @@ class OmniDuplexAdapter(DuplexAdapter):
                         break
 
                     if token_ids:
-                        input_stream.put_nowait(token_ids)
                         self._pending_thinker_tokens.extend(token_ids)
                     delta_text = first.text or ""
                     if delta_text:
@@ -151,13 +145,12 @@ class OmniDuplexAdapter(DuplexAdapter):
             if self._pending_audio is not None:
                 self._history.append(_UserTurn(audio=self._pending_audio))
                 self._pending_audio = None
-            if self._pending_thinker_tokens:
-                self._history.append(
-                    _AssistantTurn(
-                        token_ids=list(self._pending_thinker_tokens),
-                        complete=not self._interrupted,
-                    )
+            self._history.append(
+                _AssistantTurn(
+                    token_ids=list(self._pending_thinker_tokens),
+                    complete=not self._interrupted and bool(self._pending_thinker_tokens),
                 )
+            )
             self._pending_thinker_tokens = []
             self._trim_history()
             self._active_request_id = None
@@ -166,16 +159,17 @@ class OmniDuplexAdapter(DuplexAdapter):
             except Exception:
                 pass
 
+    def get_usage(self, session: DuplexSession) -> tuple[int, int]:
+        return self._prompt_token_count, len(self._pending_thinker_tokens)
+
     async def on_barge_in(self, session: DuplexSession) -> None:
         self._audio_buffer.clear()
-        self._pending_text = None
         self._realtime_audio_ref = None
         self._interrupted = True
 
     async def _build_streaming_input(
         self,
         audio: np.ndarray,
-        input_stream: asyncio.Queue[list[int]],
     ):
         tokenizer = self._tokenizer
         audio_placeholder = self._audio_placeholder
@@ -203,6 +197,7 @@ class OmniDuplexAdapter(DuplexAdapter):
 
         mm_audio: np.ndarray | list[np.ndarray] = audio_list[0] if len(audio_list) == 1 else audio_list
 
+        self._prompt_token_count = len(prompt_token_ids)
         prompt = TokensPrompt(
             prompt_token_ids=prompt_token_ids,
             multi_modal_data={"audio": mm_audio},

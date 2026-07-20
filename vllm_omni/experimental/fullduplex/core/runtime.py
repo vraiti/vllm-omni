@@ -77,8 +77,18 @@ class DuplexRuntime:
         except Exception as err:
             await emit(ev.error(f"response failed: {err}"))
         finally:
-            if not self.session.is_stale(epoch):
-                await emit(ev.done(response_index))
+            stale = self.session.is_stale(epoch)
+            status = "cancelled" if stale else "completed"
+            prompt_tokens, completion_tokens = self.adapter.get_usage(self.session)
+            await emit(
+                ev.done(
+                    response_index,
+                    status=status,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+            )
+            if not stale:
                 self.session.end_response()
 
     async def _barge_in(self) -> None:

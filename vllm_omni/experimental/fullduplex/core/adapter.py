@@ -49,3 +49,6 @@ class DuplexAdapter(ABC):
     async def on_barge_in(self, session: DuplexSession) -> None: ...
 
     async def on_playback_ack(self, session: DuplexSession, cursor: int) -> None: ...
+
+    def get_usage(self, session: DuplexSession) -> tuple[int, int]:
+        return 0, 0

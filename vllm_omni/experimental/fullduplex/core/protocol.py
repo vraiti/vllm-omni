@@ -28,8 +28,20 @@ def delta(response_index: int, modality: str, data: Any) -> dict[str, Any]:
     return {"type": RESPONSE_DELTA, "response_index": response_index, "modality": modality, "data": data}
 
 
-def done(response_index: int) -> dict[str, Any]:
-    return {"type": RESPONSE_DONE, "response_index": response_index}
+def done(
+    response_index: int,
+    *,
+    status: str = "completed",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+) -> dict[str, Any]:
+    return {
+        "type": RESPONSE_DONE,
+        "response_index": response_index,
+        "status": status,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+    }
 
 
 def cancelled(response_index: int) -> dict[str, Any]:
