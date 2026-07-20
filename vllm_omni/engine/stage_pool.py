@@ -31,6 +31,7 @@ from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
 
 if TYPE_CHECKING:
+    from vllm_omni.engine.engine_group_demux import EngineGroupDemux
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
@@ -82,6 +83,9 @@ class StagePool:
         output_processor: Any = None,
         stage_vllm_config: Any = None,
         owns_clients: bool = True,
+        demux_queue: asyncio.Queue[EngineCoreOutputs] | None = None,
+        demux: EngineGroupDemux | None = None,
+        stage_metadata: Any = None,
     ) -> None:
         if isinstance(clients, list):
             normalized_clients: list[StagePoolClient] = list(clients)
@@ -112,6 +116,10 @@ class StagePool:
                 addr = self._client_input_addr(client)
                 if addr is not None:
                     self._addr_to_replica_id[addr] = replica_id
+
+        self._demux_queue = demux_queue
+        self._demux = demux
+        self._stage_metadata = stage_metadata
 
         # Distributed-mode dispatch hooks (injected by Orchestrator on bring-up).
         self._hub: OmniCoordClientForHub | None = None
@@ -168,6 +176,33 @@ class StagePool:
     @property
     def output_processor(self) -> Any:
         return self._output_processor
+
+    @property
+    def uses_demux(self) -> bool:
+        return self._demux_queue is not None
+
+    @property
+    def stage_metadata(self) -> Any:
+        return self._stage_metadata
+
+    def process_engine_inputs(
+        self,
+        source_outputs: list[Any],
+        prompt: Any = None,
+        streaming_context: Any = None,
+    ) -> list[Any]:
+        import inspect
+
+        meta = self._stage_metadata
+        if meta is not None:
+            cpif = getattr(meta, "custom_process_input_func", None)
+            if cpif is not None:
+                sig = inspect.signature(cpif)
+                requires_mm = getattr(meta, "requires_multimodal_data", False)
+                if "streaming_context" in sig.parameters:
+                    return cpif(source_outputs, prompt, requires_mm, streaming_context)
+                return cpif(source_outputs, prompt, requires_mm)
+        return self.llm_stage_client.process_engine_inputs(source_outputs, prompt, streaming_context)
 
     @property
     def is_distributed(self) -> bool:
@@ -471,6 +506,8 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
         self._audio_sample_rate_by_request.pop(str(request_id), None)
+        if self._demux is not None:
+            self._demux.unregister_request(request_id)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -998,6 +1035,8 @@ class StagePool:
                         rollback_error,
                     )
             raise
+        if self._demux is not None:
+            self._demux.register_request(request.request_id, self.stage_id)
         return replica_id
 
     async def submit_update(
@@ -1099,6 +1138,15 @@ class StagePool:
         timeout_s: float = 0.001,
     ) -> EngineCoreOutputs | None:
         """Poll raw EngineCore outputs from one LLM replica once."""
+        if self._demux_queue is not None:
+            try:
+                return await asyncio.wait_for(
+                    self._demux_queue.get(),
+                    timeout=timeout_s,
+                )
+            except asyncio.TimeoutError:
+                return None
+
         raw_client = self.clients[replica_id]
         if raw_client is None:
             return None

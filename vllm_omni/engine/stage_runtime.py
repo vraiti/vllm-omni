@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import concurrent.futures
 import copy
 import os
@@ -29,6 +28,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
+from vllm_omni.engine.engine_group_demux import EngineGroupDemux
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     RegisterRemoteReplicaMessage,
@@ -46,7 +46,6 @@ from vllm_omni.engine.stage_engine_startup import (
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
-    StageMetadata,
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
     build_engine_args_dict,
@@ -68,96 +67,6 @@ from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
-
-_METADATA_ATTRS = frozenset(
-    {
-        "stage_id",
-        "stage_type",
-        "model_stage",
-        "engine_input_source",
-        "custom_process_input_func",
-        "final_output",
-        "final_output_type",
-        "default_sampling_params",
-        "is_comprehension",
-        "requires_multimodal_data",
-        "prompt_expand_func",
-        "cfg_kv_collect_func",
-        "replica_id",
-        "engine_output_type",
-        "runtime_cfg",
-    }
-)
-
-
-class _SecondaryStageClientOverlay:
-    """Wraps a primary stage client with a secondary stage's metadata.
-
-    Engine groups let multiple logical stages share one vLLM engine.
-    The orchestrator accesses per-stage metadata (input_sources,
-    custom_process_input_func, etc.) through the pool's stage_client.
-    This overlay ensures the secondary stage exposes its own metadata
-    while delegating all engine operations to the primary client.
-
-    Polling: the overlay's ``get_output_async`` always blocks forever
-    so the orchestrator's per-pool poll loop never fires for the
-    secondary stage.  All outputs from the shared engine are caught
-    by the primary pool's poll; the orchestrator then remaps them to
-    the correct logical stage via ``_remap_engine_group_stage``.
-    """
-
-    _is_secondary_overlay: bool = True
-
-    def __init__(
-        self,
-        primary_client: StagePoolClient,
-        metadata: StageMetadata,
-    ) -> None:
-        object.__setattr__(self, "_primary", primary_client)
-        object.__setattr__(self, "_no_poll_event", asyncio.Event())
-        for attr in _METADATA_ATTRS:
-            if hasattr(metadata, attr):
-                object.__setattr__(self, attr, getattr(metadata, attr))
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(object.__getattribute__(self, "_primary"), name)
-
-    async def get_output_async(self) -> Any:
-        await object.__getattribute__(self, "_no_poll_event").wait()
-        raise RuntimeError("secondary overlay should never be polled")
-
-    def process_engine_inputs(
-        self,
-        source_outputs: list[Any],
-        prompt: Any = None,
-        streaming_context: Any = None,
-    ) -> list[Any]:
-        import inspect
-
-        cpif = object.__getattribute__(self, "custom_process_input_func")
-        if cpif is not None:
-            sig = inspect.signature(cpif)
-            if "streaming_context" in sig.parameters:
-                return cpif(
-                    source_outputs,
-                    prompt,
-                    object.__getattribute__(self, "requires_multimodal_data"),
-                    streaming_context,
-                )
-            return cpif(
-                source_outputs,
-                prompt,
-                object.__getattribute__(self, "requires_multimodal_data"),
-            )
-
-        input_src = object.__getattribute__(self, "engine_input_source")
-        if not input_src:
-            raise ValueError(f"engine_input_source empty for stage {object.__getattribute__(self, 'stage_id')}")
-        return object.__getattribute__(self, "_primary").process_engine_inputs(
-            source_outputs,
-            prompt,
-            streaming_context,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +139,7 @@ class StageRuntime:
 
         # Populated by initialize()
         self.stage_pools: list[StagePool] = []
+        self.engine_group_demuxes: list[Any] = []
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._spawn_device_lock = threading.Lock()
         # Serialize all LLM replica spawning + handshake across device groups
@@ -382,7 +292,7 @@ class StageRuntime:
         initialized_clients: Mapping[int, Sequence[StagePoolClient | None]],
     ) -> None:
         """Populate runtime fields after replica initialization succeeds."""
-        self.stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
+        self.stage_pools, self.engine_group_demuxes = self._assemble_stage_pools(stage_plans, initialized_clients)
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         """Hook for runtimes that need infrastructure before replica init."""
@@ -796,21 +706,18 @@ class StageRuntime:
         self,
         stage_plans: Sequence[LogicalStageInitPlan],
         initialized_clients_by_stage: Mapping[int, Sequence[StagePoolClient | None]],
-    ) -> list[StagePool]:
-        """Assemble logical stage pools."""
+    ) -> tuple[list[StagePool], list[EngineGroupDemux]]:
+        """Assemble logical stage pools and engine-group demuxes."""
         stage_pools: list[StagePool] = []
         group_clients: dict[int, list[StagePoolClient]] = {}
         group_vllm_configs: dict[int, Any] = {}
+        group_members: dict[int, list[int]] = {}
 
         for plan in stage_plans:
             is_secondary = plan.shares_engine_with_stage is not None
-
             if is_secondary:
                 primary_idx = plan.shares_engine_with_stage
-                secondary_metadata = plan.replicas[0].metadata
-                clients = [_SecondaryStageClientOverlay(c, secondary_metadata) for c in group_clients[primary_idx]]
-                stage_vllm_config = group_vllm_configs[primary_idx]
-                owns_clients = False
+                group_members.setdefault(primary_idx, [primary_idx]).append(plan.stage_idx)
             else:
                 replica_clients = initialized_clients_by_stage[plan.stage_idx]
                 first_client = replica_clients[0] if replica_clients else None
@@ -824,6 +731,30 @@ class StageRuntime:
                         raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
                 group_clients[plan.stage_idx] = clients
                 group_vllm_configs[plan.stage_idx] = stage_vllm_config
+                group_members.setdefault(plan.stage_idx, [plan.stage_idx])
+
+        demuxes: dict[int, EngineGroupDemux] = {}
+        for primary_idx, member_ids in group_members.items():
+            if len(member_ids) < 2:
+                continue
+            demuxes[primary_idx] = EngineGroupDemux(
+                group_name=f"eg-{primary_idx}",
+                stage_ids=member_ids,
+                clients=group_clients[primary_idx],
+                stats_owner_stage=primary_idx,
+            )
+
+        for plan in stage_plans:
+            is_secondary = plan.shares_engine_with_stage is not None
+            primary_idx = plan.shares_engine_with_stage if is_secondary else plan.stage_idx
+
+            if is_secondary:
+                clients = list(group_clients[primary_idx])
+                stage_vllm_config = group_vllm_configs[primary_idx]
+                owns_clients = False
+            else:
+                clients = group_clients[plan.stage_idx]
+                stage_vllm_config = group_vllm_configs.get(plan.stage_idx)
                 owns_clients = True
 
             output_processor = None
@@ -832,6 +763,10 @@ class StageRuntime:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
                 output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
 
+            demux = demuxes.get(primary_idx)
+            demux_queue = demux.get_stage_queue(plan.stage_idx) if demux else None
+            metadata = plan.replicas[0].metadata
+
             stage_pools.append(
                 StagePool(
                     plan.stage_idx,
@@ -839,10 +774,13 @@ class StageRuntime:
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
                     owns_clients=owns_clients,
+                    demux_queue=demux_queue,
+                    demux=demux,
+                    stage_metadata=metadata,
                 )
             )
 
-        return stage_pools
+        return stage_pools, list(demuxes.values())
 
 
 # ===========================================================================

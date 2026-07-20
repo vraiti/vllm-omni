@@ -448,6 +448,7 @@ class AsyncOmniEngine:
                 transfer_emitter=self._transfer_emitter,
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
+                engine_group_demuxes=self._runtime.engine_group_demuxes,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

@@ -223,6 +223,7 @@ class Orchestrator:
         transfer_emitter: Any = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
+        engine_group_demuxes: list[Any] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -253,19 +254,7 @@ class Orchestrator:
 
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
-
-        self._engine_group_secondaries: set[int] = set()
-        self._engine_group_primary: dict[int, int] = {}
-        for sid, pool in enumerate(stage_pools):
-            client = pool.stage_client
-            if getattr(client, "_is_secondary_overlay", False):
-                self._engine_group_secondaries.add(sid)
-                primary = getattr(client, "_primary", None)
-                if primary is not None:
-                    for pid, ppool in enumerate(stage_pools):
-                        if pid != sid and any(c is primary for c in (ppool.stage_client, *ppool.clients)):
-                            self._engine_group_primary[sid] = pid
-                            break
+        self._engine_group_demuxes = engine_group_demuxes or []
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
@@ -344,6 +333,9 @@ class Orchestrator:
         """Main entry point for the Orchestrator event loop."""
         logger.info("[Orchestrator] Starting event loop")
 
+        for demux in self._engine_group_demuxes:
+            await demux.start()
+
         request_task = asyncio.create_task(self._request_handler(), name="orchestrator-request-handler")
         output_task = asyncio.create_task(
             self._orchestration_output_handler(),
@@ -389,6 +381,9 @@ class Orchestrator:
 
             if self._fatal_error is not None:
                 await self._drain_pending_requests_on_fatal()
+
+            for demux in self._engine_group_demuxes:
+                await demux.stop()
 
             if self._membership is not None:
                 await self._membership.drain_tasks(timeout=10.0)
@@ -675,6 +670,42 @@ class Orchestrator:
             idle = True
             for stage_id in range(self.num_stages):
                 pool = self.stage_pools[stage_id]
+
+                if pool.uses_demux:
+                    if self._shutdown_event.is_set():
+                        return
+                    raw_outputs = await pool.poll_llm_raw_output(replica_id=0, timeout_s=0.001)
+                    if raw_outputs is not None:
+                        await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+                        for eco in raw_outputs.outputs:
+                            req_state = self.request_states.get(getattr(eco, "request_id", None))
+                            if req_state is None or not req_state.streaming.enabled:
+                                continue
+                            req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                            req_state.streaming.new_prompt_len_snapshot = getattr(
+                                eco,
+                                "new_prompt_len_snapshot",
+                                None,
+                            )
+                            if req_state.streaming.enabled:
+                                await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+                        record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
+                        iteration_stats = IterationStats() if record_stats else None
+                        raw_output = await pool.process_llm_raw_outputs(
+                            0,
+                            raw_outputs,
+                            iteration_stats=iteration_stats,
+                        )
+                        if record_stats:
+                            self._stat_logger.record(
+                                raw_outputs.scheduler_stats,
+                                iteration_stats,
+                                engine_idx=self._stage_replica_to_engine_idx.get((stage_id, 0), 0),
+                            )
+                        await self._handle_processed_outputs(stage_id, 0, raw_output)
+                        idle = False
+                    continue
+
                 for replica_id in pool.live_replica_ids():
                     if self._shutdown_event.is_set():
                         return
@@ -706,11 +737,6 @@ class Orchestrator:
                                 )
                                 if req_state.streaming.enabled:
                                     await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
-                            # OmniSchedulerMixin.make_stats() already throttles
-                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
-                            # being non-None means this replica passed its own gate.
-                            # A second global throttle here would drop stats for
-                            # other (stage, replica) pairs in the same 1s window.
                             record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
                             iteration_stats = IterationStats() if record_stats else None
                             raw_output = await pool.process_llm_raw_outputs(
@@ -732,15 +758,6 @@ class Orchestrator:
                                 stage_id,
                                 e,
                             )
-                            # TODO: Fault handling is intentionally fail-stop at
-                            # the orchestrator level today. If one replica in a
-                            # logical stage dies, we promote it to `_fatal_error`,
-                            # notify requests already admitted to that stage, and
-                            # re-raise so `run()` shuts down all stages. This is
-                            # conservative but means a single unhealthy replica in
-                            # a multi-replica deployment can take down otherwise
-                            # healthy replicas in other stages. Revisit this when
-                            # adding per-replica fault isolation / eviction.
                             self._fatal_error = str(e)
                             self._fatal_error_stage_id = stage_id
                             for req_id, req_state in list(self.request_states.items()):
@@ -775,15 +792,6 @@ class Orchestrator:
             else:
                 await asyncio.sleep(0)
 
-    def _remap_engine_group_stage(self, stage_id: int, req_state: OrchestratorRequestState) -> int:
-        """If the shared engine produced output for a secondary stage, return that stage_id."""
-        if not self._engine_group_secondaries:
-            return stage_id
-        current = max(req_state.stage_submit_ts.keys()) if req_state.stage_submit_ts else 0
-        if current != stage_id and current in self._engine_group_secondaries:
-            return current
-        return stage_id
-
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
         pool = self.stage_pools[stage_id]
@@ -798,25 +806,22 @@ class Orchestrator:
                 )
                 continue
 
-            eff_stage = self._remap_engine_group_stage(stage_id, req_state)
-            eff_pool = self.stage_pools[eff_stage] if eff_stage != stage_id else pool
-
             if getattr(output, "error", None) is not None:
-                await self._handle_stage_error(eff_stage, output)
+                await self._handle_stage_error(stage_id, output)
                 continue
 
             stage_metrics = None
             if output.finished:
-                stage_metrics = eff_pool.build_stage_metrics(
+                stage_metrics = pool.build_stage_metrics(
                     [output],
-                    submit_ts=req_state.stage_submit_ts.get(eff_stage, _time.time()),
+                    submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
                     request_timestamp=req_state.request_timestamp,
                     replica_id=replica_id,
-                    sampling_params=req_state.sampling_params_list[eff_stage],
+                    sampling_params=req_state.sampling_params_list[stage_id],
                 )
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
-            await self._route_output(eff_stage, replica_id, output, req_state, stage_metrics)
+            await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
     async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
@@ -1215,11 +1220,12 @@ class Orchestrator:
         next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
         next_client = next_pool.stage_client
+        next_meta = next_pool.stage_metadata
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
-        requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
+        requires_multimodal_data = getattr(next_meta or next_client, "requires_multimodal_data", False)
         _t_submit_start = _time.perf_counter()
 
         if next_pool.stage_type == "diffusion":
@@ -1234,9 +1240,10 @@ class Orchestrator:
                     expected,
                 )
             diffusion_source_outputs = [output, *companion_outputs]
-            if next_client.custom_process_input_func is not None:
+            _cpif = getattr(next_meta or next_client, "custom_process_input_func", None)
+            if _cpif is not None:
                 _t_ar2d = _time.perf_counter()
-                _fn = next_client.custom_process_input_func
+                _fn = _cpif
                 _extra_kwargs: dict[str, Any] = {}
                 # TODO: replace signature probe with explicit kwarg contract.
                 try:
@@ -1399,7 +1406,7 @@ class Orchestrator:
             )[req_id] = req_state.pd_prefill_multimodal_output
 
         try:
-            next_inputs = next_client.process_engine_inputs(
+            next_inputs = next_pool.process_engine_inputs(
                 source_outputs,
                 req_state.prompt,
                 streaming_context=req_state.streaming,
@@ -1474,15 +1481,6 @@ class Orchestrator:
                 await next_pool.submit_update(req_id, req_state, request)
             else:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-                if next_logical in self._engine_group_primary:
-                    primary_pool = self.stage_pools[self._engine_group_primary[next_logical]]
-                    primary_pool.output_processor.add_request(
-                        request=request,
-                        prompt=None,
-                        parent_req=None,
-                        request_index=0,
-                        queue=None,
-                    )
 
         req_state.stage_submit_ts[next_logical] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
