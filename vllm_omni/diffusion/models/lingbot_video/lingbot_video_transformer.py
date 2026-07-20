@@ -368,6 +368,10 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
+def _moe_pad_backend() -> str:
+    return os.environ.get("LINGBOT_MOE_PAD_BACKEND", "vectorized").lower().strip()
+
+
 class LingBotVideoSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -418,7 +422,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         return permuted_tokens, counts, sorted_positions, sorted_scores, tokens.shape[0], top_k
 
     @staticmethod
-    def _pad_grouped_tokens(tokens, counts, align=8):
+    def _pad_grouped_tokens_loop(tokens, counts, align=8):
         num_tokens = tokens.shape[0]
         num_experts = int(counts.shape[0])
         max_len = _round_up_to_multiple(num_tokens + num_experts * align, align)
@@ -441,6 +445,46 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         tokens_with_pad = torch.vstack((tokens, tokens.new_zeros((tokens.shape[-1],))))
         input_shape = tokens_with_pad.shape
         return input_shape, tokens_with_pad[permuted_indices], permuted_indices, aligned_counts
+
+    @staticmethod
+    def _pad_grouped_tokens_vectorized(tokens, counts, align=8):
+        num_tokens = tokens.shape[0]
+        num_experts = int(counts.shape[0])
+        max_len = _round_up_to_multiple(num_tokens + num_experts * align, align)
+        counts_i64 = counts.to(torch.int64)
+        total_per_expert = torch.clamp_min(counts_i64, align)
+        aligned_counts_i64 = (total_per_expert + align - 1) // align * align
+        write_offsets = torch.cumsum(aligned_counts_i64, dim=0) - aligned_counts_i64
+        end_offsets = torch.cumsum(aligned_counts_i64, dim=0)
+        start_indices = torch.cumsum(counts_i64, dim=0) - counts_i64
+
+        slots = torch.arange(max_len, dtype=torch.int64, device=tokens.device)
+        expert_idx = torch.bucketize(slots, end_offsets, right=True)
+        valid_expert = expert_idx < num_experts
+        safe_expert_idx = expert_idx.clamp(max=num_experts - 1)
+        local_idx = slots - write_offsets[safe_expert_idx]
+        source_idx = start_indices[safe_expert_idx] + local_idx
+        valid = valid_expert & (local_idx < counts_i64[safe_expert_idx])
+        fill = torch.full_like(source_idx, num_tokens)
+        permuted_indices = torch.where(valid, source_idx, fill)
+
+        tokens_with_pad = torch.vstack((tokens, tokens.new_zeros((tokens.shape[-1],))))
+        input_shape = tokens_with_pad.shape
+        return (
+            input_shape,
+            tokens_with_pad[permuted_indices],
+            permuted_indices,
+            aligned_counts_i64.to(torch.int32),
+        )
+
+    @staticmethod
+    def _pad_grouped_tokens(tokens, counts, align=8):
+        backend = _moe_pad_backend()
+        if backend in {"loop", "default"}:
+            return LingBotVideoSparseMoeBlock._pad_grouped_tokens_loop(tokens, counts, align)
+        if backend in {"vectorized", "torch"}:
+            return LingBotVideoSparseMoeBlock._pad_grouped_tokens_vectorized(tokens, counts, align)
+        raise ValueError(f"Unsupported LINGBOT_MOE_PAD_BACKEND={backend!r}; expected loop or vectorized")
 
     @staticmethod
     def _unpad_grouped_tokens(output, input_shape, permuted_indices):

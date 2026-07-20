@@ -234,10 +234,12 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
 
 
 class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery):
-    """Native vLLM-Omni entry for the dense LingBot-Video checkpoint.
+    """Native vLLM-Omni entry for LingBot-Video (dense and MoE).
 
-    This PR supports the dense checkpoint only. MoE and fused-expert kernels are
-    intentionally left for the follow-up MoE PR.
+    Supports both the dense checkpoint (robbyant/lingbot-video-dense-1.3b)
+    and the MoE checkpoint (robbyant/lingbot-video-moe-30b-a3b). MoE layers
+    are instantiated automatically when num_experts > 0 in the transformer
+    config.
     """
 
     supports_step_execution: ClassVar[bool] = False
