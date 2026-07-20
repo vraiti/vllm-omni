@@ -101,21 +101,43 @@ class OmniDuplexAdapter(DuplexAdapter):
 
         request_id = f"dx-{uuid4()}"
         self._active_request_id = request_id
+        logger.warning(
+            "[duplex-debug] respond() audio shape=%s samples=%d duration=%.2fs",
+            audio.shape,
+            len(audio),
+            len(audio) / _INPUT_SAMPLE_RATE,
+        )
 
         try:
             streaming_input_gen = self._build_streaming_input(audio)
             sampling_params_list = self._build_sampling_params()
+            logger.warning(
+                "[duplex-debug] sampling_params_list len=%d types=%s",
+                len(sampling_params_list),
+                [type(p).__name__ for p in sampling_params_list],
+            )
 
             result_gen = self._engine.generate(
                 prompt=streaming_input_gen,
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
             )
+            logger.warning("[duplex-debug] engine.generate() returned, iterating results...")
 
             stage0_stop_count = 0
+            _iter_count = 0
 
             async for output in result_gen:
+                _iter_count += 1
                 stage_id = getattr(output, "stage_id", None)
+                if _iter_count <= 5 or _iter_count % 50 == 0:
+                    logger.warning(
+                        "[duplex-debug] iter=%d stage_id=%s outputs=%d finished=%s",
+                        _iter_count,
+                        stage_id,
+                        len(output.outputs) if hasattr(output, "outputs") else -1,
+                        getattr(output, "finished", None),
+                    )
 
                 if stage_id == 0 and output.outputs:
                     first = output.outputs[0]
@@ -142,6 +164,11 @@ class OmniDuplexAdapter(DuplexAdapter):
                         AudioChunk(pcm_f32=chunk, sample_rate=sr),
                     )
         finally:
+            logger.warning(
+                "[duplex-debug] respond() finished, total iterations=%d thinker_tokens=%d",
+                _iter_count,
+                len(self._pending_thinker_tokens),
+            )
             if self._pending_audio is not None:
                 self._history.append(_UserTurn(audio=self._pending_audio))
                 self._pending_audio = None
@@ -198,12 +225,23 @@ class OmniDuplexAdapter(DuplexAdapter):
         mm_audio: np.ndarray | list[np.ndarray] = audio_list[0] if len(audio_list) == 1 else audio_list
 
         self._prompt_token_count = len(prompt_token_ids)
+        logger.warning(
+            "[duplex-debug] _build_streaming_input: prompt_tokens=%d audio_count=%d audio_shapes=%s",
+            len(prompt_token_ids),
+            len(audio_list),
+            [a.shape for a in audio_list],
+        )
         prompt = TokensPrompt(
             prompt_token_ids=prompt_token_ids,
             multi_modal_data={"audio": mm_audio},
         )
         parsed = parse_model_prompt(self._serving.model_config, prompt)
         (engine_input,) = await self._serving.renderer.render_cmpl_async([parsed])
+        logger.warning(
+            "[duplex-debug] _build_streaming_input: engine_input type=%s keys=%s",
+            type(engine_input).__name__,
+            list(engine_input.keys()) if isinstance(engine_input, dict) else dir(engine_input),
+        )
         yield StreamingInput(prompt=engine_input)
 
     def _trim_history(self) -> None:

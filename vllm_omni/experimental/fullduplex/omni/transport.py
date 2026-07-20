@@ -7,10 +7,10 @@ import asyncio
 import contextlib
 import json
 from http import HTTPStatus
-from typing import Any
 from uuid import uuid4
 
 import numpy as np
+from pydantic import BaseModel
 from scipy.signal import resample_poly
 from vllm.logger import init_logger
 
@@ -28,15 +28,58 @@ from vllm_omni.experimental.fullduplex.omni.audio_utils import (
     pcm16_b64,
     pcm16_b64_to_f32,
 )
+from vllm_omni.experimental.fullduplex.realtime_types import (
+    RealtimeServerEventError,
+    RealtimeServerEventInputAudioBufferCleared,
+    RealtimeServerEventInputAudioBufferCommitted,
+    RealtimeServerEventResponseAudioDelta,
+    RealtimeServerEventResponseAudioDone,
+    RealtimeServerEventResponseContentPartAdded,
+    RealtimeServerEventResponseCreated,
+    RealtimeServerEventResponseDone,
+    RealtimeServerEventResponseOutputItemAdded,
+    RealtimeServerEventResponseOutputItemDone,
+    RealtimeServerEventResponseTextDelta,
+    RealtimeServerEventSessionCreated,
+    RealtimeServerEventSessionUpdated,
+)
 
 logger = init_logger(__name__)
 
 _SENTINEL = object()
 _MODEL_INPUT_RATE = 16000
 
+_ASSISTANT_ITEM_BASE = {
+    "object": "realtime.item",
+    "type": "message",
+    "role": "assistant",
+    "content": [],
+}
+
+_SESSION_BASE = {
+    "type": "realtime",
+    "object": "realtime.session",
+}
+
+_RESPONSE_BASE = {
+    "object": "realtime.response",
+}
+
 
 def _event_id() -> str:
     return f"event_{uuid4().hex[:24]}"
+
+
+def _item_id() -> str:
+    return f"item_{uuid4().hex[:24]}"
+
+
+def _session_dict(session_id: str) -> dict:
+    return {**_SESSION_BASE, "id": session_id}
+
+
+def _assistant_item(item_id: str, status: str) -> dict:
+    return {**_ASSISTANT_ITEM_BASE, "id": item_id, "status": status}
 
 
 class DuplexRealtimeHandler:
@@ -54,6 +97,7 @@ class DuplexRealtimeHandler:
         self._client_event_id: str | None = None
         self._response_id: str | None = None
         self._item_id: str | None = None
+        self._audio_appended: bool = False
 
     async def handle_connection(self) -> None:
         from starlette.websockets import WebSocketDisconnect
@@ -62,14 +106,11 @@ class DuplexRealtimeHandler:
         self._is_connected = True
 
         await self._send_event(
-            {
-                "event_id": _event_id(),
-                "type": "session.created",
-                "session": {
-                    "id": self._session_id,
-                    "object": "realtime.session",
-                },
-            }
+            RealtimeServerEventSessionCreated(
+                event_id=_event_id(),
+                type="session.created",
+                session=_session_dict(self._session_id),
+            )
         )
 
         adapter = OmniDuplexAdapter(self._engine, self._serving)
@@ -130,6 +171,7 @@ class DuplexRealtimeHandler:
 
     async def _translate_client_event(self, event: dict) -> dict | None:
         etype = event.get("type", "")
+        logger.warning("[duplex-debug] _translate_client_event type=%s audio_appended=%s", etype, self._audio_appended)
 
         if etype == "session.update":
             session_cfg = event.get("session", {})
@@ -151,14 +193,11 @@ class DuplexRealtimeHandler:
                 if rate and isinstance(rate, int):
                     self._client_input_rate = rate
             await self._send_event(
-                {
-                    "event_id": _event_id(),
-                    "type": "session.updated",
-                    "session": {
-                        "id": self._session_id,
-                        "object": "realtime.session",
-                    },
-                }
+                RealtimeServerEventSessionUpdated(
+                    event_id=_event_id(),
+                    type="session.updated",
+                    session=_session_dict(self._session_id),
+                )
             )
             return None
 
@@ -166,6 +205,7 @@ class DuplexRealtimeHandler:
             audio_b64 = event.get("audio", "")
             if not audio_b64:
                 return None
+            self._audio_appended = True
             pcm_f32 = pcm16_b64_to_f32(audio_b64)
             if self._client_input_rate != _MODEL_INPUT_RATE:
                 pcm_f32 = resample_poly(
@@ -181,22 +221,23 @@ class DuplexRealtimeHandler:
 
         if etype == "input_audio_buffer.commit":
             await self._send_event(
-                {
-                    "event_id": _event_id(),
-                    "type": "input_audio_buffer.committed",
-                    "item_id": f"item_{uuid4().hex[:24]}",
-                }
+                RealtimeServerEventInputAudioBufferCommitted(
+                    event_id=_event_id(),
+                    type="input_audio_buffer.committed",
+                    item_id=_item_id(),
+                )
             )
             return {"type": ev.INPUT_COMMIT}
 
         if etype == "input_audio_buffer.clear":
+            self._audio_appended = False
             if self._adapter is not None:
                 self._adapter._audio_buffer.clear()
             await self._send_event(
-                {
-                    "event_id": _event_id(),
-                    "type": "input_audio_buffer.cleared",
-                }
+                RealtimeServerEventInputAudioBufferCleared(
+                    event_id=_event_id(),
+                    type="input_audio_buffer.cleared",
+                )
             )
             return None
 
@@ -209,10 +250,11 @@ class DuplexRealtimeHandler:
                     client_event_id = meta_inner.get("client_event_id")
             self._client_event_id = client_event_id
 
-            if self._adapter is not None and not self._adapter._audio_buffer:
+            if not self._audio_appended:
                 await self._send_empty_completed_response()
                 return None
 
+            self._audio_appended = False
             return {"type": ev.RESPONSE_CREATE}
 
         if etype == "response.cancel":
@@ -235,7 +277,7 @@ class DuplexRealtimeHandler:
 
         if etype == ev.RESPONSE_CREATED:
             response_id = f"resp_{uuid4().hex[:24]}"
-            item_id = f"item_{uuid4().hex[:24]}"
+            item_id = _item_id()
             self._response_id = response_id
             self._item_id = item_id
             await self._send_response_created(response_id, item_id)
@@ -250,28 +292,28 @@ class DuplexRealtimeHandler:
                 pcm_f32 = data.pcm_f32
                 if pcm_f32 is not None:
                     await self._send_event(
-                        {
-                            "event_id": _event_id(),
-                            "type": "response.output_audio.delta",
-                            "response_id": response_id,
-                            "item_id": item_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": pcm16_b64(pcm_f32),
-                        }
+                        RealtimeServerEventResponseAudioDelta(
+                            event_id=_event_id(),
+                            type="response.output_audio.delta",
+                            response_id=response_id,
+                            item_id=item_id,
+                            output_index=0,
+                            content_index=0,
+                            delta=pcm16_b64(pcm_f32),
+                        )
                     )
 
             elif modality == "text" and data:
                 await self._send_event(
-                    {
-                        "event_id": _event_id(),
-                        "type": "response.output_text.delta",
-                        "response_id": response_id,
-                        "item_id": item_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "delta": data,
-                    }
+                    RealtimeServerEventResponseTextDelta(
+                        event_id=_event_id(),
+                        type="response.output_text.delta",
+                        response_id=response_id,
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        delta=data,
+                    )
                 )
 
         elif etype == ev.RESPONSE_DONE:
@@ -285,17 +327,6 @@ class DuplexRealtimeHandler:
                 event.get("completion_tokens", 0),
             )
 
-        elif etype == ev.RESPONSE_CANCELLED:
-            response_id = self._response_id or ""
-            item_id = self._item_id or ""
-            await self._send_response_done(
-                response_id,
-                item_id,
-                "cancelled",
-                0,
-                0,
-            )
-
         elif etype == ev.ERROR:
             await self._send_error(
                 event.get("message", "unknown error"),
@@ -304,7 +335,7 @@ class DuplexRealtimeHandler:
 
     async def _send_empty_completed_response(self) -> None:
         response_id = f"resp_{uuid4().hex[:24]}"
-        item_id = f"item_{uuid4().hex[:24]}"
+        item_id = _item_id()
         await self._send_response_created(response_id, item_id)
         await self._send_response_done(
             response_id,
@@ -315,48 +346,41 @@ class DuplexRealtimeHandler:
         )
 
     async def _send_response_created(self, response_id: str, item_id: str) -> None:
-        metadata: dict | None = None
+        metadata = None
         if self._client_event_id:
             metadata = {"client_event_id": self._client_event_id}
         await self._send_event(
-            {
-                "event_id": _event_id(),
-                "type": "response.created",
-                "response": {
+            RealtimeServerEventResponseCreated(
+                event_id=_event_id(),
+                type="response.created",
+                response={
                     "id": response_id,
-                    "object": "realtime.response",
+                    **_RESPONSE_BASE,
                     "status": "in_progress",
                     "output": [],
                     "metadata": metadata,
                 },
-            }
+            )
         )
         await self._send_event(
-            {
-                "event_id": _event_id(),
-                "type": "response.output_item.added",
-                "response_id": response_id,
-                "output_index": 0,
-                "item": {
-                    "id": item_id,
-                    "object": "realtime.item",
-                    "type": "message",
-                    "status": "in_progress",
-                    "role": "assistant",
-                    "content": [],
-                },
-            }
+            RealtimeServerEventResponseOutputItemAdded(
+                event_id=_event_id(),
+                type="response.output_item.added",
+                response_id=response_id,
+                output_index=0,
+                item=_assistant_item(item_id, "in_progress"),
+            )
         )
         await self._send_event(
-            {
-                "event_id": _event_id(),
-                "type": "response.content_part.added",
-                "response_id": response_id,
-                "item_id": item_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": {"type": "audio"},
-            }
+            RealtimeServerEventResponseContentPartAdded(
+                event_id=_event_id(),
+                type="response.content_part.added",
+                response_id=response_id,
+                item_id=item_id,
+                output_index=0,
+                content_index=0,
+                part={"type": "audio"},
+            )
         )
 
     async def _send_response_done(
@@ -369,70 +393,58 @@ class DuplexRealtimeHandler:
     ) -> None:
         item_status = "incomplete" if status in ("cancelled", "failed") else "completed"
         await self._send_event(
-            {
-                "event_id": _event_id(),
-                "type": "response.output_audio.done",
-                "response_id": response_id,
-                "item_id": item_id,
-                "output_index": 0,
-                "content_index": 0,
-            }
+            RealtimeServerEventResponseAudioDone(
+                event_id=_event_id(),
+                type="response.output_audio.done",
+                response_id=response_id,
+                item_id=item_id,
+                output_index=0,
+                content_index=0,
+            )
         )
         await self._send_event(
-            {
-                "event_id": _event_id(),
-                "type": "response.output_item.done",
-                "response_id": response_id,
-                "output_index": 0,
-                "item": {
-                    "id": item_id,
-                    "object": "realtime.item",
-                    "type": "message",
-                    "status": item_status,
-                    "role": "assistant",
-                    "content": [],
-                },
-            }
+            RealtimeServerEventResponseOutputItemDone(
+                event_id=_event_id(),
+                type="response.output_item.done",
+                response_id=response_id,
+                output_index=0,
+                item=_assistant_item(item_id, item_status),
+            )
         )
         await self._send_event(
-            {
-                "event_id": _event_id(),
-                "type": "response.done",
-                "response": {
+            RealtimeServerEventResponseDone(
+                event_id=_event_id(),
+                type="response.done",
+                response={
                     "id": response_id,
-                    "object": "realtime.response",
+                    **_RESPONSE_BASE,
                     "status": status,
-                    "output": [
-                        {
-                            "id": item_id,
-                            "object": "realtime.item",
-                            "type": "message",
-                            "status": item_status,
-                            "role": "assistant",
-                            "content": [],
-                        }
-                    ],
+                    "output": [_assistant_item(item_id, item_status)],
                     "usage": {
                         "input_tokens": prompt_tokens,
                         "output_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens,
                     },
                 },
-            }
+            )
         )
 
     async def _send_error(self, message: str, code: str | None = None) -> None:
         await self._send_event(
-            {
-                "event_id": _event_id(),
-                "type": "error",
-                "error": {"message": message, "code": code},
-            }
+            RealtimeServerEventError(
+                event_id=_event_id(),
+                type="error",
+                error={
+                    "type": code or "server_error",
+                    "message": message,
+                    "code": code,
+                },
+            )
         )
 
-    async def _send_event(self, payload: dict[str, Any]) -> None:
+    async def _send_event(self, event: BaseModel) -> None:
         if self._is_connected:
             try:
-                await self._ws.send_text(json.dumps(payload))
+                await self._ws.send_text(event.model_dump_json(exclude_none=True))
             except Exception:
                 self._is_connected = False

@@ -64,7 +64,7 @@ async def test_runtime_basic_response():
     session = DuplexSession("s", DuplexSessionConfig(output_modalities=("text",)))
     rt = DuplexRuntime(session, _FakeAdapter(["a", "b"]))
     out, emit = _collector()
-    await rt.run(_feed([{"type": ev.INPUT_COMMIT}, {"type": ev.CLOSE}]), emit)
+    await rt.run(_feed([{"type": ev.RESPONSE_CREATE}, {"type": ev.CLOSE}]), emit)
     types = [e["type"] for e in out]
     assert types == [ev.RESPONSE_CREATED, ev.RESPONSE_DELTA, ev.RESPONSE_DELTA, ev.RESPONSE_DONE]
     assert [e["data"] for e in out if e["type"] == ev.RESPONSE_DELTA] == ["a", "b"]
@@ -75,7 +75,7 @@ async def test_runtime_barge_in_drops_stale_output():
     session = DuplexSession("s")
     rt = DuplexRuntime(session, _FakeAdapter(["a", "b", "c"], barge_after=1))
     out, emit = _collector()
-    await rt.run(_feed([{"type": ev.INPUT_COMMIT}, {"type": ev.CLOSE}]), emit)
+    await rt.run(_feed([{"type": ev.RESPONSE_CREATE}, {"type": ev.CLOSE}]), emit)
     data = [e["data"] for e in out if e["type"] == ev.RESPONSE_DELTA]
     assert data == ["a"]
     done = [e for e in out if e["type"] == ev.RESPONSE_DONE]
@@ -115,7 +115,7 @@ async def test_runtime_cancel_event_interrupts_active_response():
     out, emit = _collector()
 
     async def feed():
-        yield {"type": ev.INPUT_COMMIT}
+        yield {"type": ev.RESPONSE_CREATE}
         await asyncio.sleep(0.03)
         yield {"type": ev.RESPONSE_CANCEL}
         yield {"type": ev.CLOSE}
@@ -137,9 +137,9 @@ async def test_runtime_new_response_supersedes_inflight_without_blocking():
     out, emit = _collector()
 
     async def feed():
-        yield {"type": ev.INPUT_COMMIT}
+        yield {"type": ev.RESPONSE_CREATE}
         await asyncio.sleep(0.03)  # let the first response emit ~one chunk
-        yield {"type": ev.INPUT_COMMIT}  # supersedes the in-flight first response
+        yield {"type": ev.RESPONSE_CREATE}  # supersedes the in-flight first response
         await asyncio.sleep(0.2)  # let the second response finish
         yield {"type": ev.CLOSE}
 

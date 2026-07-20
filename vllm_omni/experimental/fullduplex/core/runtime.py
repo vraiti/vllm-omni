@@ -7,9 +7,13 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 
+from vllm.logger import init_logger
+
 from vllm_omni.experimental.fullduplex.core import protocol as ev
 from vllm_omni.experimental.fullduplex.core.adapter import DuplexAdapter
 from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexState
+
+logger = init_logger(__name__)
 
 Emit = Callable[[dict], Awaitable[None]]
 
@@ -24,6 +28,7 @@ class DuplexRuntime:
         task: asyncio.Task | None = None
         async for event in inputs:
             etype = event.get("type")
+            logger.warning("[duplex-debug] runtime event type=%s", etype)
             if etype == ev.INPUT_APPEND:
                 modality = event.get("modality", "")
                 if modality not in self._capabilities.input_modalities:
@@ -33,7 +38,10 @@ class DuplexRuntime:
                 self.session.state = DuplexState.LISTENING
                 if self.session.config.proactive and self.adapter.should_respond(self.session):
                     task = await self._start_response(task, emit)
-            elif etype in (ev.INPUT_COMMIT, ev.RESPONSE_CREATE):
+            elif etype == ev.INPUT_COMMIT:
+                if self.session.config.proactive and self.adapter.should_respond(self.session):
+                    task = await self._start_response(task, emit)
+            elif etype == ev.RESPONSE_CREATE:
                 if self.adapter.should_respond(self.session):
                     task = await self._start_response(task, emit)
             elif etype == ev.RESPONSE_CANCEL:
