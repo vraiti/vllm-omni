@@ -17,8 +17,7 @@ from typing import Any
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
-from vllm_omni.inputs.data import OmniTextPrompt, OmniTokensPrompt
-from vllm_omni.sampling_params import OmniSamplingParams
+from vllm_omni.inputs.data import OmniSamplingParams, OmniTextPrompt, OmniTokensPrompt
 
 logger = init_logger(__name__)
 
