@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
 import pytest
+from vllm.engine.protocol import StreamingInput
 
 from vllm_omni.experimental.fullduplex.core import protocol as ev
 from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime
@@ -132,6 +134,15 @@ class _FakeServing:
     pass
 
 
+def _patch_adapter(adapter: OmniDuplexAdapter) -> OmniDuplexAdapter:
+    async def _fake_build(audio):
+        yield StreamingInput(prompt={"prompt_token_ids": [1], "arrival_time": time.time()})
+
+    adapter._build_streaming_input = _fake_build
+    adapter._build_sampling_params = lambda: []
+    return adapter
+
+
 def _make_audio_output(samples: list[float], sr: int = 24000, stage_id: int = 2):
     return _FakeOutput(
         stage_id=stage_id,
@@ -191,7 +202,7 @@ async def test_basic_audio_roundtrip():
             _make_audio_output([0.1, 0.2, 0.3]),
         ]
     )
-    adapter = OmniDuplexAdapter(engine, _FakeServing())
+    adapter = _patch_adapter(OmniDuplexAdapter(engine, _FakeServing()))
     session = DuplexSession("s", _AUDIO_CFG)
     rt = DuplexRuntime(session, adapter)
     out, emit = _collector()
@@ -225,7 +236,7 @@ async def test_barge_in_aborts_generation():
         [_make_audio_output([float(i)]) for i in range(10)],
         delay=0.02,
     )
-    adapter = OmniDuplexAdapter(engine, _FakeServing())
+    adapter = _patch_adapter(OmniDuplexAdapter(engine, _FakeServing()))
     session = DuplexSession("s", _AUDIO_CFG)
     rt = DuplexRuntime(session, adapter)
     out, emit = _collector()
@@ -253,7 +264,7 @@ async def test_new_response_supersedes_inflight():
         [_make_audio_output([float(i)]) for i in range(5)],
         delay=0.02,
     )
-    adapter = OmniDuplexAdapter(engine, _FakeServing())
+    adapter = _patch_adapter(OmniDuplexAdapter(engine, _FakeServing()))
     session = DuplexSession("s", _AUDIO_CFG)
     rt = DuplexRuntime(session, adapter)
     out, emit = _collector()
@@ -289,7 +300,7 @@ async def test_text_output_alongside_audio():
             _make_audio_output([0.5, -0.5]),
         ]
     )
-    adapter = OmniDuplexAdapter(engine, _FakeServing())
+    adapter = _patch_adapter(OmniDuplexAdapter(engine, _FakeServing()))
     session = DuplexSession("s", _AUDIO_CFG)
     rt = DuplexRuntime(session, adapter)
     out, emit = _collector()
