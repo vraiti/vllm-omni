@@ -171,8 +171,6 @@ class DuplexRealtimeHandler:
 
     async def _translate_client_event(self, event: dict) -> dict | None:
         etype = event.get("type", "")
-        logger.warning("[duplex-debug] _translate_client_event type=%s audio_appended=%s", etype, self._audio_appended)
-
         if etype == "session.update":
             session_cfg = event.get("session", {})
             model = session_cfg.get("model")

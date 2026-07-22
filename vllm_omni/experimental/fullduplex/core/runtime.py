@@ -28,7 +28,6 @@ class DuplexRuntime:
         task: asyncio.Task | None = None
         async for event in inputs:
             etype = event.get("type")
-            logger.warning("[duplex-debug] runtime event type=%s", etype)
             if etype == ev.INPUT_APPEND:
                 modality = event.get("modality", "")
                 if modality not in self._capabilities.input_modalities:

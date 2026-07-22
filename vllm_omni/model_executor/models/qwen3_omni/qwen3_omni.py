@@ -99,6 +99,10 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     realtime_max_tokens = 64
 
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        return Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str(modality, i)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
