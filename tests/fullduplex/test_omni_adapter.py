@@ -201,6 +201,7 @@ async def test_basic_audio_roundtrip():
             [
                 {"type": ev.INPUT_APPEND, "modality": "audio", "data": _audio_chunk()},
                 {"type": ev.INPUT_COMMIT},
+                {"type": ev.RESPONSE_CREATE},
                 {"type": ev.CLOSE},
             ]
         ),
@@ -232,6 +233,7 @@ async def test_barge_in_aborts_generation():
     async def feed():
         yield {"type": ev.INPUT_APPEND, "modality": "audio", "data": _audio_chunk()}
         yield {"type": ev.INPUT_COMMIT}
+        yield {"type": ev.RESPONSE_CREATE}
         await asyncio.sleep(0.03)
         yield {"type": ev.RESPONSE_CANCEL}
         yield {"type": ev.CLOSE}
@@ -259,9 +261,11 @@ async def test_new_response_supersedes_inflight():
     async def feed():
         yield {"type": ev.INPUT_APPEND, "modality": "audio", "data": _audio_chunk()}
         yield {"type": ev.INPUT_COMMIT}
+        yield {"type": ev.RESPONSE_CREATE}
         await asyncio.sleep(0.03)
         yield {"type": ev.INPUT_APPEND, "modality": "audio", "data": _audio_chunk()}
         yield {"type": ev.INPUT_COMMIT}
+        yield {"type": ev.RESPONSE_CREATE}
         await asyncio.sleep(0.2)
         yield {"type": ev.CLOSE}
 
@@ -295,6 +299,7 @@ async def test_text_output_alongside_audio():
             [
                 {"type": ev.INPUT_APPEND, "modality": "audio", "data": _audio_chunk()},
                 {"type": ev.INPUT_COMMIT},
+                {"type": ev.RESPONSE_CREATE},
                 {"type": ev.CLOSE},
             ]
         ),
