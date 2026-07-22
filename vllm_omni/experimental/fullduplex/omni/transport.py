@@ -15,7 +15,7 @@ from scipy.signal import resample_poly
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.core import protocol as ev
-from vllm_omni.experimental.fullduplex.core.adapter import AudioChunk
+from vllm_omni.experimental.fullduplex.core.adapter import AudioChunk, ContextLengthError
 from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime
 from vllm_omni.experimental.fullduplex.core.session import (
     DuplexSession,
@@ -142,6 +142,9 @@ class DuplexRealtimeHandler:
                     raise exc
         except WebSocketDisconnect:
             logger.info("Duplex client disconnected: %s", self._session_id)
+        except ContextLengthError as exc:
+            logger.warning("Context length exceeded for %s: %s", self._session_id, exc)
+            await self._send_error(str(exc), "context_length_exceeded")
         except Exception:
             logger.exception("Duplex session error: %s", self._session_id)
         finally:

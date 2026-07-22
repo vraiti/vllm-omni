@@ -18,6 +18,7 @@ from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.experimental.fullduplex.core.adapter import (
     AudioChunk,
+    ContextLengthError,
     DuplexAdapter,
     DuplexCapability,
     OutputChunk,
@@ -45,9 +46,6 @@ class _AssistantTurn:
 
 class OmniDuplexAdapter(DuplexAdapter):
     """Model-agnostic DuplexAdapter for audio-in / audio+text-out streaming."""
-
-    _MAX_HISTORY_TOKENS = 4096
-    _MAX_HISTORY_AUDIO_S = 60.0
 
     def __init__(self, engine, serving) -> None:
         self._engine = engine
@@ -151,7 +149,6 @@ class OmniDuplexAdapter(DuplexAdapter):
                 )
             )
             self._pending_thinker_tokens = []
-            self._trim_history()
             self._active_request_id = None
             try:
                 await self._engine.abort(request_id)
@@ -205,17 +202,10 @@ class OmniDuplexAdapter(DuplexAdapter):
         )
         engine_input["arrival_time"] = time.time()
         self._prompt_token_count = len(engine_input.get("prompt_token_ids", []))
+        max_len = self._serving.model_config.max_model_len
+        if self._prompt_token_count >= max_len:
+            raise ContextLengthError(f"prompt ({self._prompt_token_count} tokens) exceeds max_model_len ({max_len})")
         yield StreamingInput(prompt=engine_input)
-
-    def _trim_history(self) -> None:
-        while len(self._history) >= 2:
-            text_total = sum(len(t.token_ids) for t in self._history if isinstance(t, _AssistantTurn))
-            audio_total = sum(len(t.audio) / _INPUT_SAMPLE_RATE for t in self._history if isinstance(t, _UserTurn))
-            if text_total <= self._MAX_HISTORY_TOKENS and audio_total <= self._MAX_HISTORY_AUDIO_S:
-                break
-            self._history.pop(0)
-            if self._history and isinstance(self._history[0], _AssistantTurn):
-                self._history.pop(0)
 
     def _build_sampling_params(self):
         from vllm_omni.entrypoints.utils import coerce_param_message_types

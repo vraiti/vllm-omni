@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.core import protocol as ev
-from vllm_omni.experimental.fullduplex.core.adapter import DuplexAdapter
+from vllm_omni.experimental.fullduplex.core.adapter import ContextLengthError, DuplexAdapter
 from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexState
 
 logger = init_logger(__name__)
@@ -80,6 +80,8 @@ class DuplexRuntime:
                 if self.session.is_stale(epoch):
                     return
                 await emit(ev.delta(response_index, chunk.modality, chunk.data))
+        except ContextLengthError:
+            raise
         except Exception as err:
             await emit(ev.error(f"response failed: {err}"))
         finally:

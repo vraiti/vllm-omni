@@ -33,6 +33,10 @@ class OutputChunk:
     data: Any
 
 
+class ContextLengthError(Exception):
+    pass
+
+
 class DuplexAdapter(ABC):
     @abstractmethod
     def capabilities(self) -> DuplexCapability: ...
