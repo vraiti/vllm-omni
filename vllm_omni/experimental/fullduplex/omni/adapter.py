@@ -12,7 +12,6 @@ from uuid import uuid4
 
 import numpy as np
 from vllm.engine.protocol import StreamingInput
-from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_cls
 from vllm.tokenizers import cached_tokenizer_from_config
 
@@ -27,8 +26,6 @@ from vllm_omni.experimental.fullduplex.core.session import DuplexSession
 from vllm_omni.experimental.fullduplex.omni.audio_utils import (
     extract_audio_chunks,
 )
-
-logger = init_logger(__name__)
 
 _INPUT_SAMPLE_RATE = 16000
 
@@ -123,7 +120,6 @@ class OmniDuplexAdapter(DuplexAdapter):
                         stage0_stop_count += 1
 
                     if stage0_stop_count >= 2 and token_ids and not finish_reason:
-                        logger.debug("stage0 started new response after %d stops, breaking", stage0_stop_count)
                         break
 
                     if token_ids:

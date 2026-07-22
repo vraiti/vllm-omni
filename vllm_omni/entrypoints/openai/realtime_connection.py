@@ -92,8 +92,6 @@ class RealtimeConnection:
 
     async def handle_event(self, event: dict):
         event_type = event.get("type")
-        if event_type != "input_audio_buffer.append":
-            logger.debug("WS recv: %s", event_type)
 
         if event_type == "session.update":
             session = event.get("session", {})
@@ -130,7 +128,6 @@ class RealtimeConnection:
         elif event_type == "input_audio_buffer.commit":
             if not self._audio_buffer:
                 self._committed_audio = []
-                logger.info("commit: empty buffer")
             else:
                 audio = np.concatenate(self._audio_buffer)
                 if self._client_input_rate != MODEL_INPUT_RATE:
@@ -139,8 +136,6 @@ class RealtimeConnection:
                         up=MODEL_INPUT_RATE,
                         down=self._client_input_rate,
                     ).astype(np.float32)
-                duration = len(audio) / MODEL_INPUT_RATE
-                logger.info("commit: %.2fs audio", duration)
                 self._committed_audio = [audio]
             self._audio_buffer = []
 
@@ -170,13 +165,6 @@ class RealtimeConnection:
                 )
                 return
 
-            gen_in_progress = self.generation_task is not None and not self.generation_task.done()
-            logger.info(
-                "response.create: client_event_id=%s, committed_chunks=%d, gen_in_progress=%s",
-                client_event_id,
-                len(self._committed_audio),
-                gen_in_progress,
-            )
             await self.start_generation(self._committed_audio)
             self._committed_audio = []
 
@@ -268,11 +256,6 @@ class RealtimeConnection:
         )
 
         try:
-            logger.info(
-                "generation start: response_id=%s, client_event_id=%s",
-                response_id,
-                self._client_event_id,
-            )
             await self._send_response_created(response_id, item_id)
 
             request_id = f"rt-{self.connection_id}-{uuid4()}"
@@ -340,22 +323,9 @@ class RealtimeConnection:
                 if not self._is_connected:
                     break
 
-            logger.info(
-                "generation done: response_id=%s, text_len=%d, prompt_tokens=%d, completion_tokens=%d",
-                response_id,
-                len(full_text),
-                prompt_token_ids_len,
-                completion_tokens_len,
-            )
-            if full_text:
-                logger.info("generated text: %.200s", full_text)
             if current_audio is not None and full_text:
                 self._conversation_history.append(
                     (current_audio, full_text),
-                )
-                logger.info(
-                    "conversation history: %d turns",
-                    len(self._conversation_history),
                 )
             await self._send_response_done(
                 response_id,
@@ -376,12 +346,6 @@ class RealtimeConnection:
                 }
             )
         finally:
-            discarded = sum(len(c) for c in self._audio_buffer)
-            if discarded:
-                logger.info(
-                    "clearing %.2fs of audio buffered during generation",
-                    discarded / MODEL_INPUT_RATE,
-                )
             self._audio_buffer.clear()
 
             if self._is_connected and not response_done_sent:
