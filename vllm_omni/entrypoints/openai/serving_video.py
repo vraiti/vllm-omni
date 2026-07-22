@@ -29,7 +29,6 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import _encode_video_bytes, encode_video_base64
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
     DiffusionMultimodalOutput,
@@ -111,27 +110,6 @@ class OmniOpenAIServingVideo:
             stage_configs=stage_configs,
         )
 
-    def _is_lingbot_video(self) -> bool:
-        """Check if the model is LingBot-Video based on model name."""
-        name = self._model_name or ""
-        return "lingbot-video" in name.lower()
-
-    def _format_lingbot_rewriter_prompt(self, raw_prompt: str, num_frames: int) -> str:
-        """Format the user prompt for the LingBot-Video EXPAND stage.
-
-        Wraps the raw prompt with the step-1 EXPAND system prompt and
-        Qwen3 chat template (thinking disabled).  The EXPAND output is
-        then forwarded to the MAP stage by the expand_to_map bridge.
-        """
-        from vllm_omni.diffusion.models.lingbot_video.rewriter_prompts import (
-            _step1_text,
-        )
-
-        fps = 24
-        duration = max(1, min(30, num_frames // fps))
-        step1 = _step1_text("t2v", raw_prompt, duration)
-        return f"<|im_start|>user\n{step1}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-
     async def _run_and_extract(
         self,
         request: VideoGenerationRequest,
@@ -171,13 +149,6 @@ class OmniOpenAIServingVideo:
             multi_modal_data["audio"] = reference_audio.path
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
-
-        if self._is_lingbot_video():
-            num_frames = vp.num_frames or 121
-            formatted = self._format_lingbot_rewriter_prompt(request.prompt, num_frames)
-            prompt = OmniTextPrompt(prompt=formatted, modalities=["video"])
-            if vp.num_frames is None:
-                vp.num_frames = num_frames
 
         if vp.width is not None and vp.height is not None:
             gen_params.width = vp.width
@@ -452,10 +423,6 @@ class OmniOpenAIServingVideo:
             diffusion_params=gen_params,
             replace_diffusion_params=True,
         )
-
-        if self._is_lingbot_video() and len(sampling_params_list) > 2:
-            lora = LoRARequest("rewriter-lora", 1, "robbyant/lingbot-video-rewriter-lora")
-            sampling_params_list[1].lora_request = lora
 
         result = None
         async for output in engine_client.generate(

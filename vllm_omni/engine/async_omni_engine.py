@@ -302,6 +302,7 @@ class AsyncOmniEngine:
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
         self.prompt_expand_func: Any | None = None
+        self.format_user_prompt_func: Any | None = None
         self.supported_tasks: tuple[str, ...] = ("generate",)
         self.default_sampling_params_list: list[OmniSamplingParams] = []
         self.stage_metadata: list[StageRuntimeInfo] = []
@@ -399,6 +400,14 @@ class AsyncOmniEngine:
                 getattr(client, "prompt_expand_func", None)
                 for client in self.stage_clients
                 if getattr(client, "prompt_expand_func", None) is not None
+            ),
+            None,
+        )
+        self.format_user_prompt_func = next(
+            (
+                getattr(client, "format_user_prompt_func", None)
+                for client in self.stage_clients
+                if getattr(client, "format_user_prompt_func", None) is not None
             ),
             None,
         )
@@ -726,6 +735,10 @@ class AsyncOmniEngine:
             elif isinstance(prompt, list):
                 for item in prompt:
                     _inject_global_id(item, request_id)
+
+            if self.format_user_prompt_func is not None and isinstance(prompt, dict):
+                prompt = self.format_user_prompt_func(prompt, effective_sampling_params_list)
+                original_prompt = prompt
 
             preselected_stage0_replica = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,

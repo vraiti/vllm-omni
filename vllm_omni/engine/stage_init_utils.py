@@ -341,6 +341,7 @@ class StageMetadata:
     model_stage: str | None
     runtime_cfg: Any
     prompt_expand_func: Callable | None = None
+    format_user_prompt_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
@@ -375,6 +376,16 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
     default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
 
+    _default_lora = getattr(stage_config, "default_lora", None)
+    if _default_lora is not None:
+        from vllm.lora.request import LoRARequest
+
+        default_sampling_params.lora_request = LoRARequest(
+            lora_name=_default_lora["name"],
+            lora_int_id=_default_lora.get("id", 1),
+            lora_path=_default_lora["path"],
+        )
+
     custom_process_input_func: Callable | None = None
     _cpif_path = getattr(stage_config, "custom_process_input_func", None)
     if _cpif_path:
@@ -386,6 +397,12 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     if _pef_path:
         _mod, _fn = _pef_path.rsplit(".", 1)
         prompt_expand_func = getattr(importlib.import_module(_mod), _fn)
+
+    format_user_prompt_func: Callable | None = None
+    _fupf_path = getattr(stage_config, "format_user_prompt_func", None)
+    if _fupf_path:
+        _mod, _fn = _fupf_path.rsplit(".", 1)
+        format_user_prompt_func = getattr(importlib.import_module(_mod), _fn)
 
     cfg_kv_collect_func: Callable | None = None
     _ckf_path = getattr(stage_config, "cfg_kv_collect_func", None)
@@ -430,6 +447,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
+        format_user_prompt_func=format_user_prompt_func,
     )
 
 

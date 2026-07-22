@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """LingBot-Video pipeline topology (frozen).
-Two-stage:
-  Stage 0: LLM_AR  — Qwen3.5 rewriter (+ LoRA), generates structured JSON caption
-  Stage 1: DIFFUSION — LingBotVideoPipeline, denoising + VAE decode
+Three-stage:
+  Stage 0: LLM_AR  — EXPAND (Qwen3.5), generates detailed prose caption
+  Stage 1: LLM_AR  — MAP (Qwen3.5 + LoRA), generates structured JSON caption
+  Stage 2: DIFFUSION — LingBotVideoPipeline, denoising + VAE decode
 """
 
 from vllm_omni.config.stage_config import (
@@ -27,6 +28,7 @@ LINGBOT_VIDEO_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             model_arch="Qwen3_5ForConditionalGeneration",
             engine_group="rewriter",
+            format_user_prompt_func="vllm_omni.model_executor.stage_input_processors.lingbot_video.format_expand_prompt",
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -37,6 +39,10 @@ LINGBOT_VIDEO_PIPELINE = PipelineConfig(
             model_arch="Qwen3_5ForConditionalGeneration",
             engine_group="rewriter",
             custom_process_input_func="vllm_omni.model_executor.stage_input_processors.lingbot_video.expand_to_map",
+            default_lora={
+                "name": "rewriter-lora",
+                "path": "robbyant/lingbot-video-rewriter-lora",
+            },
         ),
         StagePipelineConfig(
             stage_id=2,

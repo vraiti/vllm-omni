@@ -227,6 +227,7 @@ class StagePipelineConfig:
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
     prompt_expand_func: str | None = None
+    format_user_prompt_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
@@ -237,6 +238,7 @@ class StagePipelineConfig:
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     engine_group: str | None = None
+    default_lora: dict[str, Any] | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -930,6 +932,8 @@ def merge_pipeline_deploy(
                 yaml_runtime=runtime,
                 yaml_extras=extras,
                 engine_group=ps.engine_group,
+                format_user_prompt_func=ps.format_user_prompt_func,
+                default_lora=ps.default_lora,
             )
         )
     return result
@@ -958,6 +962,8 @@ class StageConfig:
     yaml_extras: dict[str, Any] = field(default_factory=dict)
     runtime_overrides: dict[str, Any] = field(default_factory=dict)
     engine_group: str | None = None
+    format_user_prompt_func: str | None = None
+    default_lora: dict[str, Any] | None = None
 
     def to_omegaconf(self) -> Any:
         """TODO(@lishunyang12): remove once engine consumes ResolvedStageConfig directly."""
@@ -1019,6 +1025,10 @@ class StageConfig:
             config_dict["custom_process_input_func"] = self.custom_process_input_func
         if self.engine_group is not None:
             config_dict["engine_group"] = self.engine_group
+        if self.format_user_prompt_func:
+            config_dict["format_user_prompt_func"] = self.format_user_prompt_func
+        if self.default_lora is not None:
+            config_dict["default_lora"] = self.default_lora
 
         # Pass through extra YAML fields (default_sampling_params,
         # output_connectors, input_connectors, tts_args, etc.)

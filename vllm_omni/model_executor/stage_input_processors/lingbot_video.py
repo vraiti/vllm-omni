@@ -2,24 +2,53 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Stage input processors for LingBot-Video.
 
-Bridge functions:
-  expand_to_map  — Stage 0 (EXPAND) → Stage 1 (MAP)
-  rewriter_to_dit — Stage 1 (MAP)   → Stage 2 (DIFFUSION)
+Functions:
+  format_expand_prompt — User prompt → Stage 0 (EXPAND) input
+  expand_to_map        — Stage 0 (EXPAND) → Stage 1 (MAP)
+  rewriter_to_dit      — Stage 1 (MAP)   → Stage 2 (DIFFUSION)
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
-from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.inputs.data import OmniTextPrompt, OmniTokensPrompt
+from vllm_omni.sampling_params import OmniSamplingParams
 
 logger = init_logger(__name__)
 
 _DURATION_RE = re.compile(r"Video Duration:\s*(\d+)\s*seconds", re.IGNORECASE)
+
+
+def format_expand_prompt(
+    prompt: OmniTextPrompt,
+    sampling_params_list: Sequence[OmniSamplingParams],
+) -> OmniTextPrompt:
+    """Format the user prompt for the EXPAND stage (stage 0).
+
+    Wraps the raw user text with the step-1 EXPAND system prompt and
+    Qwen3 chat template (thinking disabled).
+    """
+    from vllm_omni.diffusion.models.lingbot_video.rewriter_prompts import (
+        _step1_text,
+    )
+
+    num_frames = 121
+    if sampling_params_list:
+        num_frames = getattr(sampling_params_list[-1], "num_frames", None) or 121
+
+    fps = 24
+    duration = max(1, min(30, num_frames // fps))
+    prompt_text = prompt.get("prompt", "")
+    step1 = _step1_text("t2v", prompt_text, duration)
+    formatted = f"<|im_start|>user\n{step1}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    return OmniTextPrompt(prompt=formatted, modalities=prompt.get("modalities", ["video"]))
 
 
 def expand_to_map(
