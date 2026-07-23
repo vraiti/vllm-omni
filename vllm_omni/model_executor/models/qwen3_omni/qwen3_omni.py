@@ -153,6 +153,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dtype=torch.long,
             )
             self.set_custom_preprocess(self.thinker_preprocess)
+            self.talker_mtp = None  # type: ignore[assignment]
         elif self.model_stage == "talker":
             multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
