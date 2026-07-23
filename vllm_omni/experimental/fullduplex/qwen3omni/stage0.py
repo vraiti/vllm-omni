@@ -224,6 +224,7 @@ class Qwen3OmniStage0DuplexRuntime:
             )
             if input_features.ndim == 3:
                 input_features = input_features.squeeze(0)
+            input_features = input_features[:, :actual_mel_frames]
             feature_lengths = torch.tensor([actual_mel_frames], dtype=torch.long, device=input_features.device)
             audio_output_lengths = self._get_output_lengths(feature_lengths)
             audio_features = self.thinker.audio_tower(
