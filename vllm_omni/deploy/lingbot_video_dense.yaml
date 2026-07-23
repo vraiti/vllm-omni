@@ -19,6 +19,7 @@ stages:
       max_tokens: 6144
       temperature: 0
       detokenize: true
+      bad_words: ["<think>"]
 
   # Stage 1: MAP (Qwen3.5-27B + rewriter LoRA, shares engine with stage 0)
   # Converts prose caption to structured JSON caption.
@@ -27,6 +28,7 @@ stages:
       max_tokens: 6144
       temperature: 0
       detokenize: true
+      bad_words: ["<think>"]
 
   # Stage 2: Diffusion (DiT + VAE)
   # Receives structured JSON caption from MAP, encodes + denoises.

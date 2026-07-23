@@ -20,6 +20,7 @@ stages:
       max_tokens: 6144
       temperature: 0
       detokenize: true
+      bad_words: ["<think>"]
 
   # Stage 1: MAP (shares engine with stage 0, applies rewriter LoRA)
   - stage_id: 1
@@ -27,6 +28,7 @@ stages:
       max_tokens: 6144
       temperature: 0
       detokenize: true
+      bad_words: ["<think>"]
 
   # Stage 2: Diffusion (DiT + VAE)
   - stage_id: 2
