@@ -132,6 +132,42 @@ class DuplexCapabilities:
             target_barge_in_latency_ms=None,
         )
 
+    @classmethod
+    def qwen3omni_native(cls, *, max_sessions: int = 1) -> DuplexCapabilities:
+        supports_multi_session = max_sessions > 1
+        return cls(
+            supports_model_native_turn_policy=False,
+            supports_barge_in=False,
+            supports_input_append=True,
+            supports_replace_latest_chunk=False,
+            supports_reencode_context=False,
+            supports_turn_commit_only=False,
+            supports_kv_lease=False,
+            supports_core_kv_lease=False,
+            supports_model_internal_state=True,
+            supports_stage_resumption=True,
+            supports_scheduler_native_append=False,
+            supports_core_resumable_request=True,
+            supports_stage_connector_handoff=True,
+            supports_independent_io_streams=True,
+            supports_realtime_endpoint=True,
+            supports_multi_session=supports_multi_session,
+            supports_multi_session_same_replica=supports_multi_session,
+            supports_session_lease=True,
+            supports_session_resume=True,
+            session_admission_mode="engine_managed",
+            supports_audio_truncate=True,
+            requires_model_runner_kv=True,
+            requires_native_stage_role=True,
+            implementation_level="model_native_duplex",
+            adapter_patterns=["scheduler_data_plane"],
+            input_modes=["append_audio_chunk"],
+            signal_sources=["client_event", "server_policy"],
+            stage_handoff_transport="scheduler_data_plane",
+            chunk_period_ms=1000,
+            target_barge_in_latency_ms=None,
+        )
+
     def as_dict(self) -> dict[str, object]:
         return {
             "supports_session_adapter": self.supports_session_adapter,
