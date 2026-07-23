@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Iterable, Mapping
@@ -51,20 +52,99 @@ PROMPT_TEMPLATE = (
     "commentary or evaluations:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
-DEFAULT_NEGATIVE_PROMPT = (
-    '{"universal_negative": {"visual_quality": ["low quality", "worst quality", "blurry", '
-    '"pixelated", "jpeg artifacts", "low resolution", "unstable color", "color flicker", '
-    '"underexposed", "overexposed", "invisible subject", "subject hidden in darkness"], '
-    '"artistic_style": ["painting", "illustration", "drawing", "cartoon", "3d render", '
-    '"cgi", "sketch", "digital art"], "composition_and_content": ["text", "watermark", '
-    '"signature", "logo", "subtitles", "pillarboxed", "side bars", '
-    '"portrait image in landscape frame"], "temporal_and_motion_stability": ["flickering", '
-    '"jittery", "motion blur", "temporal inconsistency", "warping", "morphing", '
-    '"incoherent motion", "unnatural movement", "static object with sudden jump", '
-    '"frame-to-frame inconsistency"], "material_and_structure": ["plastic-like glass", '
-    '"unrealistic texture", "deformed bottle", "liquid freezing improperly", '
-    '"distorted reflections"]}}'
-)
+DEFAULT_NEGATIVE_VIDEO: dict = {
+    "universal_negative": {
+        "visual_quality": [
+            "low quality",
+            "worst quality",
+            "blurry",
+            "pixelated",
+            "jpeg artifacts",
+            "low resolution",
+            "unstable color",
+            "color flicker",
+            "underexposed",
+            "overexposed",
+            "washed out",
+            "over-saturation",
+            "poor color balance",
+            "invisible subject",
+            "subject hidden in darkness",
+            "crushed blacks",
+            "blown-out highlights",
+            "macroblocking",
+            "rolling shutter",
+            "temporal aliasing",
+            "color banding",
+            "edge halos",
+            "chromatic aberration",
+            "moiré patterns",
+            "high-frequency noise",
+            "grainy texture",
+            "low frame rate",
+        ],
+        "lighting_failure": [
+            "harsh flat lighting",
+            "uniformly lit without variation",
+            "no atmosphere or depth",
+            "inconsistent light direction",
+            "hard-edged unrealistic shadows",
+        ],
+        "physical_plausibility": [
+            "physically implausible motion",
+            "objects defying gravity",
+            "violates real-world physics",
+            "impossible contact or penetration",
+            "nonsensical interactions",
+            "illogical scene",
+        ],
+        "artistic_style": [
+            "painting",
+            "illustration",
+            "drawing",
+            "cartoon",
+            "3d render",
+            "cgi",
+            "sketch",
+            "digital art",
+        ],
+        "composition_and_content": [
+            "text",
+            "watermark",
+            "signature",
+            "logo",
+            "subtitles",
+            "pillarboxed",
+            "side bars",
+            "portrait image in landscape frame",
+        ],
+        "temporal_and_motion_stability": [
+            "flickering",
+            "jittery",
+            "motion blur",
+            "temporal inconsistency",
+            "warping",
+            "morphing",
+            "incoherent motion",
+            "unnatural movement",
+            "static object with sudden jump",
+            "frame-to-frame inconsistency",
+            "shaky footage",
+            "jump cuts",
+            "hard cut",
+            "unnatural scene transitions",
+        ],
+        "material_and_structure": [
+            "plastic-like glass",
+            "unrealistic texture",
+            "deformed bottle",
+            "liquid freezing improperly",
+            "distorted reflections",
+        ],
+    }
+}
+
+DEFAULT_NEGATIVE_PROMPT = json.dumps(DEFAULT_NEGATIVE_VIDEO, ensure_ascii=False)
 
 
 def _dtype_from_name(value: Any, default: torch.dtype) -> torch.dtype:

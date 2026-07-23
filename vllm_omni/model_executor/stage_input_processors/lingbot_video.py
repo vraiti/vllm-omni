@@ -10,6 +10,8 @@ Functions:
 
 from __future__ import annotations
 
+import copy
+import json
 import re
 from collections.abc import Sequence
 from typing import Any
@@ -22,6 +24,75 @@ from vllm_omni.inputs.data import OmniSamplingParams, OmniTextPrompt, OmniTokens
 logger = init_logger(__name__)
 
 _DURATION_RE = re.compile(r"Video Duration:\s*(\d+)\s*seconds", re.IGNORECASE)
+
+_DARK_SCENE_HINTS = (
+    "dark",
+    "dim",
+    "low light",
+    "low-light",
+    "night",
+    "nighttime",
+    "moody",
+    "gloomy",
+    "ominous",
+    "deep shadow",
+    "deep shadows",
+    "dark shadows",
+    "dramatic and moody",
+)
+
+_MOTION_BLUR_HINTS = (
+    "motion blur",
+    "motion-blur",
+    "blurred background",
+    "background is blurred",
+    "background appears blurred",
+    "blurred landscape",
+    "blurred scenery",
+    "blurred surroundings",
+    "blurred by",
+    "speed blur",
+    "long exposure",
+)
+
+_PHYSICAL_BLOCK_HINTS = (
+    "fantasy",
+    "surreal",
+    "dreamlike",
+    "dream-like",
+    "magic",
+    "magical",
+    "supernatural",
+    "physics-bending",
+    "physics bending",
+    "impossible physics",
+    "anti-gravity",
+    "antigravity",
+    "zero gravity",
+    "zero-gravity",
+    "weightless",
+    "weightlessness",
+    "floating in space",
+    "outer space",
+    "astronaut",
+)
+
+_STYLE_BLOCK_HINTS = (
+    "painting",
+    "illustration",
+    "cartoon",
+    "drawing",
+    "sketch",
+    "cgi",
+    "3d render",
+    "3d-render",
+    "digital art",
+    "anime",
+    "stylized animation",
+    "claymation",
+    "stop motion",
+    "stop-motion",
+)
 
 
 def format_expand_prompt(
@@ -98,6 +169,41 @@ def expand_to_map(
     return [{"prompt": formatted}]
 
 
+def _has_any_hint(text: str, hints: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(hint in lowered for hint in hints)
+
+
+def _prune_negative(caption_text: str) -> str:
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import (
+        DEFAULT_NEGATIVE_VIDEO,
+    )
+
+    neg = copy.deepcopy(DEFAULT_NEGATIVE_VIDEO)
+    cats = neg["universal_negative"]
+
+    if _has_any_hint(caption_text, _DARK_SCENE_HINTS):
+        cats["visual_quality"] = [
+            t
+            for t in cats["visual_quality"]
+            if t not in {"underexposed", "subject hidden in darkness", "crushed blacks"}
+        ]
+
+    if _has_any_hint(caption_text, _MOTION_BLUR_HINTS):
+        if "temporal_and_motion_stability" in cats:
+            cats["temporal_and_motion_stability"] = [
+                t for t in cats["temporal_and_motion_stability"] if t != "motion blur"
+            ]
+
+    if _has_any_hint(caption_text, _PHYSICAL_BLOCK_HINTS):
+        cats.pop("physical_plausibility", None)
+
+    if _has_any_hint(caption_text, _STYLE_BLOCK_HINTS):
+        cats.pop("artistic_style", None)
+
+    return json.dumps(neg, ensure_ascii=False)
+
+
 def rewriter_to_dit(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | list | None = None,
@@ -108,7 +214,8 @@ def rewriter_to_dit(
     """Convert MAP LLM output to diffusion stage input.
 
     Stage 1 (MAP, Qwen3.5 + rewriter LoRA) generates a structured JSON
-    caption.  This bridge passes that caption text as the diffusion prompt.
+    caption.  This bridge repairs the JSON, prunes the default negative
+    prompt based on caption content, and passes both to the diffusion stage.
     """
     del streaming_context, requires_multimodal_data, kwargs
 
@@ -128,4 +235,19 @@ def rewriter_to_dit(
         generated_text,
     )
 
-    return {"prompt": generated_text}
+    from vllm_omni.diffusion.models.lingbot_video.rewriter_prompts import (
+        parse_json,
+    )
+
+    parsed = parse_json(generated_text)
+    if parsed is not None:
+        caption = json.dumps(parsed, ensure_ascii=False)
+        logger.info("[rewriter_to_dit] JSON repair succeeded")
+    else:
+        caption = generated_text
+        logger.warning("[rewriter_to_dit] JSON repair failed, using raw text")
+
+    negative_prompt = _prune_negative(caption)
+    logger.info("[rewriter_to_dit] Pruned negative prompt: %s", negative_prompt)
+
+    return {"prompt": caption, "negative_prompt": negative_prompt}
