@@ -40,3 +40,6 @@ stages:
     default_sampling_params:
       num_inference_steps: 40
       guidance_scale: 3.0
+      height: 480
+      width: 832
+      num_frames: 121
