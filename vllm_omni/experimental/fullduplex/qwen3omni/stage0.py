@@ -206,6 +206,14 @@ class Qwen3OmniStage0DuplexRuntime:
             return None
 
         try:
+            hop_length = getattr(self.feature_extractor, "hop_length", 160)
+            audio_length = len(audio)
+            if audio_length % hop_length != 0:
+                pad_length = hop_length - (audio_length % hop_length)
+                audio = np.pad(audio, (0, pad_length), mode="constant", constant_values=0)
+                audio_length = len(audio)
+            actual_mel_frames = audio_length // hop_length
+
             features = self.feature_extractor(
                 audio,
                 sampling_rate=_SAMPLE_RATE,
@@ -214,12 +222,10 @@ class Qwen3OmniStage0DuplexRuntime:
             input_features = features.input_features.to(
                 device=self._model_device(), dtype=self.thinker.audio_tower.dtype
             )
-            # audio_tower expects [freq_bins, time_steps] (2D); squeeze batch dim
             if input_features.ndim == 3:
                 input_features = input_features.squeeze(0)
-            feature_lengths = torch.tensor([input_features.shape[-1]], dtype=torch.long, device=input_features.device)
+            feature_lengths = torch.tensor([actual_mel_frames], dtype=torch.long, device=input_features.device)
             audio_output_lengths = self._get_output_lengths(feature_lengths)
-            # audio_tower returns [total_tokens, hidden_dim] (2D)
             audio_features = self.thinker.audio_tower(
                 input_features,
                 feature_lens=feature_lengths,
