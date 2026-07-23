@@ -123,8 +123,9 @@ def rewriter_to_dit(
         return None
 
     logger.info(
-        "[rewriter_to_dit] MAP produced %d chars of caption JSON",
+        "[rewriter_to_dit] MAP produced %d chars of caption JSON:\n%s",
         len(generated_text),
+        generated_text,
     )
 
     return {"prompt": generated_text}
