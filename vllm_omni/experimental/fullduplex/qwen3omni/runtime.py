@@ -7,20 +7,12 @@ from base64 import b64decode
 from binascii import Error as BinasciiError
 from typing import Any
 
-from vllm_omni.experimental.fullduplex.base.data_plane import (
-    coerce_int,
-    completion_token_ids,
-    first_completion,
-    multimodal_output,
-    special_token_ids,
-)
 from vllm_omni.experimental.fullduplex.base.runtime_extension import (
     BaseDuplexRuntimeExtension,
 )
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexAppendPlan,
     DuplexInputMode,
-    DuplexOutputAction,
     DuplexOutputDecision,
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
@@ -28,7 +20,6 @@ from vllm_omni.experimental.fullduplex.qwen3omni.policy import Qwen3OmniDuplexPo
 
 _CHUNK_SAMPLES = Qwen3OmniDuplexPolicy.CHUNK_SAMPLES
 _SAMPLES_PER_AUDIO_TOKEN = Qwen3OmniDuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
-_IM_END_TOKEN_ID = Qwen3OmniDuplexPolicy.IM_END_TOKEN_ID
 
 
 def _pcm_sample_count(payload: object) -> int | None:
@@ -151,36 +142,6 @@ class Qwen3OmniDuplexRuntimeExtension(BaseDuplexRuntimeExtension):
         segment_output_metadata: dict[str, Any],
         output: object,
     ) -> DuplexOutputDecision | None:
-        if stage_id != 0 or not segment_finished:
-            return None
-
-        completion = first_completion(output)
-        token_ids = completion_token_ids(completion) or list(segment_token_ids)
-        stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
-
-        im_end_id = _IM_END_TOKEN_ID
-        stids = special_token_ids(segment_output_metadata)
-        output_metadata = multimodal_output(output, completion)
-        stids.update(special_token_ids(output_metadata))
-        if "im_end_token_id" in stids:
-            im_end_id = stids["im_end_token_id"]
-
-        is_im_end = coerce_int(stop_reason) == im_end_id or (token_ids and token_ids[-1] == im_end_id)
-        if not is_im_end:
-            return None
-
-        metadata = dict(output_metadata)
-        for key, value in stids.items():
-            metadata.setdefault(f"meta.{key}", value)
-        metadata.update(
-            {
-                "duplex_direct_response": True,
-                "duplex_native_decision": "turn_complete",
-                "turn_end": True,
-                "end_of_turn": True,
-            }
-        )
-        return DuplexOutputDecision(
-            action=DuplexOutputAction.DIRECT_RESPONSE,
-            metadata=metadata,
-        )
+        del segment_token_ids, segment_output_metadata
+        del final_stage_id, segment_finished, output
+        return None
