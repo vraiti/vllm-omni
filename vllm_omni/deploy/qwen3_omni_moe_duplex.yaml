@@ -6,6 +6,7 @@
 base_config: qwen3_omni_moe.yaml
 pipeline: qwen3_omni_moe
 session_mode: duplex
+async_chunk: false
 active_stream_window: 1
 duplex_session:
   idle_ttl_s: 300
