@@ -161,9 +161,10 @@ def expand_to_map(
     formatted = f"<|im_start|>user\n{step2}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
     logger.info(
-        "[expand_to_map] EXPAND produced %d chars, formatting MAP prompt with duration=%ds",
+        "[expand_to_map] EXPAND produced %d chars, formatting MAP prompt with duration=%ds:\n%s",
         len(detailed_caption),
         dur,
+        detailed_caption,
     )
 
     return [{"prompt": formatted}]
