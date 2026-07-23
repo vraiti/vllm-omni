@@ -214,19 +214,19 @@ class Qwen3OmniStage0DuplexRuntime:
             input_features = features.input_features.to(
                 device=self._model_device(), dtype=self.thinker.audio_tower.dtype
             )
+            # audio_tower expects [freq_bins, time_steps] (2D); squeeze batch dim
+            if input_features.ndim == 3:
+                input_features = input_features.squeeze(0)
             feature_lengths = torch.tensor([input_features.shape[-1]], dtype=torch.long, device=input_features.device)
             audio_output_lengths = self._get_output_lengths(feature_lengths)
-            audio_outputs = self.thinker.audio_tower(
+            # audio_tower returns [total_tokens, hidden_dim] (2D)
+            audio_features = self.thinker.audio_tower(
                 input_features,
                 feature_lens=feature_lengths,
                 aftercnn_lens=audio_output_lengths,
             )
-            if isinstance(audio_outputs, torch.Tensor):
-                audio_features = audio_outputs
-            else:
-                audio_features = audio_outputs.last_hidden_state
             total_tokens = int(audio_output_lengths.sum().item())
-            return audio_features[:, :total_tokens, :]
+            return audio_features[:total_tokens]
         except Exception:
             logger.exception("Qwen3-Omni duplex audio encoding failed")
             return None
