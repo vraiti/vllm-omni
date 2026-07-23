@@ -131,6 +131,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.model_stage = vllm_config.model_config.model_stage
 
         if self.model_stage == "thinker":
+            self.has_preprocess = True
             self.use_async_omni_output = True
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
@@ -151,6 +152,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 device=self._module_device(self.thinker),
                 dtype=torch.long,
             )
+            self.set_custom_preprocess(self.thinker_preprocess)
         elif self.model_stage == "talker":
             multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
@@ -268,6 +270,179 @@ class Qwen3OmniMoeForConditionalGeneration(
                 prompt_token_ids=prompt_token_ids,
                 multi_modal_data={"audio": remaining},
             )
+
+    # ==================== Duplex data plane ====================
+
+    def thinker_preprocess(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+        duplex = kwargs.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+            return input_ids, embeds, {}
+
+        prompt_len_meta = kwargs.get("duplex_prompt_len")
+        token_offset_meta = kwargs.get("duplex_token_offset", 0)
+        if (
+            isinstance(prompt_len_meta, int)
+            and isinstance(token_offset_meta, int)
+            and token_offset_meta >= prompt_len_meta
+        ):
+            embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+            return input_ids, embeds, {}
+
+        helper = self._qwen3omni_duplex_helper()
+        session_id = str(duplex.get("session_id") or "")
+        try:
+            incarnation = int(duplex.get("incarnation", 0))
+        except (TypeError, ValueError):
+            incarnation = 0
+        payload = duplex.get("payload")
+        if not session_id or not isinstance(payload, dict):
+            embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+            return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": "bad_duplex_payload"}}
+
+        session_key = (session_id, incarnation)
+        state = helper.sessions.get(session_key)
+        if state is None:
+            from vllm_omni.experimental.fullduplex.qwen3omni.stage0 import (
+                _Qwen3OmniStage0SessionState,
+            )
+
+            state = _Qwen3OmniStage0SessionState(session_id=session_id)
+            helper.sessions[session_key] = state
+            session_config = duplex.get("session_config")
+            session_config = dict(session_config) if isinstance(session_config, dict) else {}
+            helper._prepare_session_context(state, session_config)
+
+        audio_waveform = helper._decode_audio_payload(payload)
+        seq = duplex.get("seq")
+        try:
+            seq = int(seq) if seq is not None else None
+        except (TypeError, ValueError):
+            seq = None
+        epoch = duplex.get("epoch")
+        try:
+            epoch = int(epoch) if epoch is not None else None
+        except (TypeError, ValueError):
+            epoch = None
+
+        result = helper.stage_prefill_embeddings(
+            state,
+            audio_waveform,
+            epoch=epoch,
+            seq=seq,
+            final=bool(duplex.get("final")),
+        )
+
+        update_result = dict(result)
+        update_result.pop("inputs_embeds", None)
+        if result.get("success") is not True:
+            embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+            return input_ids, embeds, {"duplex": update_result}
+
+        target_dtype = input_embeds.dtype if input_embeds is not None else self.embed_input_ids(input_ids[:1]).dtype
+        full_req_embeds = result["inputs_embeds"].to(device=input_ids.device, dtype=target_dtype)
+        full_input_token_ids = list(result.get("input_token_ids") or [])
+
+        prompt_len = kwargs.get("duplex_prompt_len")
+        try:
+            prompt_len = int(prompt_len) if prompt_len is not None else int(full_req_embeds.shape[0])
+        except (TypeError, ValueError):
+            prompt_len = int(full_req_embeds.shape[0])
+
+        pad_token_id = helper.stage_padding_token_id()
+        if prompt_len > int(full_req_embeds.shape[0]):
+            pad_len = prompt_len - int(full_req_embeds.shape[0])
+            pad_ids = torch.full(
+                (pad_len,),
+                pad_token_id,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            pad_embeds = self.embed_input_ids(pad_ids).to(dtype=full_req_embeds.dtype)
+            full_req_embeds = torch.cat([pad_embeds, full_req_embeds], dim=0)
+            full_input_token_ids = [pad_token_id] * pad_len + full_input_token_ids
+        elif prompt_len < int(full_req_embeds.shape[0]):
+            logger.warning(
+                "Qwen3-Omni duplex append produced %d embeddings but the scheduler "
+                "reserved only %d prompt slots; the tail will be truncated.",
+                int(full_req_embeds.shape[0]),
+                prompt_len,
+            )
+
+        span_len = int(input_ids.shape[0])
+        token_offset = kwargs.get("duplex_token_offset", 0)
+        try:
+            token_offset = max(0, int(token_offset))
+        except (TypeError, ValueError):
+            token_offset = 0
+
+        req_embeds = full_req_embeds[token_offset : token_offset + span_len]
+        if req_embeds.shape[0] < span_len:
+            pad_ids = torch.full(
+                (span_len - req_embeds.shape[0],),
+                pad_token_id,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            pad_embeds = self.embed_input_ids(pad_ids).to(dtype=req_embeds.dtype)
+            req_embeds = torch.cat([req_embeds, pad_embeds], dim=0)
+        elif req_embeds.shape[0] > span_len:
+            req_embeds = req_embeds[:span_len]
+
+        input_token_ids = full_input_token_ids[token_offset : token_offset + span_len]
+        if len(input_token_ids) < span_len:
+            input_token_ids.extend([pad_token_id] * (span_len - len(input_token_ids)))
+        if input_token_ids:
+            req_input_ids = torch.tensor(input_token_ids, dtype=input_ids.dtype, device=input_ids.device)
+            update_result["duplex_prompt_token_ids"] = full_input_token_ids
+        else:
+            req_input_ids = torch.full_like(input_ids, pad_token_id)
+
+        return req_input_ids, req_embeds, {"duplex": update_result}
+
+    def _qwen3omni_duplex_helper(self):
+        helper = getattr(self, "_qwen3omni_duplex_data_plane_helper", None)
+        if helper is not None:
+            return helper
+        from vllm_omni.experimental.fullduplex.qwen3omni.stage0 import Qwen3OmniStage0DuplexRuntime
+
+        model_path = getattr(getattr(self.vllm_config, "model_config", None), "model", None)
+        device = str(self._module_device(self.thinker if self.thinker is not None else self))
+        helper = Qwen3OmniStage0DuplexRuntime(self, model_path=model_path, device=device)
+        self._qwen3omni_duplex_data_plane_helper = helper
+        return helper
+
+    def prepare_duplex_sampling(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        rows: tuple,
+    ) -> None:
+        del sampling_metadata
+        request_sessions = getattr(self, "_qwen3omni_duplex_request_sessions", None)
+        if not isinstance(request_sessions, dict):
+            request_sessions = {}
+            self._qwen3omni_duplex_request_sessions = request_sessions
+        request_sessions.update(
+            {row.request_id: (row.session_id, row.incarnation) for row in rows if row.session_id is not None}
+        )
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        request_sessions = getattr(self, "_qwen3omni_duplex_request_sessions", None)
+        helper = getattr(self, "_qwen3omni_duplex_data_plane_helper", None)
+        sessions = getattr(helper, "sessions", None) if helper is not None else None
+        if isinstance(request_sessions, dict):
+            for request_id in finished_req_ids:
+                session_key = request_sessions.pop(request_id, None)
+                if session_key is not None and isinstance(sessions, dict):
+                    sessions.pop(session_key, None)
+        if hasattr(self.model, "on_requests_finished"):
+            self.model.on_requests_finished(finished_req_ids)
 
     # ==================== Device utilities ====================
 
