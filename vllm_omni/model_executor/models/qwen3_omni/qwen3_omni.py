@@ -879,6 +879,15 @@ class Qwen3OmniMoeForConditionalGeneration(
         # single token. Use the runner-provided phase flag instead of span_len.
         is_prefill = bool(payload.get("_omni_is_prefill", span_len > 1))
         if is_prefill:
+            logger.debug(
+                "[talker_preprocess] prefill: span_len=%d, payload_keys=%s, "
+                "embed_keys=%s, ids_keys=%s, input_ids_shape=%s",
+                span_len,
+                list(payload.keys()),
+                list(payload.get("embed", {}).keys()),
+                list(payload.get("ids", {}).keys()),
+                input_ids.shape,
+            )
             num_computed_tokens = payload.get("_omni_num_computed_tokens")
             request_resumable = meta.get("resumable", False)
             if num_computed_tokens is not None and not request_resumable:
@@ -1183,6 +1192,19 @@ class Qwen3OmniMoeForConditionalGeneration(
                 continue
             else:
                 raise AssertionError("Expect role id after <|im_start|> (assistant, user, system)")
+        if not talker_input_embeds:
+            logger.error(
+                "[_thinker_to_talker_prefill] empty talker_input_embeds: "
+                "input_ids=%s, im_start_indexes=%s, target_len=%d",
+                input_ids,
+                im_start_indexes,
+                target_len,
+            )
+            raise ValueError(
+                f"_thinker_to_talker_prefill produced no embeddings; "
+                f"input_ids shape={input_ids.shape}, "
+                f"im_start_indexes={im_start_indexes.tolist()}"
+            )
         talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
         talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
 

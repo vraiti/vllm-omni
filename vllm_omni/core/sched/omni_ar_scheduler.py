@@ -208,9 +208,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
+            waiting_before = {r.request_id: getattr(r, "status", None) for r in list(self.waiting)}
+            if waiting_before:
+                logger.debug(
+                    "[OmniARScheduler] chunk_adapter pre: waiting=%s",
+                    waiting_before,
+                )
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
+            waiting_after = {r.request_id: getattr(r, "status", None) for r in list(self.waiting)}
+            if waiting_before != waiting_after:
+                logger.debug(
+                    "[OmniARScheduler] chunk_adapter post: waiting=%s",
+                    waiting_after,
+                )
 
         original_waiting = None
         if self._should_defer_waiting_admission():
