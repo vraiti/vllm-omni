@@ -297,6 +297,12 @@ class _OrchestratorDuplexStagePort:
             replica_id = await pool.submit_update(context.request_id, request_state, request)
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
+        if self._orchestrator.async_chunk and context.stage_id == 0 and request_state.final_stage_id > 0:
+            await self._orchestrator._prewarm_async_chunk_stages(
+                context.request_id,
+                request,
+                request_state,
+            )
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
         if not request_state.running_counter_registered and self._running_counter is not None:
