@@ -212,11 +212,13 @@ class _OrchestratorDuplexStagePort:
     def __init__(
         self,
         *,
+        orchestrator: Orchestrator,
         stage_pools: list[StagePool],
         request_states: dict[str, OrchestratorRequestState],
         running_counter: OmniRequestCounter | None,
         cleanup_request_ids: Callable[..., Any],
     ) -> None:
+        self._orchestrator = orchestrator
         self._stage_pools = stage_pools
         self._request_states = request_states
         self._running_counter = running_counter
@@ -388,6 +390,7 @@ class Orchestrator:
             self.duplex_control_plane = DuplexControlPlane(
                 extension=duplex_runtime_extension,
                 stage_port=_OrchestratorDuplexStagePort(
+                    orchestrator=self,
                     stage_pools=self.stage_pools,
                     request_states=self.request_states,
                     running_counter=self._running_counter,
