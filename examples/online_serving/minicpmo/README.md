@@ -4,10 +4,6 @@ This directory contains MiniCPM-o 4.5 online serving demos for vLLM-Omni.
 Inputs can include text, image, audio, or video; outputs are text and optional
 24 kHz speech.
 
-For the experimental native duplex runtime architecture, lifecycle invariants,
-capability boundary, and validation scope, see
-[`vllm_omni/experimental/fullduplex/DESIGN.md`](../../../vllm_omni/experimental/fullduplex/DESIGN.md).
-
 ## Installation
 
 Install vLLM-Omni with the MiniCPM-o talker dependencies:
@@ -37,12 +33,6 @@ profile admits at most four concurrent sequences per stage.
 | `minicpmo_4_5_2gpu.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
-| `minicpmo_4_5_duplex.yaml` | 1 | Experimental native full-duplex overlay. |
-
-The split pipeline preserves native-duplex epoch/turn identity, segment text,
-turn completion, reference voice, and terminal-audio metadata through
-Code2Wav. Focused CPU regressions cover this envelope; run the Realtime
-scenario below for live barge-in validation on the target GPU.
 
 Default:
 
@@ -55,8 +45,7 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 ```
 
 For local ModelScope checkpoints, replace `openbmb/MiniCPM-o-4_5` with the
-checkpoint path. To start the experimental native duplex backend, use
-`vllm_omni/deploy/minicpmo_4_5_duplex.yaml`.
+checkpoint path.
 
 ### Per-stage overrides
 
@@ -142,53 +131,6 @@ For the established text benchmark, send
 `--extra_body '{"modalities":["text"],"chat_template_kwargs":{"enable_thinking":false}}'`.
 Requesting audio also benchmarks Talker and Code2Wav and changes the
 assistant template, so it is not an apples-to-apples accuracy run.
-
-## Run the Realtime duplex CLI demo
-
-After the duplex backend is running, stream one WAV through the Realtime
-WebSocket endpoint:
-
-```bash
-python examples/online_serving/minicpmo/realtime_duplex_demo.py \
-    --url ws://localhost:8099/v1/realtime?duplex=1 \
-    --model openbmb/MiniCPM-o-4_5 \
-    --input-wav /path/to/input_16k_mono_pcm16.wav \
-    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
-    --output-dir /tmp/minicpmo_realtime_duplex_demo
-```
-
-## Open the experimental browser client
-
-The browser UI serves the page and proxies the same-origin Realtime WebSocket to
-the backend:
-
-```bash
-python -m examples.online_serving.minicpmo.realtime_web \
-    --port 7862 \
-    --ws-backend ws://127.0.0.1:8099 \
-    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav
-```
-
-Open `http://<host>:7862/`. When using a reverse proxy, open the URL mapped to
-port `7862`; the browser derives its WebSocket endpoint relative to that URL.
-
-If the page proxy serves HTTP but does not forward WebSocket upgrades, point the
-browser at a separately exposed Realtime endpoint:
-
-```bash
-python -m examples.online_serving.minicpmo.realtime_web \
-    --port 7862 \
-    --ws-backend ws://127.0.0.1:8099 \
-    --public-realtime-url wss://public.example/v1/realtime
-```
-
-## Validate soft-interrupt behavior
-
-The soft-interrupt E2E driver defaults to `--validation-mode model-policy`,
-which checks lifecycle and streaming invariants for arbitrary input audio. The
-stronger `response-required` mode is diagnostic: it requires a purpose-built
-two-response WAV, its `--input-sha256`, and an
-`--expect-second-response-substring` value.
 
 ## Related examples
 

@@ -6,9 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
-    PersonaPlexTalkerForConditionalGeneration,
-)
 from vllm_omni.model_executor.stage_input_processors.personaplex import (
     talker2code2wav_async_chunk,
     talker2code2wav_full_payload,
@@ -81,55 +78,3 @@ def test_async_chunk_keeps_delay_tail_across_resumable_segments() -> None:
     expected = torch.cat([first_frame[:, :1], second_frame[:, 1:]], dim=1).reshape(-1)
     assert torch.equal(second.codes.audio, expected)
     assert manager.request_payload["req"]["personaplex_frames"][0].equal(second_frame.reshape(-1))
-
-
-def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
-    received: dict[str, torch.Tensor] = {}
-    recorded: list[tuple[str, torch.Tensor, torch.Tensor]] = []
-
-    def depformer(
-        text_token: torch.Tensor,
-        hidden: torch.Tensor,
-        *,
-        audio_tokens: torch.Tensor | None = None,
-        audio_provided: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        received["text_token"] = text_token
-        received["hidden"] = hidden
-        received["audio_tokens"] = audio_tokens
-        received["audio_provided"] = audio_provided
-        return torch.arange(16, dtype=torch.long).reshape(1, 16)
-
-    model = SimpleNamespace(
-        _dtype=torch.float32,
-        depformer=depformer,
-        _duplex_stage0_runtime=lambda: SimpleNamespace(
-            record_sample=lambda *, request_id, text_token, agent_codes: recorded.append(
-                (request_id, text_token.clone(), agent_codes.clone())
-            )
-        ),
-    )
-    method = getattr(PersonaPlexTalkerForConditionalGeneration, "post_sample_talker_mtp", None)
-    assert callable(method)
-
-    codes = method(
-        model,
-        input_ids=torch.tensor([101]),
-        hidden_states=torch.arange(4, dtype=torch.float32).reshape(1, 4),
-        req_ids=["r1"],
-        req_infos=[
-            {
-                "duplex": {"data_plane": True},
-                "pplex_depformer_audio_tokens": torch.arange(16),
-                "pplex_depformer_audio_provided": torch.arange(16) > 0,
-            }
-        ],
-    )
-
-    assert codes.shape == (1, 16)
-    assert received["text_token"].tolist() == [101]
-    assert received["hidden"].shape == (1, 1, 4)
-    assert torch.equal(received["audio_tokens"], torch.arange(16).reshape(1, 16))
-    assert torch.equal(received["audio_provided"], (torch.arange(16) > 0).reshape(1, 16))
-    assert [(row[0], row[1].item()) for row in recorded] == [("r1", 101)]
-    assert torch.equal(recorded[0][2], codes[0])

@@ -81,7 +81,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         <code>tests/e2e/offline_inference/test_{model}.py</code><br>
         <strong>Feature integration:</strong><br>
         <code>tests/e2e/features/&lt;feature&gt;/</code><br>
-        (e.g. <code>fullduplex/</code>, <code>custom_pipeline/</code>, <code>rlhf_test/</code>)<br>
+        (e.g. <code>custom_pipeline/</code>, <code>rlhf_test/</code>)<br>
         <strong>Component / interface Test (GPU):</strong><br>
         <code>tests/{component}/…</code>, <code>tests/entrypoints/…</code>
       </td>

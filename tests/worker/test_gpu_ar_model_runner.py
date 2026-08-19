@@ -58,9 +58,9 @@ def test_post_sample_talker_mtp_uses_current_sample_and_hidden() -> None:
     runner, received = _mtp_runner(
         async_scheduling=False,
         buffers={
-            "ready": {"duplex": {"data_plane": True}},
+            "ready": {"mtp_ctrl": {"data_plane": True}},
             "partial-prefill": {
-                "duplex": {"data_plane": True},
+                "mtp_ctrl": {"data_plane": True},
                 "codes": {"audio": torch.tensor([[99]])},
             },
             "offline": {},
@@ -90,14 +90,14 @@ def test_post_sample_talker_mtp_uses_current_sample_and_hidden() -> None:
     assert received["req_ids"] == ["ready"]
     assert received["input_ids"].tolist() == [101]
     assert received["hidden_states"].tolist() == [[1.0, 2.0]]
-    assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
+    assert received["req_infos"] == [{"mtp_ctrl": {"data_plane": True}}]
     assert runner.model_intermediate_buffer["ready"]["codes"]["audio"].tolist() == [[11, 12, 13]]
     # A partial-prefill row has no sampled token yet. It must not replay the
     # prior frame's codes into the current connector payload.
     audio = multimodal["codes"]["audio"]
     assert audio[0].tolist() == [[11, 12, 13]]
     assert audio[1].numel() == 0
-    # Mixed batches must retain outputs produced by non-duplex rows.
+    # Mixed batches must retain outputs produced by non-MTP rows.
     assert audio[2].tolist() == [[90, 91, 92]]
     assert multimodal["meta"] == {"source": "temporal"}
 
@@ -106,8 +106,8 @@ def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:
     runner, received = _mtp_runner(
         async_scheduling=True,
         buffers={
-            "ready": {"duplex": {"data_plane": True}},
-            "discarded-prefill": {"duplex": {"data_plane": True}},
+            "ready": {"mtp_ctrl": {"data_plane": True}},
+            "discarded-prefill": {"mtp_ctrl": {"data_plane": True}},
         },
     )
 
@@ -126,12 +126,12 @@ def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:
     assert received["req_ids"] == ["ready"]
     assert received["input_ids"].tolist() == [101]
     assert received["hidden_states"].tolist() == [[1.0, 2.0]]
-    assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
+    assert received["req_infos"] == [{"mtp_ctrl": {"data_plane": True}}]
     assert multimodal["codes"]["audio"][0].tolist() == [[11, 12, 13]]
     assert multimodal["codes"]["audio"][1].numel() == 0
 
 
-def test_post_sample_talker_mtp_skips_shape_validation_without_duplex_rows() -> None:
+def test_post_sample_talker_mtp_skips_shape_validation_without_mtp_rows() -> None:
     runner = object.__new__(GPUARModelRunner)
     runner.use_async_scheduling = False
     runner.model = SimpleNamespace(
@@ -173,13 +173,13 @@ def test_post_sample_talker_mtp_rejects_invalid_selected_token_shape(
         post_sample_talker_mtp=lambda **_: pytest.fail("hook must not run"),
     )
     runner.model_intermediate_buffer = {
-        "duplex": {"duplex": {"data_plane": True}},
+        "mtp_req": {"mtp_ctrl": {"data_plane": True}},
     }
 
     with pytest.raises(ValueError, match=error_match):
         GPUARModelRunner._run_post_sample_talker_mtp(
             runner,
-            req_ids=["duplex"],
+            req_ids=["mtp_req"],
             valid_sampled_token_ids=[[101]],
             sampled_token_ids=sampled_token_ids,
             invalid_req_indices=[],

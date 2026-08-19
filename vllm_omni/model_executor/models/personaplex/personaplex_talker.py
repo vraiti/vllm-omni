@@ -316,42 +316,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         else:
             is_prefill = span > 1
 
-        duplex = info_dict.get("duplex")
-        if isinstance(duplex, dict) and duplex.get("data_plane") is True and is_prefill:
-            prompt_len_raw = info_dict.get("duplex_prompt_len", span)
-            try:
-                prompt_len = int(prompt_len_raw)
-            except (TypeError, ValueError):
-                prompt_len = span
-            prepared = self._duplex_stage0_runtime().prepare_append(
-                duplex,
-                prompt_len=prompt_len,
-                request_id=(str(info_dict["request_id"]) if isinstance(info_dict.get("request_id"), str) else None),
-            )
-            offset_raw = info_dict.get("duplex_token_offset", 0)
-            try:
-                offset = max(0, int(offset_raw))
-            except (TypeError, ValueError):
-                offset = 0
-            local_offset = offset - prepared.prompt_offset
-            if local_offset < 0:
-                raise ValueError(
-                    "PersonaPlex scheduled span precedes the current append: "
-                    f"offset={offset}, append_offset={prepared.prompt_offset}, "
-                    f"span={span}, prompt={prompt_len}"
-                )
-            req_embeds = prepared.inputs_embeds[local_offset : local_offset + span].to(
-                device=device,
-                dtype=self._dtype,
-            )
-            req_input_ids = prepared.input_ids[local_offset : local_offset + span].to(device=device)
-            if req_embeds.shape[0] != span or req_input_ids.shape[0] != span:
-                raise ValueError(
-                    "PersonaPlex duplex prompt slice is shorter than the scheduled span: "
-                    f"offset={offset}, span={span}, prompt={prompt_len}"
-                )
-            return req_input_ids, req_embeds, prepared.info_update
-
         zero_hidden = torch.zeros((1, self.mtp_hidden_size), device=device, dtype=self._dtype)
 
         prefill_text = info_dict.get("pplex_prefill_text")
@@ -416,32 +380,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             info_update["pplex_prev_agent"] = last_agent.detach().to(torch.long).cpu()
         return input_ids, base, info_update
 
-    def _duplex_stage0_runtime(self):
-        runtime = getattr(self, "_personaplex_duplex_stage0_runtime", None)
-        if runtime is not None:
-            return runtime
-        from vllm_omni.experimental.fullduplex.personaplex.stage0 import (
-            PersonaPlexStage0DuplexRuntime,
-        )
-
-        model_path = str(getattr(self.vllm_config.model_config, "model", ""))
-        device = str(next(self.parameters()).device)
-        runtime = PersonaPlexStage0DuplexRuntime(
-            self,
-            model_path=model_path,
-            device=device,
-            max_sessions=int(getattr(self.vllm_config.model_config, "duplex_max_sessions", 1)),
-        )
-        self._personaplex_duplex_stage0_runtime = runtime
-        return runtime
-
-    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
-        runtime = getattr(self, "_personaplex_duplex_stage0_runtime", None)
-        if runtime is None:
-            return
-        for request_id in finished_req_ids:
-            runtime.close_request(request_id)
-
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         """Capture this frame's last hidden for the next step's depformer (mtp)."""
         if hidden_states is None or hidden_states.numel() == 0:
@@ -475,66 +413,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # the embed through unchanged and just emit this frame's codes.
         inputs_embeds = input_embeds.reshape(bsz, -1).to(dtype)
         return inputs_embeds, codes.to(torch.long)
-
-    def post_sample_talker_mtp(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
-        req_ids: list[str],
-        req_infos: list[dict[str, Any]],
-    ) -> torch.Tensor:
-        """Generate depformer codes for a one-token resumable duplex segment.
-
-        The normal runner invokes ``talker_mtp`` at the start of the next decode
-        step. PersonaPlex's unified duplex request instead appends one audio
-        frame and stops after one sampled text token, so there is no next decode
-        step. Run the same depformer dependency immediately from the current
-        sampled text token and temporal hidden state.
-        """
-        bsz = int(input_ids.shape[0])
-        if len(req_infos) != bsz:
-            raise ValueError(
-                f"PersonaPlex depformer request information does not match batch: {len(req_infos)} != {bsz}"
-            )
-        text_token = input_ids.reshape(bsz).to(torch.long)
-        hidden = hidden_states.reshape(bsz, 1, -1).to(self._dtype)
-        audio_tokens: list[torch.Tensor] = []
-        audio_provided: list[torch.Tensor] = []
-        for info in req_infos:
-            tokens = info.get("pplex_depformer_audio_tokens")
-            provided = info.get("pplex_depformer_audio_provided")
-            if not isinstance(tokens, torch.Tensor) or not isinstance(provided, torch.Tensor):
-                raise ValueError("PersonaPlex duplex depformer teacher-forcing state is missing")
-            tokens = tokens.reshape(-1)
-            provided = provided.reshape(-1)
-            if tokens.shape != provided.shape:
-                raise ValueError(
-                    "PersonaPlex depformer teacher-forcing token/mask shapes differ: "
-                    f"{tuple(tokens.shape)} != {tuple(provided.shape)}"
-                )
-            audio_tokens.append(tokens)
-            audio_provided.append(provided)
-        codes = self.depformer(
-            text_token,
-            hidden,
-            audio_tokens=torch.stack(audio_tokens).to(
-                device=hidden.device,
-                dtype=torch.long,
-            ),
-            audio_provided=torch.stack(audio_provided).to(
-                device=hidden.device,
-                dtype=torch.bool,
-            ),
-        ).to(torch.long)
-        runtime = self._duplex_stage0_runtime()
-        for row, request_id in enumerate(req_ids):
-            runtime.record_sample(
-                request_id=request_id,
-                text_token=text_token[row],
-                agent_codes=codes[row],
-            )
-        return codes
 
     # ------------------------------------------------------------------
     # Weight loading

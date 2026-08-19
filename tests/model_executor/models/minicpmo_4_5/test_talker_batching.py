@@ -322,69 +322,6 @@ def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> N
     assert talker.compute_logits(output.text_hidden_states).argmax(dim=-1).tolist() == [0, 0]
 
 
-def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
-    talker = _make_talker()
-    mocker.patch.object(talker, "_sample_audio_codes", return_value=torch.tensor([2, 2]))
-    infos = [
-        {
-            "request_id": "req-a",
-            "native_duplex": True,
-            "duplex": {"epoch": 3, "turn_id": 7},
-            "ids": {"tts": [41]},
-            "meta": {
-                "native_duplex_segment_text": "first",
-                "turn_eos_token_id": 99,
-            },
-            "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
-        },
-        {
-            "request_id": "req-b",
-            "native_duplex": True,
-            "duplex": {"epoch": 4, "turn_id": 8},
-            "ids": {"tts": [42, 99]},
-            "meta": {
-                "native_duplex_segment_text": "second",
-                "turn_eos_token_id": 99,
-            },
-            "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
-        },
-    ]
-
-    output = talker.make_omni_output(
-        torch.ones(2, 2),
-        model_intermediate_buffer=infos,
-        request_token_spans=[(0, 1), (1, 2)],
-    )
-
-    meta = output.multimodal_outputs["meta"]
-    assert [value.item() for value in meta["native_duplex"]] == [True, True]
-    assert [value.item() for value in meta["duplex_epoch"]] == [3, 4]
-    assert [value.item() for value in meta["duplex_turn_id"]] == [7, 8]
-    assert "native_duplex_segment_text" not in meta
-    assert [bytes(value.tolist()).decode("utf-8") for value in meta["llm_output_text_utf8"]] == [
-        "first",
-        "second",
-    ]
-    assert [value.item() for value in meta["turn_end"]] == [False, True]
-
-
-def test_talker_rejects_native_duplex_without_fence_identity(mocker) -> None:
-    talker = _make_talker()
-    mocker.patch.object(talker, "_sample_audio_codes", return_value=torch.tensor([2]))
-    info = {
-        "request_id": "req-missing-fence",
-        "native_duplex": True,
-        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
-    }
-
-    with pytest.raises(RuntimeError, match="requires non-negative integer epoch and turn_id"):
-        talker.make_omni_output(
-            torch.ones(1, 2),
-            model_intermediate_buffer=[info],
-            request_token_spans=[(0, 1)],
-        )
-
-
 def test_incomplete_prefill_emits_no_code_and_does_not_advance_state(mocker) -> None:
     talker = _make_talker()
     sample = mocker.patch.object(talker, "_sample_audio_codes", return_value=torch.tensor([2]))

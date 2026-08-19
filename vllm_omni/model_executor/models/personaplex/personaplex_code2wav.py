@@ -94,7 +94,7 @@ class PersonaPlexCode2Wav(nn.Module):
         self._output_sample_rate = int(getattr(mimi_cfg, "sample_rate", 24000))
         self._samples_per_frame = int(getattr(mimi_cfg, "samples_per_frame", 1920))
         self._mimi_name = getattr(mimi_cfg, "mimi_name", None) or getattr(self.config, "mimi_name", None)
-        self._max_codec_sessions = int(getattr(vllm_config.model_config, "duplex_max_sessions", 1))
+        self._max_codec_sessions = 1
 
         # The Mimi module is constructed in load_weights() (it owns its own
         # weight format) and assigned here so vLLM's memory profiler can see it.

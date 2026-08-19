@@ -383,7 +383,6 @@ class OmniStageModelConfig:
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
-    duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -1395,7 +1394,6 @@ def _build_common_stage_config_kwargs(
                 topology,
                 stage_deploy,
                 engine.model,
-                duplex_max_sessions=(deploy.duplex_session.max_sessions if deploy.session_mode == "duplex" else 1),
                 model=model,
             ),
             "load_config": _build_load_config(topology, engine.load),
@@ -1578,7 +1576,6 @@ def _build_model_config(
     stage_deploy: StageDeployConfig | None,
     engine: _ModelEngineOverrides,
     *,
-    duplex_max_sessions: int,
     model: str | None,
 ) -> OmniStageModelConfig:
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
@@ -1602,7 +1599,6 @@ def _build_model_config(
         kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
     return OmniStageModelConfig(
         default_sampling_params=default_sampling_params,
-        duplex_max_sessions=duplex_max_sessions,
         **kwargs,
     )
 
