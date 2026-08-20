@@ -17,6 +17,9 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams, StructuredOu
 from vllm.tool_parsers import ToolParserManager
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
+    from vllm.engine.protocol import StreamingInput
     from vllm.inputs import TokensPrompt
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -35,6 +38,21 @@ SAMPLE_RATE_HZ = 24000
 BYTES_PER_SAMPLE_PCM16 = 2
 
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
+
+# MiniCPM-o 4.5's audio placeholder (MiniCPMO45OmniForConditionalGeneration.
+# get_placeholder_str, minicpmo_4_5_omni.py) -- a single literal string,
+# unlike Qwen3-Omni's three-part start/pad/end placeholder above. Used only
+# for the model-driven-turn-control (self.supports_native_vad) streaming
+# path, currently MiniCPM-o's alone.
+MINICPMO_AUDIO_PLACEHOLDER = "(<audio>./</audio>)"
+
+# MiniCPM-o 4.5's turn-control vocabulary (modeling_minicpmo_unified.py):
+# the model predicts one of these as an ordinary next token to signal
+# "stay silent" / "start speaking" / "this response is done" -- see
+# _resolve_streaming_turn_tokens.
+MINICPMO_LISTEN_TOKEN = "<|listen|>"
+MINICPMO_SPEAK_TOKEN = "<|speak|>"
+MINICPMO_TURN_EOS_TOKEN = "<|turn_eos|>"
 
 # Dev-only debug artifacts (WS event JSONL, conversation history dumps) --
 # not for production use. One subdirectory per connection.
@@ -231,6 +249,16 @@ class FullDuplexRealtimeConnection:
 
         self._tokenizer: Any = None
 
+        # Model-driven turn control (self.supports_native_vad) state: a
+        # single persistent streaming request for the whole session, instead
+        # of one independent engine.generate() call per response.create. See
+        # _start_streaming_session/_run_streaming_session.
+        self._streaming_request_id: str | None = None
+        self._streaming_queue: asyncio.Queue | None = None
+        self._listen_token_id: int | None = None
+        self._speak_token_id: int | None = None
+        self._turn_eos_token_id: int | None = None
+
         self._log_dir = _allocate_log_dir()
         self._events_log_path = self._log_dir / "events.jsonl"
         self._history_dump_counter = 0
@@ -281,6 +309,8 @@ class FullDuplexRealtimeConnection:
             except asyncio.CancelledError:
                 pass
         await self._cancel_active_response()
+        if self._streaming_request_id is not None:
+            await self._stop_streaming_session()
         self._dump_conversation_history("final")
         logger.info("[realtime] connection closed, session_id=%s", self.session.session_id)
 
@@ -458,6 +488,28 @@ class FullDuplexRealtimeConnection:
         except Exception:
             await self._send_error("Invalid base64 audio data", "invalid_request_error", event_id=event.event_id)
             return
+
+        if self.supports_native_vad:
+            # Model-driven turn control: no buffer-until-commit -- each
+            # chunk becomes a StreamingInput pushed onto the persistent
+            # request's queue (APPEND, see spec/ASYNC_OMNI_SPEC.md). The
+            # first chunk of the connection starts the session (CREATE).
+            from vllm.engine.protocol import StreamingInput
+            from vllm.inputs import TokensPrompt
+
+            pcm16 = np.frombuffer(audio_bytes, dtype=np.int16)
+            audio_f32 = pcm16.astype(np.float32) / 32768.0
+            raw_tok = getattr(self._tokenizer, "tokenizer", self._tokenizer)
+            token_ids = raw_tok.encode(MINICPMO_AUDIO_PLACEHOLDER, add_special_tokens=False)
+            chunk_prompt = TokensPrompt(
+                prompt_token_ids=token_ids,
+                multi_modal_data={"audio": [(audio_f32, SAMPLE_RATE_HZ)]},
+            )
+            if self._streaming_queue is None:
+                await self._start_streaming_session()
+            await self._streaming_queue.put(StreamingInput(prompt=chunk_prompt))
+            return
+
         self.session.input_audio_buffer.extend(audio_bytes)
 
     def _commit_audio_buffer(self) -> types.RealtimeConversationItemUserMessage | None:
@@ -720,6 +772,24 @@ class FullDuplexRealtimeConnection:
 
     async def _handle_response_create(self, event: types.ResponseCreateEvent):
         s = self.session
+
+        if self.supports_native_vad:
+            # Model-driven turn control: responses begin from the model's
+            # own speak-token decision (_run_streaming_session), not a
+            # client-issued response.create -- there is no discrete
+            # "current turn" to build a prompt from here. Matches
+            # _handle_audio_commit's existing precedent of rejecting
+            # events that don't apply in this turn-control mode, rather
+            # than silently no-op'ing one a client is actively waiting on
+            # response.created for (see the client-timeout gotcha noted at
+            # ResponseCreatedEvent's send site).
+            await self._send_error(
+                "response.create is not supported when the model drives its own turn "
+                "control (semantic_vad); the server starts responses automatically",
+                "invalid_request_error",
+                event_id=event.event_id,
+            )
+            return
 
         if s.is_semantic_vad:
             # There's no explicit commit in this mode (spec forbids it) --
@@ -1406,6 +1476,183 @@ class FullDuplexRealtimeConnection:
             )
         )
 
+    # ------------------------------------------------------------------ #
+    #  Model-driven turn control (self.supports_native_vad): a single      #
+    #  persistent streaming request for the whole session, instead of one #
+    #  independent engine.generate() call per response.create.            #
+    # ------------------------------------------------------------------ #
+
+    def _resolve_streaming_turn_tokens(self) -> None:
+        """Resolve the model's listen/speak/turn-end special tokens once,
+        the first time a streaming session starts. Currently only
+        MiniCPM-o's vocabulary (see the MINICPMO_* constants) -- the only
+        model with supports_semantic_vad=True today."""
+        if self._speak_token_id is not None:
+            return
+        raw_tok = getattr(self._tokenizer, "tokenizer", self._tokenizer)
+        self._listen_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_LISTEN_TOKEN)
+        self._speak_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_SPEAK_TOKEN)
+        self._turn_eos_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_TURN_EOS_TOKEN)
+
+    async def _stream_source(self, queue: asyncio.Queue) -> AsyncGenerator[StreamingInput, None]:
+        """Pull StreamingInput chunks off queue for AsyncOmni.generate()'s
+        persistent-streaming-request path (see spec/ASYNC_OMNI_SPEC.md).
+        A None sentinel ends the generator, which AsyncOmni reads as the
+        session's FINISH signal."""
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                return
+            yield chunk
+
+    async def _start_streaming_session(self) -> None:
+        """Start (or restart, from _restart_streaming_session) the
+        persistent streaming request. The first StreamingInput chunk
+        carries the full instructions + history rendered exactly like a
+        per-turn prompt (_build_full_prompt); live audio appended after
+        that (_handle_audio_append) is pushed onto self._streaming_queue as
+        further chunks."""
+        from vllm.engine.protocol import StreamingInput
+
+        self._resolve_streaming_turn_tokens()
+        seed_prompt = await self._build_full_prompt()
+        self._streaming_queue = asyncio.Queue()
+        await self._streaming_queue.put(StreamingInput(prompt=seed_prompt))
+        self._streaming_request_id = _gen_id("rt-stream")
+        self._response_cancel_event.clear()
+        self._response_task = asyncio.create_task(self._run_streaming_session())
+
+    async def _stop_streaming_session(self) -> None:
+        """Abort the current streaming request and cancel the task driving
+        it, without starting a replacement. If a response was mid-utterance,
+        it's finalized as cancelled first (inside the task's own
+        CancelledError handler, see _run_streaming_session) so the client
+        gets a matching response.done instead of a silently dropped
+        response."""
+        if self._streaming_request_id is not None:
+            try:
+                await self.engine.abort(self._streaming_request_id)
+            except Exception:
+                logger.exception("Failed to abort streaming request %s", self._streaming_request_id)
+        if self._response_task and not self._response_task.done():
+            self._response_cancel_event.set()
+            self._response_task.cancel()
+            try:
+                await self._response_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _restart_streaming_session(self) -> None:
+        """Stop the current streaming request and start a fresh one seeded
+        with the (already-mutated) current session.items/instructions.
+
+        Used instead of KV-cache truncate/excise for any API-level context
+        change (conversation.item.truncate, history auto-trim) -- see
+        spec/VLLM_KV_TRUNCATE.md / spec/TOKEN_EXCISE.md for why that's out
+        of scope for this path.
+        """
+        await self._stop_streaming_session()
+        await self._start_streaming_session()
+
+    async def _run_streaming_session(self) -> None:
+        """Drive one persistent generate() call for the connection's whole
+        model-driven-turn-control session, opening and closing response
+        items on the model's own speak/turn-end tokens instead of client
+        response.create events. Reuses _begin_response_item /
+        _process_output_chunk / _finalize_response_item -- the exact same
+        per-response logic the per-turn path uses once per response.create,
+        here invoked many times over one long-lived generate() call."""
+        s = self.session
+        sampling_params_list = list(self.engine.default_sampling_params_list)
+        for sp in sampling_params_list:
+            if isinstance(sp, SamplingParams):
+                sp.output_kind = RequestOutputKind.DELTA
+
+        gen = self.engine.generate(
+            prompt=self._stream_source(self._streaming_queue),
+            request_id=self._streaming_request_id,
+            sampling_params_list=sampling_params_list,
+        )
+
+        ctx: ResponseStreamState | None = None
+        response_id: str | None = None
+        try:
+            async for output in gen:
+                if not self._connected:
+                    break
+
+                first_out = output.outputs[0] if output.outputs else None
+                new_token_ids = list(first_out.token_ids) if first_out is not None else []
+
+                if ctx is None:
+                    if self._speak_token_id not in new_token_ids:
+                        # Listening (no open item): nothing client-visible to
+                        # do with this chunk beyond having fed it through
+                        # generate().
+                        continue
+                    response_id = _gen_id("resp")
+                    previous_item_id = s.items[-1].id if s.items else None
+                    ctx = await self._begin_response_item(
+                        response_id,
+                        is_audio=True,
+                        previous_item_id=previous_item_id,
+                        tools=None,
+                        tool_choice=None,
+                    )
+                    # Fall through to process this same chunk below: if the
+                    # speak token shared a decode step with real content
+                    # (rather than being the whole chunk on its own), that
+                    # content must not be silently dropped. Known
+                    # limitation: the speak token's own decoded text isn't
+                    # stripped out of a bundled chunk, so it can leak a
+                    # literal "<|speak|>" into the transcript in that case.
+
+                finished = await self._process_output_chunk(output, ctx, response_id)
+                if finished or self._turn_eos_token_id in new_token_ids:
+                    # finished=True (finish_reason fired, e.g. a stage's own
+                    # max_tokens) without a turn_eos token means the engine
+                    # ended this segment's generation before the model
+                    # itself decided to stop talking -- close the item out
+                    # defensively rather than leave it open with no more
+                    # chunks ever arriving for it.
+                    await self._finalize_response_item(response_id, ctx)
+                    ctx = None
+                    response_id = None
+                    # A response boundary is also a natural point to check
+                    # whether history needs trimming -- there's no
+                    # response.create to gate this on in streaming mode (see
+                    # _maybe_truncate_history's per-turn callers).
+                    items_before = len(s.items)
+                    if not await self._maybe_truncate_history(None):
+                        logger.warning(
+                            "[realtime] token budget exceeded and truncation is disabled; "
+                            "streaming session %s left as-is",
+                            self._streaming_request_id,
+                        )
+                    elif len(s.items) != items_before:
+                        # Items were actually dropped -- restart so the
+                        # model's live context reflects the trim. Called
+                        # directly (not via _restart_streaming_session,
+                        # which cancels self._response_task -- that's this
+                        # very task, and a task can't await its own
+                        # completion): just start the replacement and
+                        # return, letting the `finally` below close out this
+                        # generator the same way natural completion would.
+                        await self._start_streaming_session()
+                        return
+        except asyncio.CancelledError:
+            if ctx is not None and response_id is not None:
+                ctx.cancelled = True
+                await self._finalize_response_item(response_id, ctx)
+            raise
+        finally:
+            aclose = getattr(gen, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    logger.debug("Error closing streaming generator for %s", self._streaming_request_id, exc_info=True)
+
     async def _run_response_inner(self, response_id, response_cfg, s, active):
         # Captured now, before anything else can mutate session.items (e.g.
         # a new input_audio_buffer.commit landing while this response is
@@ -1474,6 +1721,21 @@ class FullDuplexRealtimeConnection:
     # ------------------------------------------------------------------ #
 
     async def _handle_response_cancel(self, event: types.ResponseCancelEvent):
+        if self.supports_native_vad:
+            # No discrete per-turn active_response to check here -- the
+            # persistent session may be mid-utterance or just listening;
+            # either way, restarting is a safe, idempotent way to honor an
+            # explicit cancel. See _restart_streaming_session.
+            if self._streaming_request_id is None:
+                await self._send_error(
+                    "No response is in progress",
+                    "invalid_request_error",
+                    event_id=event.event_id,
+                )
+                return
+            await self._restart_streaming_session()
+            return
+
         if self.session.active_response is None:
             await self._send_error(
                 "No response is in progress",
@@ -1731,6 +1993,13 @@ class FullDuplexRealtimeConnection:
                 audio_end_ms=audio_end_ms,
             )
         )
+
+        if self.supports_native_vad and self._streaming_request_id is not None:
+            # The persistent request's live context just changed (this
+            # item's remembered transcript is now shorter) -- restart so
+            # the model's context reflects it. See _restart_streaming_session
+            # for why this is a full restart rather than KV-cache surgery.
+            await self._restart_streaming_session()
 
     # ------------------------------------------------------------------ #
     #  History -> prompt serialization                                    #
