@@ -58,6 +58,7 @@ def _allocate_log_dir() -> Path:
         except FileExistsError:
             serial_id += 1
 
+
 # Qwen3-Omni talker/code2wav constant for correlating an assistant item's
 # audio_end_ms (conversation.item.truncate) back to how many real thinker
 # output tokens had actually been heard -- see
@@ -103,6 +104,7 @@ AUTO_TRUNCATION_TARGET_RATIO = 0.5
 # unknown event types.
 KEEPALIVE_INTERVAL_SECONDS = 20
 
+
 @dataclass
 class _ToolParserRequest:
     """Duck-typed stand-in for the ChatCompletionRequest/ResponsesRequest
@@ -120,6 +122,47 @@ class _ToolParserRequest:
     tool_choice: str = "auto"
     include_reasoning: bool = False
     skip_special_tokens: bool = True
+
+
+@dataclass
+class ResponseStreamState:
+    """Mutable per-response accumulator threaded through
+    ``_begin_response_item`` / ``_process_output_chunk`` /
+    ``_finalize_response_item``.
+
+    Replaces the ``nonlocal`` closures a single-response-per-call
+    ``_run_response_inner`` used to hold these in directly. Factored out so
+    a persistent, session-long ``generate()`` call (one request driving many
+    responses, for models with server/model-driven turn control) can open
+    and close many of these across its lifetime using the exact same
+    begin/process/finalize logic a per-turn ``response.create`` uses once.
+    """
+
+    item_id: str
+    output_index: int
+    content_index: int
+    part_type: str
+    is_audio: bool
+    previous_item_id: str | None
+    item_obj: Any
+    tool_parser: Any = None
+    converted_tools: list = field(default_factory=list)
+    tool_choice: str | None = None
+    structural_tag_json: str | None = None
+    full_text: str = ""
+    full_transcript: str = ""
+    full_token_ids: list[int] = field(default_factory=list)
+    full_audio_chunks: list[Any] = field(default_factory=list)
+    total_audio_samples: int = 0
+    usage: ResponseUsage = field(default_factory=ResponseUsage)
+    text_finished: bool = False
+    audio_finished: bool = False
+    tool_call_seen: bool = False
+    previous_text: str = ""
+    previous_token_ids: list[int] = field(default_factory=list)
+    pending_tool_calls: dict[int, dict[str, Any]] = field(default_factory=dict)
+    next_output_index: int = 1
+    cancelled: bool = False
 
 
 class FullDuplexRealtimeConnection:
@@ -654,11 +697,7 @@ class FullDuplexRealtimeConnection:
             if item.type in ("function_call", "function_call_output"):
                 call_id = getattr(item, "call_id", None)
                 pair = next(
-                    (
-                        other
-                        for other in s.items
-                        if other.id != item.id and getattr(other, "call_id", None) == call_id
-                    ),
+                    (other for other in s.items if other.id != item.id and getattr(other, "call_id", None) == call_id),
                     None,
                 )
                 if pair is not None and pair.id is not None:
@@ -768,23 +807,24 @@ class FullDuplexRealtimeConnection:
         finally:
             s.active_response = None
 
-    async def _run_response_inner(self, response_id, response_cfg, s, active):
-        # Captured now, before anything else can mutate session.items (e.g.
-        # a new input_audio_buffer.commit landing while this response is
-        # still generating) -- this is where the item this response produces
-        # actually belongs chronologically, not wherever s.items happens to
-        # end at completion time.
-        previous_item_id = s.items[-1].id if s.items else None
+    async def _begin_response_item(
+        self,
+        response_id: str,
+        *,
+        is_audio: bool,
+        previous_item_id: str | None,
+        tools: list | None,
+        tool_choice: str | None,
+    ) -> ResponseStreamState:
+        """Create and announce the assistant-message placeholder item for a
+        new response, and set up tool-call parsing for it.
 
-        modalities = s.config.output_modalities
-        if response_cfg is not None and getattr(response_cfg, "output_modalities", None) is not None:
-            modalities = response_cfg.output_modalities
-        is_audio = "audio" in modalities
-
-        tools, tool_choice = self._resolve_tools_and_choice(s, response_cfg)
-
-        prompt = await self._build_full_prompt(tools=tools)
-
+        Shared by the per-turn path (_run_response_inner, one call per
+        response.create) and the persistent-streaming path
+        (_run_streaming_session, one call per model-detected speak-token
+        boundary within one long-lived generate() call).
+        """
+        s = self.session
         item_id = _gen_id("item")
         output_index = 0
 
@@ -793,10 +833,7 @@ class FullDuplexRealtimeConnection:
         structural_tag_json = None
         if converted_tools and tool_choice != "none" and self._tool_call_parser_name:
             tool_parser_cls = ToolParserManager.get_tool_parser(self._tool_call_parser_name)
-            strict_tools = [
-                ChatCompletionToolsParam(**t)
-                for t in self._convert_tools(tools, strict=True)
-            ]
+            strict_tools = [ChatCompletionToolsParam(**t) for t in self._convert_tools(tools, strict=True)]
             tool_parser = tool_parser_cls(self._tokenizer, tools=strict_tools)
             # Guided decoding: constrains the arguments JSON to each tool's
             # schema once the model emits <tool_call> (structural_tag_model
@@ -867,272 +904,228 @@ class FullDuplexRealtimeConnection:
             )
         )
 
-        full_text = ""
-        full_transcript = ""
-        full_token_ids: list[int] = []
-        full_audio_chunks: list[np.ndarray] = []
-        cancelled = False
-        usage = ResponseUsage()
-        total_audio_samples = 0
-
-        text_finished = False
-        audio_finished = False
-
-        # Tool-call streaming state. previous_text/previous_token_ids track
-        # the cumulative text/tokens the tool parser has seen so far --
-        # extract_tool_calls_streaming needs both the previous and current
-        # cumulative view to detect e.g. a <tool_call> tag boundary that
-        # straddles two deltas. pending_tool_calls is keyed by the parser's
-        # own per-call index (supports multiple simultaneous tool calls);
-        # dict insertion order is used as emission/history order.
-        previous_text = ""
-        previous_token_ids: list[int] = []
-        pending_tool_calls: dict[int, dict[str, Any]] = {}
-        next_output_index = 1  # 0 is the message item, reserved above
-        # The talker has no concept of tool-call spans and will synthesize
-        # audio for <tool_call>...</tool_call> text same as any other
-        # content (confirmed: nothing in _thinker_to_talker_prefill excludes
-        # it). We can't suppress that at the source without threading
-        # tool-call boundaries down into the model's decode loop, so instead
-        # stop forwarding audio deltas to the client once a call is
-        # detected -- imperfect (some audio for the tag/name may already be
-        # in flight) but eliminates the bulk of it, especially the
-        # arguments, which stream in later deltas after detection.
-        tool_call_seen = False
-
-        async def emit_content_delta(piece: str) -> None:
-            nonlocal full_text, full_transcript
-            if not piece:
-                return
-            full_transcript += piece
-            if is_audio:
-                await self._send_event(
-                    types.ResponseAudioTranscriptDeltaEvent(
-                        event_id=_gen_id("evt"),
-                        type="response.output_audio_transcript.delta",
-                        response_id=response_id,
-                        item_id=item_id,
-                        output_index=output_index,
-                        content_index=content_index,
-                        delta=piece,
-                    )
-                )
-            else:
-                full_text += piece
-                await self._send_event(
-                    types.ResponseTextDeltaEvent(
-                        event_id=_gen_id("evt"),
-                        type="response.output_text.delta",
-                        response_id=response_id,
-                        item_id=item_id,
-                        output_index=output_index,
-                        content_index=content_index,
-                        delta=piece,
-                    )
-                )
-
-        async def handle_tool_parser_delta(delta_msg) -> None:
-            nonlocal next_output_index, tool_call_seen
-            if delta_msg is None:
-                return
-            if delta_msg.content:
-                await emit_content_delta(delta_msg.content)
-            for tc in delta_msg.tool_calls:
-                entry = pending_tool_calls.get(tc.index)
-                if entry is None:
-                    tool_call_seen = True
-                    entry = {
-                        "item_id": _gen_id("item"),
-                        "call_id": tc.id or _gen_id("call"),
-                        "name": tc.function.name if tc.function else None,
-                        "arguments": "",
-                        "output_index": next_output_index,
-                    }
-                    pending_tool_calls[tc.index] = entry
-                    next_output_index += 1
-                    await self._send_event(
-                        types.ResponseOutputItemAddedEvent(
-                            event_id=_gen_id("evt"),
-                            type="response.output_item.added",
-                            response_id=response_id,
-                            output_index=entry["output_index"],
-                            item=types.RealtimeConversationItemFunctionCall(
-                                type="function_call",
-                                id=entry["item_id"],
-                                call_id=entry["call_id"],
-                                name=entry["name"] or "",
-                                arguments="",
-                                status="in_progress",
-                            ),  # type: ignore[arg-type]
-                        )
-                    )
-                elif not entry["name"] and tc.function and tc.function.name:
-                    entry["name"] = tc.function.name
-
-                if tc.function and tc.function.arguments:
-                    entry["arguments"] += tc.function.arguments
-                    await self._send_event(
-                        types.ResponseFunctionCallArgumentsDeltaEvent(
-                            event_id=_gen_id("evt"),
-                            type="response.function_call_arguments.delta",
-                            response_id=response_id,
-                            item_id=entry["item_id"],
-                            output_index=entry["output_index"],
-                            call_id=entry["call_id"],
-                            delta=tc.function.arguments,
-                        )
-                    )
-
-        sampling_params_list = list(self.engine.default_sampling_params_list)
-        structural_tag_applied = False
-        for sp in sampling_params_list:
-            if isinstance(sp, SamplingParams):
-                sp.output_kind = RequestOutputKind.DELTA
-                # Only the first real (text/thinker) stage generates the
-                # <tool_call> JSON that needs constraining -- later stages
-                # (talker, codec) get their own SamplingParams untouched.
-                if not structural_tag_applied and structural_tag_json is not None:
-                    sp.structured_outputs = StructuredOutputsParams(
-                        structural_tag=structural_tag_json
-                    )
-                    structural_tag_applied = True
-
-        gen = self.engine.generate(
-            prompt=prompt,
-            request_id=active.request_id,
-            sampling_params_list=sampling_params_list,
+        return ResponseStreamState(
+            item_id=item_id,
+            output_index=output_index,
+            content_index=content_index,
+            part_type=part_type,
+            is_audio=is_audio,
+            previous_item_id=previous_item_id,
+            item_obj=item_obj,
+            tool_parser=tool_parser,
+            converted_tools=converted_tools,
+            tool_choice=tool_choice,
+            structural_tag_json=structural_tag_json,
         )
 
-        try:
-            async for output in gen:
-                if not self._connected:
-                    cancelled = True
-                    break
+    async def _emit_content_delta(self, ctx: ResponseStreamState, response_id: str, piece: str) -> None:
+        if not piece:
+            return
+        ctx.full_transcript += piece
+        if ctx.is_audio:
+            await self._send_event(
+                types.ResponseAudioTranscriptDeltaEvent(
+                    event_id=_gen_id("evt"),
+                    type="response.output_audio_transcript.delta",
+                    response_id=response_id,
+                    item_id=ctx.item_id,
+                    output_index=ctx.output_index,
+                    content_index=ctx.content_index,
+                    delta=piece,
+                )
+            )
+        else:
+            ctx.full_text += piece
+            await self._send_event(
+                types.ResponseTextDeltaEvent(
+                    event_id=_gen_id("evt"),
+                    type="response.output_text.delta",
+                    response_id=response_id,
+                    item_id=ctx.item_id,
+                    output_index=ctx.output_index,
+                    content_index=ctx.content_index,
+                    delta=piece,
+                )
+            )
 
-                output_type = getattr(output, "final_output_type", "text")
-                first_out_dbg = output.outputs[0] if output.outputs else None
+    async def _handle_tool_parser_delta(self, ctx: ResponseStreamState, response_id: str, delta_msg) -> None:
+        if delta_msg is None:
+            return
+        if delta_msg.content:
+            await self._emit_content_delta(ctx, response_id, delta_msg.content)
+        for tc in delta_msg.tool_calls:
+            entry = ctx.pending_tool_calls.get(tc.index)
+            if entry is None:
+                ctx.tool_call_seen = True
+                entry = {
+                    "item_id": _gen_id("item"),
+                    "call_id": tc.id or _gen_id("call"),
+                    "name": tc.function.name if tc.function else None,
+                    "arguments": "",
+                    "output_index": ctx.next_output_index,
+                }
+                ctx.pending_tool_calls[tc.index] = entry
+                ctx.next_output_index += 1
+                await self._send_event(
+                    types.ResponseOutputItemAddedEvent(
+                        event_id=_gen_id("evt"),
+                        type="response.output_item.added",
+                        response_id=response_id,
+                        output_index=entry["output_index"],
+                        item=types.RealtimeConversationItemFunctionCall(
+                            type="function_call",
+                            id=entry["item_id"],
+                            call_id=entry["call_id"],
+                            name=entry["name"] or "",
+                            arguments="",
+                            status="in_progress",
+                        ),  # type: ignore[arg-type]
+                    )
+                )
+            elif not entry["name"] and tc.function and tc.function.name:
+                entry["name"] = tc.function.name
 
-                if output_type == "audio":
-                    audio_chunks = self._extract_audio_deltas(output)
-                    for chunk in audio_chunks:
-                        s.has_output_audio = True
-                        s.instructions_locked = True
-                        total_audio_samples += chunk.shape[0]
-                        # Keep the full raw audio for the server-side history
-                        # copy only (see stored_item below) -- this is for
-                        # observability/debugging (e.g. replaying exactly
-                        # what the model produced for a given item), never
-                        # sent to the client as part of item history, since
-                        # the client already received it live via the
-                        # response.output_audio.delta events below and
-                        # echoing a whole response's audio back in
-                        # conversation.item.created would reproduce the
-                        # oversized-message bug fixed for
-                        # input_audio_buffer.commit.
-                        full_audio_chunks.append(chunk)
-                        # Keep counting samples (item_duration_ms/drop_message_item
-                        # bookkeeping still needs to reflect that audio was
-                        # really generated) but stop forwarding it to the
-                        # client once a tool call has started -- see
-                        # tool_call_seen's definition above for why.
-                        if tool_call_seen:
-                            continue
-                        b64 = self._pcm16_b64(chunk)
-                        await self._send_event(
-                            types.ResponseAudioDeltaEvent(
-                                event_id=_gen_id("evt"),
-                                type="response.output_audio.delta",
-                                response_id=response_id,
-                                item_id=item_id,
-                                output_index=output_index,
-                                content_index=content_index,
-                                delta=b64,
-                            )
-                        )
-                    if first_out_dbg and first_out_dbg.finish_reason is not None:
-                        audio_finished = True
-                        if text_finished:
-                            break
+            if tc.function and tc.function.arguments:
+                entry["arguments"] += tc.function.arguments
+                await self._send_event(
+                    types.ResponseFunctionCallArgumentsDeltaEvent(
+                        event_id=_gen_id("evt"),
+                        type="response.function_call_arguments.delta",
+                        response_id=response_id,
+                        item_id=entry["item_id"],
+                        output_index=entry["output_index"],
+                        call_id=entry["call_id"],
+                        delta=tc.function.arguments,
+                    )
+                )
+
+    async def _process_output_chunk(self, output: Any, ctx: ResponseStreamState, response_id: str) -> bool:
+        """Process one output chunk into ctx, emitting delta events.
+
+        Returns True once this response's text AND (if applicable) audio
+        streams have both reached finish_reason. The per-turn caller
+        (_run_response_inner) breaks its loop on this; the
+        persistent-streaming caller (_run_streaming_session) ignores the
+        return value -- finish_reason never fires mid-session there -- and
+        instead ends a response on the model's own turn-end token.
+        """
+        s = self.session
+        output_type = getattr(output, "final_output_type", "text")
+        first_out_dbg = output.outputs[0] if output.outputs else None
+
+        if output_type == "audio":
+            audio_chunks = self._extract_audio_deltas(output)
+            for chunk in audio_chunks:
+                s.has_output_audio = True
+                s.instructions_locked = True
+                ctx.total_audio_samples += chunk.shape[0]
+                # Keep the full raw audio for the server-side history
+                # copy only (see stored_item below) -- this is for
+                # observability/debugging (e.g. replaying exactly
+                # what the model produced for a given item), never
+                # sent to the client as part of item history, since
+                # the client already received it live via the
+                # response.output_audio.delta events below and
+                # echoing a whole response's audio back in
+                # conversation.item.created would reproduce the
+                # oversized-message bug fixed for
+                # input_audio_buffer.commit.
+                ctx.full_audio_chunks.append(chunk)
+                # Keep counting samples (item_duration_ms/drop_message_item
+                # bookkeeping still needs to reflect that audio was
+                # really generated) but stop forwarding it to the
+                # client once a tool call has started -- see
+                # tool_call_seen's definition above for why.
+                if ctx.tool_call_seen:
                     continue
+                b64 = self._pcm16_b64(chunk)
+                await self._send_event(
+                    types.ResponseAudioDeltaEvent(
+                        event_id=_gen_id("evt"),
+                        type="response.output_audio.delta",
+                        response_id=response_id,
+                        item_id=ctx.item_id,
+                        output_index=ctx.output_index,
+                        content_index=ctx.content_index,
+                        delta=b64,
+                    )
+                )
+            if first_out_dbg and first_out_dbg.finish_reason is not None:
+                ctx.audio_finished = True
+                if ctx.text_finished:
+                    return True
+            return False
 
-                if output.outputs:
-                    first_out = output.outputs[0]
-                    delta_text = first_out.text or ""
-                    delta_token_ids = list(first_out.token_ids)
-                    usage.output_tokens += len(delta_token_ids)
-                    # Raw thinker token stream, in talker-consumption order --
-                    # this is what _qwen3_omni_truncate_transcript correlates
-                    # against codec frames, independent of any tool-parser
-                    # stripping applied to full_text/full_transcript below
-                    # (the talker speaks the raw stream, tool tags included).
-                    full_token_ids.extend(delta_token_ids)
+        if output.outputs:
+            first_out = output.outputs[0]
+            delta_text = first_out.text or ""
+            delta_token_ids = list(first_out.token_ids)
+            ctx.usage.output_tokens += len(delta_token_ids)
+            # Raw thinker token stream, in talker-consumption order --
+            # this is what _qwen3_omni_truncate_transcript correlates
+            # against codec frames, independent of any tool-parser
+            # stripping applied to full_text/full_transcript below
+            # (the talker speaks the raw stream, tool tags included).
+            ctx.full_token_ids.extend(delta_token_ids)
 
-                    if output.prompt_token_ids:
-                        usage.input_tokens = max(usage.input_tokens, len(output.prompt_token_ids))
+            if output.prompt_token_ids:
+                ctx.usage.input_tokens = max(ctx.usage.input_tokens, len(output.prompt_token_ids))
 
-                    if tool_parser is not None:
-                        # Additive branch: when no tools are configured for
-                        # this response, tool_parser is None and this whole
-                        # block is skipped -- the plain-text path below is
-                        # untouched.
-                        current_text = previous_text + delta_text
-                        current_token_ids = previous_token_ids + delta_token_ids
-                        delta_msg = None
-                        if delta_text or delta_token_ids:
-                            delta_msg = tool_parser.extract_tool_calls_streaming(
-                                previous_text,
-                                current_text,
-                                delta_text,
-                                previous_token_ids,
-                                current_token_ids,
-                                delta_token_ids,
-                                request=_ToolParserRequest(
-                                    tools=converted_tools, tool_choice=tool_choice or "auto"
-                                ),
-                            )
-                        previous_text = current_text
-                        previous_token_ids = current_token_ids
-                        await handle_tool_parser_delta(delta_msg)
-                    elif delta_text:
-                        await emit_content_delta(delta_text)
+            if ctx.tool_parser is not None:
+                # Additive branch: when no tools are configured for
+                # this response, tool_parser is None and this whole
+                # block is skipped -- the plain-text path below is
+                # untouched.
+                current_text = ctx.previous_text + delta_text
+                current_token_ids = ctx.previous_token_ids + delta_token_ids
+                delta_msg = None
+                if delta_text or delta_token_ids:
+                    delta_msg = ctx.tool_parser.extract_tool_calls_streaming(
+                        ctx.previous_text,
+                        current_text,
+                        delta_text,
+                        ctx.previous_token_ids,
+                        current_token_ids,
+                        delta_token_ids,
+                        request=_ToolParserRequest(tools=ctx.converted_tools, tool_choice=ctx.tool_choice or "auto"),
+                    )
+                ctx.previous_text = current_text
+                ctx.previous_token_ids = current_token_ids
+                await self._handle_tool_parser_delta(ctx, response_id, delta_msg)
+            elif delta_text:
+                await self._emit_content_delta(ctx, response_id, delta_text)
 
-                    finish = first_out.finish_reason
-                    if finish is not None:
-                        text_finished = True
-                        if not is_audio or audio_finished:
-                            break
-        except asyncio.CancelledError:
-            cancelled = True
-        finally:
-            aclose = getattr(gen, "aclose", None)
-            if aclose is not None:
-                try:
-                    await aclose()
-                except Exception:
-                    logger.debug("Error closing generator for %s", active.request_id, exc_info=True)
+            finish = first_out.finish_reason
+            if finish is not None:
+                ctx.text_finished = True
+                if not ctx.is_audio or ctx.audio_finished:
+                    return True
+        return False
 
-        if tool_parser is not None and getattr(tool_parser, "engine_based_streaming", False):
+    async def _finalize_response_item(self, response_id: str, ctx: ResponseStreamState) -> None:
+        s = self.session
+        if ctx.tool_parser is not None and getattr(ctx.tool_parser, "engine_based_streaming", False):
             # finish_streaming() only exists on the newer ParserEngine-based
             # parsers (engine_based_streaming=True, e.g. Qwen3EngineToolParser)
             # -- the base ToolParser class legacy regex-based parsers extend
             # (e.g. Hermes2ProToolParser) don't declare it at all and would
             # raise AttributeError here (confirmed in production logs).
-            await handle_tool_parser_delta(tool_parser.finish_streaming())
+            await self._handle_tool_parser_delta(ctx, response_id, ctx.tool_parser.finish_streaming())
 
         if self._response_cancel_event.is_set():
-            cancelled = True
+            ctx.cancelled = True
 
-        status = "cancelled" if cancelled else "completed"
+        status = "cancelled" if ctx.cancelled else "completed"
 
-        if is_audio:
+        if ctx.is_audio:
             await self._send_event(
                 types.ResponseAudioDoneEvent(
                     event_id=_gen_id("evt"),
                     type="response.output_audio.done",
                     response_id=response_id,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=content_index,
+                    item_id=ctx.item_id,
+                    output_index=ctx.output_index,
+                    content_index=ctx.content_index,
                 )
             )
             await self._send_event(
@@ -1140,10 +1133,10 @@ class FullDuplexRealtimeConnection:
                     event_id=_gen_id("evt"),
                     type="response.output_audio_transcript.done",
                     response_id=response_id,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=content_index,
-                    transcript=full_transcript,
+                    item_id=ctx.item_id,
+                    output_index=ctx.output_index,
+                    content_index=ctx.content_index,
+                    transcript=ctx.full_transcript,
                 )
             )
         else:
@@ -1152,10 +1145,10 @@ class FullDuplexRealtimeConnection:
                     event_id=_gen_id("evt"),
                     type="response.output_text.done",
                     response_id=response_id,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=content_index,
-                    text=full_text,
+                    item_id=ctx.item_id,
+                    output_index=ctx.output_index,
+                    content_index=ctx.content_index,
+                    text=ctx.full_text,
                 )
             )
 
@@ -1169,24 +1162,24 @@ class FullDuplexRealtimeConnection:
         item_obj = types.RealtimeConversationItemAssistantMessage(
             type="message",
             role="assistant",
-            id=item_id,
-            status="completed" if not cancelled else "incomplete",
+            id=ctx.item_id,
+            status="completed" if not ctx.cancelled else "incomplete",
             content=(
-                [{"type": "output_audio", "transcript": full_transcript}]  # type: ignore[list-item]
-                if is_audio
-                else [{"type": "output_text", "text": full_text}]  # type: ignore[list-item]
+                [{"type": "output_audio", "transcript": ctx.full_transcript}]  # type: ignore[list-item]
+                if ctx.is_audio
+                else [{"type": "output_text", "text": ctx.full_text}]  # type: ignore[list-item]
             ),
         )
 
-        done_part = {"type": part_type, "text": full_text, "transcript": full_transcript}
+        done_part = {"type": ctx.part_type, "text": ctx.full_text, "transcript": ctx.full_transcript}
         await self._send_event(
             types.ResponseContentPartDoneEvent(
                 event_id=_gen_id("evt"),
                 type="response.content_part.done",
                 response_id=response_id,
-                item_id=item_id,
-                output_index=output_index,
-                content_index=content_index,
+                item_id=ctx.item_id,
+                output_index=ctx.output_index,
+                content_index=ctx.content_index,
                 part=done_part,  # type: ignore[arg-type]
             )
         )
@@ -1196,7 +1189,7 @@ class FullDuplexRealtimeConnection:
                 event_id=_gen_id("evt"),
                 type="response.output_item.done",
                 response_id=response_id,
-                output_index=output_index,
+                output_index=ctx.output_index,
                 item=item_obj,  # type: ignore[arg-type]
             )
         )
@@ -1209,7 +1202,7 @@ class FullDuplexRealtimeConnection:
         # so rather than guess, the history copy gets empty content; the
         # wire events above already carried the real accumulated content.
         history_item = item_obj
-        if cancelled:
+        if ctx.cancelled:
             history_item = types.RealtimeConversationItemAssistantMessage(
                 type="message",
                 role="assistant",
@@ -1217,7 +1210,7 @@ class FullDuplexRealtimeConnection:
                 status="incomplete",
                 content=(
                     [{"type": "output_audio", "transcript": ""}]  # type: ignore[list-item]
-                    if is_audio
+                    if ctx.is_audio
                     else [{"type": "output_text", "text": ""}]  # type: ignore[list-item]
                 ),
             )
@@ -1241,10 +1234,10 @@ class FullDuplexRealtimeConnection:
         # (confirmed in production logs, audio_end_ms=6201 on an item that
         # had already been dropped here).
         drop_message_item = (
-            not cancelled
-            and total_audio_samples == 0
-            and not (full_text or full_transcript)
-            and bool(pending_tool_calls)
+            not ctx.cancelled
+            and ctx.total_audio_samples == 0
+            and not (ctx.full_text or ctx.full_transcript)
+            and bool(ctx.pending_tool_calls)
         )
 
         # The placeholder inserted at response.output_item.added time is
@@ -1262,7 +1255,7 @@ class FullDuplexRealtimeConnection:
         # why): conversation.item.created below still uses the audio-less
         # history_item, only s.items/the /tmp dump gets this richer copy.
         stored_item = history_item
-        if is_audio and full_audio_chunks:
+        if ctx.is_audio and ctx.full_audio_chunks:
             # Constructing via model_copy(update=...) here (like item_obj
             # above) would NOT validate/coerce stored_content's raw dicts
             # into Content objects -- _assistant_item_text's attribute-based
@@ -1270,7 +1263,7 @@ class FullDuplexRealtimeConnection:
             # this item on every later prompt build, exactly the bug class
             # called out at item_obj's construction above. Use the
             # validating constructor instead.
-            full_audio_b64 = self._pcm16_b64(np.concatenate(full_audio_chunks))
+            full_audio_b64 = self._pcm16_b64(np.concatenate(ctx.full_audio_chunks))
             stored_content = [
                 part.model_dump() | ({"audio": full_audio_b64} if getattr(part, "type", None) == "output_audio" else {})
                 for part in history_item.content
@@ -1283,14 +1276,14 @@ class FullDuplexRealtimeConnection:
                 content=stored_content,  # type: ignore[arg-type]
             )
 
-        chain_after = previous_item_id
-        if s.find_item_index(item_id) is not None:
+        chain_after = ctx.previous_item_id
+        if s.find_item_index(ctx.item_id) is not None:
             if drop_message_item:
-                s.remove_item(item_id)
+                s.remove_item(ctx.item_id)
             else:
-                s.insert_item(stored_item, previous_item_id=previous_item_id or "root")
+                s.insert_item(stored_item, previous_item_id=ctx.previous_item_id or "root")
                 if item_obj.id:
-                    s.item_duration_ms[item_obj.id] = total_audio_samples / SAMPLE_RATE_HZ * 1000
+                    s.item_duration_ms[item_obj.id] = ctx.total_audio_samples / SAMPLE_RATE_HZ * 1000
                     # Skip storing for tool-call responses: full_token_ids is
                     # the raw thinker stream (tool-call tags included), but
                     # this item's transcript/text is the tool-parser-stripped
@@ -1298,13 +1291,13 @@ class FullDuplexRealtimeConnection:
                     # so _qwen3_omni_truncate_transcript falls back to
                     # blanking (today's behavior) rather than risk splicing
                     # raw <tool_call> text into a truncated transcript.
-                    if not pending_tool_calls:
-                        s.item_token_ids[item_obj.id] = full_token_ids
+                    if not ctx.pending_tool_calls:
+                        s.item_token_ids[item_obj.id] = ctx.full_token_ids
                 await self._send_event(
                     types.ConversationItemCreatedEvent(
                         event_id=_gen_id("evt"),
                         type="conversation.item.created",
-                        previous_item_id=previous_item_id,
+                        previous_item_id=ctx.previous_item_id,
                         item=history_item,  # type: ignore[arg-type]
                     )
                 )
@@ -1317,14 +1310,14 @@ class FullDuplexRealtimeConnection:
             # _handle_item_truncate). Clearing item_in_progress first means
             # a truncate arriving from here on goes straight through
             # _handle_item_truncate's normal, non-deferred path.
-            s.item_in_progress.pop(item_id, None)
-            pending_ms = s.pending_truncations_ms.get(item_id)
+            s.item_in_progress.pop(ctx.item_id, None)
+            pending_ms = s.pending_truncations_ms.get(ctx.item_id)
             if pending_ms is not None:
                 await self._do_item_truncate(
                     types.ConversationItemTruncateEvent(
                         event_id=_gen_id("evt"),
                         type="conversation.item.truncate",
-                        item_id=item_id,
+                        item_id=ctx.item_id,
                         content_index=0,
                         audio_end_ms=pending_ms,
                     )
@@ -1335,7 +1328,7 @@ class FullDuplexRealtimeConnection:
         # can ever be truncated, so there's no client action that could race
         # ahead and remove one of these before we get here.
         function_call_items: list[types.RealtimeConversationItemFunctionCall] = []
-        for entry in pending_tool_calls.values():
+        for entry in ctx.pending_tool_calls.values():
             await self._send_event(
                 types.ResponseFunctionCallArgumentsDoneEvent(
                     event_id=_gen_id("evt"),
@@ -1354,7 +1347,7 @@ class FullDuplexRealtimeConnection:
                 call_id=entry["call_id"],
                 name=entry["name"] or "",
                 arguments=entry["arguments"],
-                status="completed" if not cancelled else "incomplete",
+                status="completed" if not ctx.cancelled else "incomplete",
             )
             await self._send_event(
                 types.ResponseOutputItemDoneEvent(
@@ -1377,10 +1370,10 @@ class FullDuplexRealtimeConnection:
             chain_after = fc_item.id
             function_call_items.append(fc_item)
 
-        usage.total_tokens = usage.input_tokens + usage.output_tokens
+        ctx.usage.total_tokens = ctx.usage.input_tokens + ctx.usage.output_tokens
 
         status_details = None
-        if cancelled:
+        if ctx.cancelled:
             status_details = {
                 "type": "cancelled",
                 "reason": "client_cancelled",
@@ -1399,9 +1392,9 @@ class FullDuplexRealtimeConnection:
             output_modalities=s.config.output_modalities,
             max_output_tokens=s.config.max_output_tokens,
             usage={  # type: ignore[arg-type]
-                "total_tokens": usage.total_tokens,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
+                "total_tokens": ctx.usage.total_tokens,
+                "input_tokens": ctx.usage.input_tokens,
+                "output_tokens": ctx.usage.output_tokens,
             },
         )
 
@@ -1412,6 +1405,69 @@ class FullDuplexRealtimeConnection:
                 response=done_response,
             )
         )
+
+    async def _run_response_inner(self, response_id, response_cfg, s, active):
+        # Captured now, before anything else can mutate session.items (e.g.
+        # a new input_audio_buffer.commit landing while this response is
+        # still generating) -- this is where the item this response produces
+        # actually belongs chronologically, not wherever s.items happens to
+        # end at completion time.
+        previous_item_id = s.items[-1].id if s.items else None
+
+        modalities = s.config.output_modalities
+        if response_cfg is not None and getattr(response_cfg, "output_modalities", None) is not None:
+            modalities = response_cfg.output_modalities
+        is_audio = "audio" in modalities
+
+        tools, tool_choice = self._resolve_tools_and_choice(s, response_cfg)
+
+        prompt = await self._build_full_prompt(tools=tools)
+
+        ctx = await self._begin_response_item(
+            response_id,
+            is_audio=is_audio,
+            previous_item_id=previous_item_id,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+
+        sampling_params_list = list(self.engine.default_sampling_params_list)
+        structural_tag_applied = False
+        for sp in sampling_params_list:
+            if isinstance(sp, SamplingParams):
+                sp.output_kind = RequestOutputKind.DELTA
+                # Only the first real (text/thinker) stage generates the
+                # <tool_call> JSON that needs constraining -- later stages
+                # (talker, codec) get their own SamplingParams untouched.
+                if not structural_tag_applied and ctx.structural_tag_json is not None:
+                    sp.structured_outputs = StructuredOutputsParams(structural_tag=ctx.structural_tag_json)
+                    structural_tag_applied = True
+
+        gen = self.engine.generate(
+            prompt=prompt,
+            request_id=active.request_id,
+            sampling_params_list=sampling_params_list,
+        )
+
+        try:
+            async for output in gen:
+                if not self._connected:
+                    ctx.cancelled = True
+                    break
+                finished = await self._process_output_chunk(output, ctx, response_id)
+                if finished:
+                    break
+        except asyncio.CancelledError:
+            ctx.cancelled = True
+        finally:
+            aclose = getattr(gen, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    logger.debug("Error closing generator for %s", active.request_id, exc_info=True)
+
+        await self._finalize_response_item(response_id, ctx)
 
     # ------------------------------------------------------------------ #
     #  response.cancel                                                    #
@@ -1827,9 +1883,7 @@ class FullDuplexRealtimeConnection:
                 )
                 continue
             if item.type == "function_call_output":
-                messages.append(
-                    {"role": "tool", "tool_call_id": item.call_id, "content": item.output}
-                )
+                messages.append({"role": "tool", "tool_call_id": item.call_id, "content": item.output})
                 continue
 
             role = getattr(item, "role", None)
@@ -1963,9 +2017,7 @@ class FullDuplexRealtimeConnection:
             self._append_event_jsonl("send", data)
             await self.ws.send_text(json.dumps(data))
         except Exception:
-            logger.warning(
-                "[realtime] send failed, marking connection dead: %s", data.get("type"), exc_info=True
-            )
+            logger.warning("[realtime] send failed, marking connection dead: %s", data.get("type"), exc_info=True)
             self._connected = False
 
     async def _send_json(self, payload: dict) -> None:
@@ -1975,9 +2027,7 @@ class FullDuplexRealtimeConnection:
             self._append_event_jsonl("send", payload)
             await self.ws.send_text(json.dumps(payload))
         except Exception:
-            logger.warning(
-                "[realtime] send failed, marking connection dead: %s", payload.get("type"), exc_info=True
-            )
+            logger.warning("[realtime] send failed, marking connection dead: %s", payload.get("type"), exc_info=True)
             self._connected = False
 
     async def _send_error(
