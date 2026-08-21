@@ -1714,6 +1714,28 @@ class FullDuplexRealtimeConnection:
                         # generate().
                         continue
                     response_id = _gen_id("resp")
+                    # The model sampling <|speak|> is this mode's "VAD stop
+                    # event" (spec's create_response semantics) -- the same
+                    # response.created a client-driven response.create gets
+                    # (_handle_response_create) is owed here too, before any
+                    # item/content-added events, per
+                    # RealtimeClientEventResponseCreate's documented order.
+                    await self._send_event(
+                        types.ResponseCreatedEvent(
+                            event_id=_gen_id("evt"),
+                            type="response.created",
+                            response=types.RealtimeResponse(
+                                id=response_id,
+                                object="realtime.response",
+                                status="in_progress",
+                                output=[],
+                                conversation_id=s.conversation_id,
+                                output_modalities=s.config.output_modalities,
+                                max_output_tokens=s.config.max_output_tokens,
+                                metadata=None,
+                            ),
+                        )
+                    )
                     previous_item_id = s.items[-1].id if s.items else None
                     ctx = await self._begin_response_item(
                         response_id,
