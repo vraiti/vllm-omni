@@ -1740,6 +1740,14 @@ class FullDuplexRealtimeConnection:
                 # this segment truly won't resume, unlike an ordinary
                 # chunk-boundary pause.
                 is_chunk_pause = first_out is not None and first_out.stop_reason is not None
+                if is_chunk_pause:
+                    # The terminator that caused this pause is already in
+                    # the KV sequence (ordinary sampled/forced output token,
+                    # unlike the reference's deferred-feed optimization) --
+                    # only </unit> itself still needs to land, and it's
+                    # accumulated here rather than submitted standalone; see
+                    # _submit_native_vad_audio_chunk.
+                    self._pending_unit_close = True
                 if self._turn_eos_token_id in new_token_ids or (finished and not is_chunk_pause):
                     # finished=True without a turn_eos token means the
                     # engine ended this segment's generation before the
