@@ -628,6 +628,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         Discards the last sampled output token from the prior input chunk at stage 0.
         """
         req_id = session.request_id
+        logger.info(
+            "[SCHED_TRACE_LOG] _update_request_as_session req=%s status_before=%s new_prompt_len=%s stage=%s",
+            req_id,
+            session.status,
+            len(update.prompt_token_ids),
+            self.vllm_config.model_config.stage_id,
+        )
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         # Seed the stale share in SCHEDULED-token units (see the segment-stop

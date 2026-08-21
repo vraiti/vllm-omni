@@ -472,6 +472,13 @@ class Orchestrator:
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
+        logger.info(
+            "[ORCH_TRACE_LOG] add_request stage=%s req=%s resumable=%s final_stage=%s",
+            stage_id,
+            request_id,
+            req_state.streaming.enabled,
+            final_stage_id,
+        )
         req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
@@ -519,6 +526,11 @@ class Orchestrator:
             req_state.sampling_params_list = msg.sampling_params_list
 
         req_state.streaming.enabled = True
+        logger.info(
+            "[ORCH_TRACE_LOG] streaming_update stage=%s req=%s",
+            stage_id,
+            request_id,
+        )
         req_state.stage_submit_ts[stage_id] = _time.time()
         if not await self._dispatch_or_fail_request(
             lambda: self.stage_pools[stage_id].submit_update(
@@ -817,6 +829,19 @@ class Orchestrator:
             if getattr(output, "error", None) is not None:
                 await self._handle_stage_error(stage_id, output)
                 continue
+
+            if req_state.streaming.enabled:
+                new_token_ids = getattr(output, "new_token_ids", None)
+                logger.info(
+                    "[ORCH_TRACE_LOG] processed_output stage=%s req=%s finished=%s "
+                    "finish_reason=%s stop_reason=%s num_new_tokens=%s",
+                    stage_id,
+                    output.request_id,
+                    output.finished,
+                    getattr(output, "finish_reason", None),
+                    getattr(output, "stop_reason", None),
+                    len(new_token_ids) if new_token_ids is not None else None,
+                )
 
             stage_metrics = None
             segment_finished = req_state.streaming.enabled and req_state.streaming.segment_finished

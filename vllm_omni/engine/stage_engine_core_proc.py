@@ -56,6 +56,12 @@ class StageEngineCoreProc(EngineCoreProc):
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
+        logger.info(
+            "[STAGE_PROC_TRACE_LOG] preprocess_add_request req=%s resumable=%s num_prompt_tokens=%s",
+            request.request_id,
+            getattr(request, "resumable", None),
+            len(getattr(request, "prompt_token_ids", None) or ()),
+        )
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
