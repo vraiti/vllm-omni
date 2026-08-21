@@ -56,7 +56,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
-from vllm_omni.experimental.fullduplex.client import (
+from vllm_omni.benchmarks.patch.realtime_client import (
     RealtimeDuplexClient,
     summarize_session_request_metrics,
     wait_for,
@@ -255,7 +255,7 @@ def get_samples(args, tokenizer):
     is_omni_backend = args.backend in [
         "openai-chat-omni",
         "openai-audio-speech",
-        "openai-realtime-duplex",
+        "openai-realtime-tts",
         "daily-omni",
     ]
     is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name == "random-mm"
@@ -380,14 +380,12 @@ def get_samples(args, tokenizer):
         if args.backend not in (
             "openai-audio-speech",
             "openai-chat-omni",
-            "openai-realtime-duplex",
             "openai-realtime-tts",
         ):
             raise ValueError(
                 "Seed-TTS requires --backend openai-audio-speech (POST /v1/audio/speech) or "
                 "--backend openai-chat-omni (POST /v1/chat/completions with ref_audio/ref_text), or "
-                "--backend openai-realtime-duplex or openai-realtime-tts "
-                "(WebSocket /v1/realtime). "
+                "--backend openai-realtime-tts (WebSocket /v1/realtime). "
                 f"Got backend={args.backend!r}."
             )
         repo_id = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
@@ -397,10 +395,7 @@ def get_samples(args, tokenizer):
                 "--hf-name for the Hub dataset id."
             )
         turns_per_session = int(getattr(args, "seed_tts_turns_per_session", 1))
-        if turns_per_session > 1 and args.backend not in {
-            "openai-realtime-duplex",
-            "openai-realtime-tts",
-        }:
+        if turns_per_session > 1 and args.backend != "openai-realtime-tts":
             raise ValueError(
                 f"--seed-tts-turns-per-session > 1 requires a Realtime Seed-TTS backend. Got backend={args.backend!r}."
             )
@@ -1320,7 +1315,7 @@ def _realtime_websocket_url(api_url: str) -> str:
     return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
-async def async_request_openai_realtime_duplex(
+async def async_request_openai_realtime_tts(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
@@ -1355,8 +1350,6 @@ async def async_request_openai_realtime_duplex(
                     "seed_tts_system_prompt",
                     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
                 ),
-                native_duplex=False,
-                auto_response=False,
                 extra_body=speech_extra,
                 session_id=session_id,
                 timeout_s=120.0,
@@ -1494,10 +1487,7 @@ ASYNC_REQUEST_FUNCS["openai-audio-speech"] = async_request_openai_audio_speech
 if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-audio-speech")
 
-ASYNC_REQUEST_FUNCS["openai-realtime-duplex"] = async_request_openai_realtime_duplex
-if "openai-realtime-duplex" not in OPENAI_COMPATIBLE_BACKENDS:
-    OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-duplex")
-ASYNC_REQUEST_FUNCS["openai-realtime-tts"] = async_request_openai_realtime_duplex
+ASYNC_REQUEST_FUNCS["openai-realtime-tts"] = async_request_openai_realtime_tts
 if "openai-realtime-tts" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-tts")
 

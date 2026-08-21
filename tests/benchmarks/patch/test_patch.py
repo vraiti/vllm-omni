@@ -18,9 +18,9 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     async_request_openai_chat_omni_completions,
-    async_request_openai_realtime_duplex,
+    async_request_openai_realtime_tts,
 )
-from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
+from vllm_omni.benchmarks.patch.realtime_client import RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -49,7 +49,7 @@ class MockResponse:
 
 
 @pytest.mark.asyncio
-async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch):
+async def test_seed_tts_realtime_tts_exports_per_request_metrics(monkeypatch):
     class FakeRealtimeClient:
         last_instance = None
 
@@ -134,13 +134,12 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
         SimpleNamespace(utterance_id=f"utt-{index}", target_text=f"text {index}") for index in range(4)
     )
 
-    output = await async_request_openai_realtime_duplex(
+    output = await async_request_openai_realtime_tts(
         request_input,
         session=None,
     )
 
     client = FakeRealtimeClient.last_instance
-    assert client.configure_kwargs["native_duplex"] is False
     assert client.configure_kwargs["extra_body"] == {
         "ref_audio": "data:audio/wav;base64,AAAA",
     }
