@@ -11,16 +11,15 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionToolsParam
+from vllm.inputs import TokensPrompt
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams, StructuredOutputsParams
 from vllm.tool_parsers import ToolParserManager
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
-
-    from vllm.engine.protocol import StreamingInput
-    from vllm.inputs import TokensPrompt
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.realtime import types
@@ -53,6 +52,49 @@ MINICPMO_AUDIO_PLACEHOLDER = "(<audio>./</audio>)"
 MINICPMO_LISTEN_TOKEN = "<|listen|>"
 MINICPMO_SPEAK_TOKEN = "<|speak|>"
 MINICPMO_TURN_EOS_TOKEN = "<|turn_eos|>"
+
+# MiniCPM-o 4.5 also caps how many tokens it will freely sample per ~1s
+# input audio chunk before forcing <|chunk_eos|> (reference:
+# streaming_generate's max_new_speak_tokens_per_chunk=20, distinct from
+# turn control above -- see chunk_eos_logits_processor.py for why this is
+# enforced via a stage-registered LogitsProcessor rather than here).
+MINICPMO_CHUNK_EOS_TOKEN = "<|chunk_eos|>"
+MINICPMO_MAX_NEW_TOKENS_PER_CHUNK = 20
+
+# The reference's per-chunk decode loop (streaming_generate) breaks out --
+# ending that call so the caller can feed the next audio chunk -- on any of
+# chunk_terminator_token_ids = [listen, chunk_eos, chunk_tts_eos]. <|turn_eos|>
+# is NOT one of these: it only closes a spoken turn (end_of_turn=True) and the
+# same per-chunk call keeps decoding past it. Configured as this request's
+# SamplingParams.stop_token_ids (_run_streaming_session), these three let
+# vLLM's own resumable-request machinery (Request.resumable,
+# RequestStatus.WAITING_FOR_STREAMING_REQ, scheduler.py's
+# _handle_stopped_request) pause the request between chunks instead of
+# connection.py driving pause/resume by hand.
+MINICPMO_CHUNK_TTS_EOS_TOKEN = "<|chunk_tts_eos|>"
+
+# One streaming_generate call (and therefore one round of the chunk-terminator
+# stop/resume cycle above) corresponds to exactly one second of input audio in
+# the reference (modeling_minicpmo_unified.py:1126, `chunk_size = sample_rate`)
+# -- the model was never trained to make a listen/speak decision over less.
+# _handle_audio_append accumulates raw client PCM16 into
+# self._native_vad_audio_buffer up to this many bytes before submitting a
+# StreamingInput, regardless of how small/frequent the client's own
+# input_audio_buffer.append events are.
+MINICPMO_CHUNK_SECONDS = 1.0
+MINICPMO_CHUNK_BYTES = int(SAMPLE_RATE_HZ * MINICPMO_CHUNK_SECONDS) * BYTES_PER_SAMPLE_PCM16
+
+# Structural framing the reference wraps every chunk in --
+# <unit>[audio embed][listen/speak + content][terminator]</unit> -- fed by
+# streaming_prefill (opens <unit> before the chunk's audio embed) and
+# finalize_unit (closes </unit> after the chunk-terminator, once
+# streaming_generate has returned). Our engine already appends the sampled
+# terminator token to the KV sequence itself (no "defer the feed" step like
+# the reference's), so all connection.py needs to add is the </unit><unit>
+# pair around each chunk boundary -- see _submit_native_vad_audio_chunk and
+# _pending_unit_close.
+MINICPMO_UNIT_OPEN_TOKEN = "<unit>"
+MINICPMO_UNIT_CLOSE_TOKEN = "</unit>"
 
 # Dev-only debug artifacts (WS event JSONL, conversation history dumps) --
 # not for production use. One subdirectory per connection.
@@ -255,9 +297,29 @@ class FullDuplexRealtimeConnection:
         # _start_streaming_session/_run_streaming_session.
         self._streaming_request_id: str | None = None
         self._streaming_queue: asyncio.Queue | None = None
+        # Raw PCM16 bytes accumulated by _handle_audio_append until a full
+        # MINICPMO_CHUNK_SECONDS worth is available -- see that constant's
+        # comment for why the model needs whole ~1s chunks, not whatever
+        # granularity the client's input_audio_buffer.append events arrive
+        # in. Not reset across _restart_streaming_session: unsent audio the
+        # user already spoke is still real input and belongs in whichever
+        # session is current once a full chunk accumulates.
+        self._native_vad_audio_buffer = bytearray()
         self._listen_token_id: int | None = None
         self._speak_token_id: int | None = None
         self._turn_eos_token_id: int | None = None
+        self._chunk_eos_token_id: int | None = None
+        self._chunk_tts_eos_token_id: int | None = None
+        self._unit_open_token_id: int | None = None
+        self._unit_close_token_id: int | None = None
+        # Set by _run_streaming_session when a chunk-terminator pause is
+        # detected (is_chunk_pause); consumed by the next
+        # _submit_native_vad_audio_chunk call, which prepends </unit>
+        # (closing the just-paused chunk) before its own <unit> (opening
+        # the new one) -- accumulating the close instead of submitting it
+        # the moment the pause fires, since there's nothing to combine it
+        # with until the next full audio chunk is ready anyway.
+        self._pending_unit_close: bool = False
 
         self._log_dir = _allocate_log_dir()
         self._events_log_path = self._log_dir / "events.jsonl"
@@ -490,27 +552,52 @@ class FullDuplexRealtimeConnection:
             return
 
         if self.supports_native_vad:
-            # Model-driven turn control: no buffer-until-commit -- each
-            # chunk becomes a StreamingInput pushed onto the persistent
+            # Model-driven turn control: no buffer-until-commit -- accumulate
+            # into MINICPMO_CHUNK_BYTES-sized chunks (see that constant's
+            # comment for why the model needs whole ~1s chunks regardless of
+            # the client's own input_audio_buffer.append granularity) before
+            # each becomes a StreamingInput pushed onto the persistent
             # request's queue (APPEND, see spec/ASYNC_OMNI_SPEC.md). The
-            # first chunk of the connection starts the session (CREATE).
-            from vllm.engine.protocol import StreamingInput
-            from vllm.inputs import TokensPrompt
-
-            pcm16 = np.frombuffer(audio_bytes, dtype=np.int16)
-            audio_f32 = pcm16.astype(np.float32) / 32768.0
-            raw_tok = getattr(self._tokenizer, "tokenizer", self._tokenizer)
-            token_ids = raw_tok.encode(MINICPMO_AUDIO_PLACEHOLDER, add_special_tokens=False)
-            chunk_prompt = TokensPrompt(
-                prompt_token_ids=token_ids,
-                multi_modal_data={"audio": [(audio_f32, SAMPLE_RATE_HZ)]},
-            )
-            if self._streaming_queue is None:
-                await self._start_streaming_session()
-            await self._streaming_queue.put(StreamingInput(prompt=chunk_prompt))
+            # connection's first full chunk starts the session (CREATE).
+            self._native_vad_audio_buffer.extend(audio_bytes)
+            while len(self._native_vad_audio_buffer) >= MINICPMO_CHUNK_BYTES:
+                chunk_bytes = bytes(self._native_vad_audio_buffer[:MINICPMO_CHUNK_BYTES])
+                del self._native_vad_audio_buffer[:MINICPMO_CHUNK_BYTES]
+                await self._submit_native_vad_audio_chunk(chunk_bytes)
             return
 
         self.session.input_audio_buffer.extend(audio_bytes)
+
+    async def _submit_native_vad_audio_chunk(self, audio_bytes: bytes) -> None:
+        """Push one MINICPMO_CHUNK_BYTES-sized slice as a StreamingInput onto
+        the persistent request's queue (APPEND), starting the session
+        (CREATE) first if this is the connection's first chunk.
+
+        Every chunk opens with <unit> (streaming_prefill's framing -- see
+        MINICPMO_UNIT_OPEN_TOKEN's comment). If the previous chunk ended in
+        a pause (_pending_unit_close, set by _run_streaming_session), this
+        is also the first opportunity to close it out: </unit> is prepended
+        here rather than submitted on its own the moment the pause fired,
+        since there's nothing to combine it with until this next chunk is
+        ready anyway.
+        """
+        self._resolve_streaming_turn_tokens()
+        pcm16 = np.frombuffer(audio_bytes, dtype=np.int16)
+        audio_f32 = pcm16.astype(np.float32) / 32768.0
+        raw_tok = getattr(self._tokenizer, "tokenizer", self._tokenizer)
+        prefix_ids = []
+        if self._pending_unit_close:
+            prefix_ids.append(self._unit_close_token_id)
+            self._pending_unit_close = False
+        prefix_ids.append(self._unit_open_token_id)
+        placeholder_ids = raw_tok.encode(MINICPMO_AUDIO_PLACEHOLDER, add_special_tokens=False)
+        chunk_prompt = TokensPrompt(
+            prompt_token_ids=prefix_ids + placeholder_ids,
+            multi_modal_data={"audio": [(audio_f32, SAMPLE_RATE_HZ)]},
+        )
+        if self._streaming_queue is None:
+            await self._start_streaming_session()
+        await self._streaming_queue.put(StreamingInput(prompt=chunk_prompt))
 
     def _commit_audio_buffer(self) -> types.RealtimeConversationItemUserMessage | None:
         """Turn whatever's in input_audio_buffer into a new ConversationItem.
@@ -1074,10 +1161,13 @@ class FullDuplexRealtimeConnection:
 
         Returns True once this response's text AND (if applicable) audio
         streams have both reached finish_reason. The per-turn caller
-        (_run_response_inner) breaks its loop on this; the
-        persistent-streaming caller (_run_streaming_session) ignores the
-        return value -- finish_reason never fires mid-session there -- and
-        instead ends a response on the model's own turn-end token.
+        (_run_response_inner) breaks its loop on this. The
+        persistent-streaming caller (_run_streaming_session) also gets
+        finish_reason set on ordinary per-audio-chunk pauses now (see
+        MINICPMO_CHUNK_TTS_EOS_TOKEN's comment) -- it disambiguates those
+        from a real finish via stop_reason before trusting this return
+        value, and otherwise ends a response on the model's own turn-end
+        token.
         """
         s = self.session
         output_type = getattr(output, "final_output_type", "text")
@@ -1493,6 +1583,10 @@ class FullDuplexRealtimeConnection:
         self._listen_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_LISTEN_TOKEN)
         self._speak_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_SPEAK_TOKEN)
         self._turn_eos_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_TURN_EOS_TOKEN)
+        self._chunk_eos_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_CHUNK_EOS_TOKEN)
+        self._chunk_tts_eos_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_CHUNK_TTS_EOS_TOKEN)
+        self._unit_open_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_UNIT_OPEN_TOKEN)
+        self._unit_close_token_id = raw_tok.convert_tokens_to_ids(MINICPMO_UNIT_CLOSE_TOKEN)
 
     async def _stream_source(self, queue: asyncio.Queue) -> AsyncGenerator[StreamingInput, None]:
         """Pull StreamingInput chunks off queue for AsyncOmni.generate()'s
@@ -1512,8 +1606,6 @@ class FullDuplexRealtimeConnection:
         per-turn prompt (_build_full_prompt); live audio appended after
         that (_handle_audio_append) is pushed onto self._streaming_queue as
         further chunks."""
-        from vllm.engine.protocol import StreamingInput
-
         self._resolve_streaming_turn_tokens()
         seed_prompt = await self._build_full_prompt()
         self._streaming_queue = asyncio.Queue()
@@ -1567,6 +1659,37 @@ class FullDuplexRealtimeConnection:
         for sp in sampling_params_list:
             if isinstance(sp, SamplingParams):
                 sp.output_kind = RequestOutputKind.DELTA
+        if sampling_params_list and isinstance(sampling_params_list[0], SamplingParams):
+            # Read by chunk_eos_logits_processor.py, registered on the
+            # thinker stage -- see MINICPMO_MAX_NEW_TOKENS_PER_CHUNK. Set
+            # only on the CREATE request: the per-chunk StreamingInput
+            # updates fall back to this same SamplingParams object
+            # (AsyncOmni._add_streaming_input_request's `chunk_params = ...
+            # or stage0_params`), and the logits processor's per-request
+            # state (keyed by batch index) persists for the request's
+            # whole lifetime regardless.
+            extra_args = dict(sampling_params_list[0].extra_args or {})
+            extra_args["minicpmo_chunk_eos"] = {
+                "chunk_eos_token_id": self._chunk_eos_token_id,
+                "max_new_tokens_per_chunk": MINICPMO_MAX_NEW_TOKENS_PER_CHUNK,
+            }
+            sampling_params_list[0].extra_args = extra_args
+            # chunk_terminator_token_ids (see MINICPMO_CHUNK_TTS_EOS_TOKEN's
+            # comment): sampling any of these sets FinishReason.STOP with a
+            # non-None stop_reason (the token id itself, per
+            # vllm/v1/core/sched/utils.py's check_stop) -- but because this
+            # request is resumable, _handle_stopped_request parks it as
+            # RequestStatus.WAITING_FOR_STREAMING_REQ instead of freeing it,
+            # and it resumes on the next StreamingInput chunk
+            # (_handle_audio_append) without connection.py needing to
+            # restart anything. stop_reason is exactly what
+            # _run_streaming_session's loop below uses to tell "just a
+            # chunk-boundary pause" apart from a real finish.
+            sampling_params_list[0].stop_token_ids = [
+                tid
+                for tid in (self._listen_token_id, self._chunk_eos_token_id, self._chunk_tts_eos_token_id)
+                if tid is not None
+            ]
 
         gen = self.engine.generate(
             prompt=self._stream_source(self._streaming_queue),
@@ -1608,13 +1731,21 @@ class FullDuplexRealtimeConnection:
                     # literal "<|speak|>" into the transcript in that case.
 
                 finished = await self._process_output_chunk(output, ctx, response_id)
-                if finished or self._turn_eos_token_id in new_token_ids:
-                    # finished=True (finish_reason fired, e.g. a stage's own
-                    # max_tokens) without a turn_eos token means the engine
-                    # ended this segment's generation before the model
-                    # itself decided to stop talking -- close the item out
-                    # defensively rather than leave it open with no more
-                    # chunks ever arriving for it.
+                # stop_reason is only ever set (to the matching token id) by
+                # check_stop's stop_token_ids branch -- i.e. exactly the
+                # chunk_terminator_token_ids pause configured as
+                # stop_token_ids above. finish_reason firing with
+                # stop_reason=None means something else ended generation
+                # (max_tokens, max_model_len, or a real eos_token_id) and
+                # this segment truly won't resume, unlike an ordinary
+                # chunk-boundary pause.
+                is_chunk_pause = first_out is not None and first_out.stop_reason is not None
+                if self._turn_eos_token_id in new_token_ids or (finished and not is_chunk_pause):
+                    # finished=True without a turn_eos token means the
+                    # engine ended this segment's generation before the
+                    # model itself decided to stop talking -- close the
+                    # item out defensively rather than leave it open with
+                    # no more chunks ever arriving for it.
                     await self._finalize_response_item(response_id, ctx)
                     ctx = None
                     response_id = None
@@ -2120,8 +2251,6 @@ class FullDuplexRealtimeConnection:
         persistent request whose KV cache carries history forward, so this
         function *is* the connection's memory of the conversation.
         """
-        from vllm.inputs import TokensPrompt
-
         s = self.session
         messages: list[dict[str, Any]] = []
         audio_arrays: list[tuple[np.ndarray, int]] = []

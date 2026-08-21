@@ -45,6 +45,12 @@ stages:
     max_model_len: 4096
     max_num_batched_tokens: 4096
     devices: "0,1,2,3"
+    # Caps freely-sampled tokens per audio chunk to match the reference
+    # streaming_generate loop's max_new_speak_tokens_per_chunk=20 -- only
+    # active for /v1/realtime requests that set extra_args["minicpmo_chunk_eos"]
+    # (see FullDuplexRealtimeConnection._run_streaming_session).
+    logits_processors:
+      - "vllm_omni.model_executor.models.minicpmo_4_5.chunk_eos_logits_processor:MiniCPMOChunkEosForceLogitsProcessor"
     interleave_mm_strings: true
     media_io_kwargs:
       video:
