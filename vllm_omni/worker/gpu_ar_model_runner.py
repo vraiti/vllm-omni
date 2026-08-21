@@ -7,6 +7,7 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
+import logging
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
@@ -2169,6 +2170,25 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+
+        # TOKEN_TRACE_LOG: grep this tag to find/remove this hook later.
+        # Covers both the LLM (thinker) and TTS (talker) stages -- both run
+        # StageExecutionType.LLM_AR through this same runner, just with
+        # different model instances/configs, so one hook here logs every
+        # token either samples. Deliberately logger.info (not .debug): kept
+        # visible without turning on every other DEBUG-level line in vLLM.
+        if logger.isEnabledFor(logging.INFO):
+            stage_id = getattr(self.vllm_config.model_config, "stage_id", None)
+            model_stage = getattr(self.vllm_config.model_config, "model_stage", None)
+            for req_id, token_ids in zip(req_ids_output_copy, valid_sampled_token_ids, strict=True):
+                if token_ids:
+                    logger.info(
+                        "[TOKEN_TRACE_LOG] stage=%s(%s) req=%s sampled=%s",
+                        stage_id,
+                        model_stage,
+                        req_id,
+                        token_ids,
+                    )
 
         multimodal_outputs = self._run_post_sample_talker_mtp(
             req_ids=req_ids_output_copy,
