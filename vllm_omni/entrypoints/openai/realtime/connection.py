@@ -560,6 +560,12 @@ class FullDuplexRealtimeConnection:
             # request's queue (APPEND, see spec/ASYNC_OMNI_SPEC.md). The
             # connection's first full chunk starts the session (CREATE).
             self._native_vad_audio_buffer.extend(audio_bytes)
+            logger.info(
+                "[CONN_TRACE_LOG] _handle_audio_append received=%d bytes, buffer_now=%d/%d bytes",
+                len(audio_bytes),
+                len(self._native_vad_audio_buffer),
+                MINICPMO_CHUNK_BYTES,
+            )
             while len(self._native_vad_audio_buffer) >= MINICPMO_CHUNK_BYTES:
                 chunk_bytes = bytes(self._native_vad_audio_buffer[:MINICPMO_CHUNK_BYTES])
                 del self._native_vad_audio_buffer[:MINICPMO_CHUNK_BYTES]
@@ -595,8 +601,17 @@ class FullDuplexRealtimeConnection:
             prompt_token_ids=prefix_ids + placeholder_ids,
             multi_modal_data={"audio": [(audio_f32, SAMPLE_RATE_HZ)]},
         )
-        if self._streaming_queue is None:
+        is_first_chunk = self._streaming_queue is None
+        if is_first_chunk:
             await self._start_streaming_session()
+        logger.info(
+            "[CONN_TRACE_LOG] _submit_native_vad_audio_chunk req=%s "
+            "first_chunk=%s num_prompt_tokens=%d queue_size_before_put=%d",
+            self._streaming_request_id,
+            is_first_chunk,
+            len(prefix_ids) + len(placeholder_ids),
+            self._streaming_queue.qsize(),
+        )
         await self._streaming_queue.put(StreamingInput(prompt=chunk_prompt))
 
     def _commit_audio_buffer(self) -> types.RealtimeConversationItemUserMessage | None:

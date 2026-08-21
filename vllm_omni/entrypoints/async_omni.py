@@ -486,7 +486,14 @@ class AsyncOmni(EngineClient, OmniBase):
             nonlocal has_submitted_first_chunk
             cancelled = False
             try:
+                logger.info("[ASYNC_OMNI_TRACE_LOG] handle_inputs req=%s: entering input_stream loop", request_id)
                 async for chunk in input_stream:
+                    logger.info(
+                        "[ASYNC_OMNI_TRACE_LOG] handle_inputs req=%s: got chunk from "
+                        "input_stream, has_submitted_first_chunk=%s",
+                        request_id,
+                        has_submitted_first_chunk,
+                    )
                     chunk_params = getattr(chunk, "sampling_params", None) or stage0_params
                     self._validate_streaming_input_sampling_params(chunk_params)
                     chunk_sampling_params_list = list(sampling_params_list)
@@ -519,9 +526,19 @@ class AsyncOmni(EngineClient, OmniBase):
                             lora_request=lora_request,
                             resumable=True,
                         )
+                logger.info(
+                    "[ASYNC_OMNI_TRACE_LOG] handle_inputs req=%s: input_stream exhausted normally (generator returned)",
+                    request_id,
+                )
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
+                logger.info("[ASYNC_OMNI_TRACE_LOG] handle_inputs req=%s: cancelled/GeneratorExit", request_id)
             except Exception as error:
+                logger.info(
+                    "[ASYNC_OMNI_TRACE_LOG] handle_inputs req=%s: exception %r",
+                    request_id,
+                    error,
+                )
                 status_code, error_type = client_error_metadata(error)
                 await req_state.queue.put(
                     ErrorMessage(
