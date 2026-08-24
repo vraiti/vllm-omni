@@ -584,10 +584,12 @@ def _install_call_tracer() -> None:
 
     def _tracer(frame, event, arg):
         if event == "call":
-            print(
-                f"[CALLTRACE] {frame.f_code.co_filename}:{frame.f_lineno} {frame.f_code.co_name}",
-                flush=True,
-            )
+            filename = frame.f_code.co_filename
+            if (os.sep + "vllm_omni" + os.sep) in filename or (os.sep + "vllm" + os.sep) in filename:
+                print(
+                    f"[CALLTRACE] {filename}:{frame.f_lineno} {frame.f_code.co_name}",
+                    flush=True,
+                )
         return _tracer
 
     sys.settrace(_tracer)
