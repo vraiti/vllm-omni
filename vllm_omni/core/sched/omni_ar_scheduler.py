@@ -244,6 +244,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting = original_waiting
             self._restore_omni_wait_queues()
 
+        if scheduler_output.num_scheduled_tokens:
+            logger.info(
+                "[SCHED_TRACE_LOG] schedule() stage=%s scheduled=%s waiting=%d running=%d skipped_waiting=%d",
+                self.vllm_config.model_config.stage_id,
+                scheduler_output.num_scheduled_tokens,
+                len(self.waiting),
+                len(self.running),
+                len(self.skipped_waiting),
+            )
+
         self._postprocess_omni_schedule_output(
             scheduler_output,
             include_cached_payloads=True,

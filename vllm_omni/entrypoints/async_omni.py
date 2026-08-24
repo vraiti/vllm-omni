@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import traceback
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -448,11 +449,21 @@ class AsyncOmni(EngineClient, OmniBase):
                 input_stream_task.cancel()
             self._fire_failure_counter_if_alive(request_id)
             await self._abort_internal_requests(request_id)
+            logger.info(
+                "[ASYNC_OMNI_TRACE_LOG] generate() req=%s CancelledError/GeneratorExit -- stack at raise point:\n%s",
+                request_id,
+                "".join(traceback.format_stack()),
+            )
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
             self._fire_failure_counter_if_alive(request_id)
             await self._abort_internal_requests(request_id)
+            logger.info(
+                "[ASYNC_OMNI_TRACE_LOG] generate() req=%s exception: %s",
+                request_id,
+                traceback.format_exc(),
+            )
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
 
