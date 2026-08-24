@@ -186,6 +186,9 @@ def tts2code2wav_async_chunk(
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """Stream request-owned MiniCPM-o codec windows to Code2Wav."""
+    import traceback
+
+    print("[CALLTRACE tts2code2wav_async_chunk] " + "".join(traceback.format_stack()), flush=True)
     external_id = getattr(request, "external_req_id", None)
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
