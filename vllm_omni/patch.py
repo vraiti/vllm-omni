@@ -597,15 +597,18 @@ def _install_call_tracer() -> None:
         return _tracer
 
     def _drain_loop() -> None:
-        while True:
-            time.sleep(1)
-            with lock:
-                if not buffer:
-                    continue
-                chunk = bytes(buffer)
-                buffer.clear()
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.flush()
+        log_path = f"/tmp/logs/vllm-{os.getpid()}-trace.log"
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "ab") as log_fh:
+            while True:
+                time.sleep(1)
+                with lock:
+                    if not buffer:
+                        continue
+                    chunk = bytes(buffer)
+                    buffer.clear()
+                log_fh.write(chunk)
+                log_fh.flush()
 
     sys.settrace(_tracer)
     threading.settrace(_tracer)
