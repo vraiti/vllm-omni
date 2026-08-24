@@ -588,11 +588,7 @@ def _install_call_tracer() -> None:
         if event == "call":
             name = frame.f_code.co_name
             filename = frame.f_code.co_filename
-            if (
-                "<" not in name
-                and "model_executor" not in filename
-                and ((os.sep + "vllm_omni" + os.sep) in filename or (os.sep + "vllm" + os.sep) in filename)
-            ):
+            if "<" not in name and "vllm" in filename and "model_executor" not in filename:
                 line = f"[CALLTRACE] {filename}:{frame.f_lineno} {name}\n".encode()
                 with lock:
                     buffer.extend(line)
