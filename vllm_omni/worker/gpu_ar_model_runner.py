@@ -2180,7 +2180,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if logger.isEnabledFor(logging.INFO):
             stage_id = getattr(self.vllm_config.model_config, "stage_id", None)
             model_stage = getattr(self.vllm_config.model_config, "model_stage", None)
-            for req_id, token_ids in zip(req_ids_output_copy, valid_sampled_token_ids, strict=True):
+            for req_id, token_ids in zip(req_ids_output_copy, valid_sampled_token_ids):
                 if token_ids:
                     logger.info(
                         "[TOKEN_TRACE_LOG] stage=%s(%s) req=%s sampled=%s",
