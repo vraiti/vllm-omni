@@ -443,6 +443,9 @@ def thinker2talker_async_chunk(
     2. Split hidden states into: prompt embeddings + generated embeddings
     3. Package for talker with additional information
     """
+    import traceback
+
+    print("[CALLTRACE thinker2talker_async_chunk] " + "".join(traceback.format_stack()), flush=True)
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
