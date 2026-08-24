@@ -571,3 +571,28 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+
+# =============================================================================
+# TEMPORARY: sys.settrace call tracer for locating the async_chunk producer
+# invocation site (VLLM_OMNI_TRACE_CALLS=1). Not for permanent inclusion.
+# =============================================================================
+def _install_call_tracer() -> None:
+    if os.environ.get("VLLM_OMNI_TRACE_CALLS") != "1":
+        return
+    import threading
+
+    def _tracer(frame, event, arg):
+        if event == "call":
+            print(
+                f"[CALLTRACE] {frame.f_code.co_filename}:{frame.f_lineno} {frame.f_code.co_name}",
+                flush=True,
+            )
+        return _tracer
+
+    sys.settrace(_tracer)
+    threading.settrace(_tracer)
+    _PATCH_LOGGER.info("[calltrace] sys.settrace installed via VLLM_OMNI_TRACE_CALLS=1")
+
+
+_install_call_tracer()
