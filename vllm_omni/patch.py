@@ -581,6 +581,10 @@ def _install_call_tracer() -> None:
     if os.environ.get("VLLM_OMNI_TRACE_CALLS") != "1":
         return
     import threading
+    import time
+
+    buffer = bytearray()
+    lock = threading.Lock()
 
     def _tracer(frame, event, arg):
         if event == "call":
@@ -589,14 +593,25 @@ def _install_call_tracer() -> None:
             if "<" not in name and (
                 (os.sep + "vllm_omni" + os.sep) in filename or (os.sep + "vllm" + os.sep) in filename
             ):
-                print(
-                    f"[CALLTRACE] {filename}:{frame.f_lineno} {name}",
-                    flush=True,
-                )
+                line = f"[CALLTRACE] {filename}:{frame.f_lineno} {name}\n".encode()
+                with lock:
+                    buffer.extend(line)
         return _tracer
+
+    def _drain_loop() -> None:
+        while True:
+            time.sleep(1)
+            with lock:
+                if not buffer:
+                    continue
+                chunk = bytes(buffer)
+                buffer.clear()
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.flush()
 
     sys.settrace(_tracer)
     threading.settrace(_tracer)
+    threading.Thread(target=_drain_loop, name="omni-calltrace-drain", daemon=True).start()
     _PATCH_LOGGER.info("[calltrace] sys.settrace installed via VLLM_OMNI_TRACE_CALLS=1")
 
 
