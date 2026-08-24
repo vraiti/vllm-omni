@@ -575,11 +575,9 @@ _patch_cumem_free_callback_cuda()
 
 # =============================================================================
 # TEMPORARY: sys.settrace call tracer for locating the async_chunk producer
-# invocation site (VLLM_OMNI_TRACE_CALLS=1). Not for permanent inclusion.
+# invocation site. Not for permanent inclusion.
 # =============================================================================
 def _install_call_tracer() -> None:
-    if os.environ.get("VLLM_OMNI_TRACE_CALLS") != "1":
-        return
     import threading
     import time
 
