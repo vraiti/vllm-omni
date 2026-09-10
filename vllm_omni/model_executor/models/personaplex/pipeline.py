@@ -46,9 +46,9 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            # built by lead: talker emits a 17-row Mimi token stack per frame;
-            # these processors keep the PCM-bearing rows (cb 0..7) and flatten
-            # them codebook-major for the Code2Wav stage.
+            # built by lead: replay requests emit a 17-value logical frame_t
+            # per frame; the processor keeps the PCM-bearing agent rows and
+            # flattens them codebook-major for the Code2Wav stage.
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={

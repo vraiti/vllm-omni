@@ -126,10 +126,57 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
         ],
     )
 
-    assert codes.shape == (1, 16)
+    assert codes.shape == (1, 17)
     assert received["text_token"].tolist() == [101]
     assert received["hidden"].shape == (1, 1, 4)
     assert torch.equal(received["audio_tokens"], torch.arange(16).reshape(1, 16))
     assert torch.equal(received["audio_provided"], (torch.arange(16) > 0).reshape(1, 16))
     assert [(row[0], row[1].item()) for row in recorded] == [("r1", 101)]
-    assert torch.equal(recorded[0][2], codes[0])
+    assert codes[0, 0].item() == 101
+    assert torch.equal(codes[0, 1:9], recorded[0][2][:8])
+    assert torch.equal(codes[0, 9:], torch.zeros(8, dtype=torch.long))
+
+
+def test_full_payload_replays_logical_frame_history_and_prefill() -> None:
+    manager = SimpleNamespace()
+    request = SimpleNamespace(
+        external_req_id="internal-1",
+        request_id="internal-1",
+        additional_information=None,
+    )
+    prefill = torch.ones((3, 4), dtype=torch.float32)
+    first_frame = torch.cat(
+        [torch.tensor([10]), torch.arange(8), torch.arange(100, 108)],
+    ).reshape(1, 17)
+    second_frame = torch.cat(
+        [torch.tensor([11]), torch.arange(8, 16), torch.arange(108, 116)],
+    ).reshape(1, 17)
+
+    request.additional_information = {
+        "codes": {"audio": first_frame},
+        "embed": {"prefill": prefill},
+        "meta": {
+            "request_id": "session-1",
+            "chunk_seq": 1,
+            "cache_epoch": 0,
+        },
+    }
+    first = talker2code2wav_full_payload(transfer_manager=manager, request=request)
+    assert first.codes.audio.numel() == 1
+    assert torch.equal(first.embed.prefill, prefill)
+
+    request.additional_information = {
+        "codes": {"audio": second_frame},
+        "embed": {"prefill": prefill + 1},
+        "meta": {
+            "request_id": "session-1",
+            "chunk_seq": 2,
+            "cache_epoch": 0,
+        },
+    }
+    second = talker2code2wav_full_payload(transfer_manager=manager, request=request)
+    expected = torch.cat([first_frame[:, 1:9], second_frame[:, 1:9]], dim=0)
+    expected = expected[:, :].reshape(2, 8)
+    expected = torch.cat([expected[:-1, :1], expected[1:, 1:]], dim=1).reshape(-1)
+    assert torch.equal(second.codes.audio, expected)
+    assert torch.equal(second.embed.prefill, prefill + 1)

@@ -281,6 +281,25 @@ def test_request_id_falls_back_to_runtime_information() -> None:
     assert _audio(second).numel() == 4
 
 
+def test_runtime_request_id_alias_preserves_codec_state_across_ordinary_requests() -> None:
+    model, mimi = _model()
+    replay_info = [{"meta": {"request_id": "session-1", "codec_streaming": True}}]
+
+    first = model(input_ids=_codes(1), request_ids=["internal-1"], runtime_additional_information=replay_info)
+    second = model(
+        input_ids=_codes(1, start=10), request_ids=["internal-2"], runtime_additional_information=replay_info
+    )
+
+    assert _audio(first).numel() == 4
+    assert _audio(second).numel() == 4
+    assert model._request_codec_slots == {"session-1": 0}
+    assert model._request_codes["session-1"].shape == (2,)
+    assert mimi.decode_frame_calls == 2
+
+    model.on_requests_finished(["internal-1", "internal-2"])
+    assert model._request_codec_slots == {"session-1": 0}
+
+
 def test_decoder_slot_lifecycle_isolated_capacity_and_reuse() -> None:
     model, _ = _model(max_sessions=2)
     first = _FakeStreamingMimi(stream_value=10)

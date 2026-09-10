@@ -87,6 +87,16 @@ class AudioFullDuplexSessionState:
     pending_truncations_ms: dict[str, int] = field(default_factory=dict)
 
     input_audio_buffer: bytearray = field(default_factory=bytearray)
+    # PersonaPlex is served through ordinary AsyncOmni requests rather than a
+    # resumable scheduler request.  Keep its replay payload and frame-aligned
+    # PCM queue separate from the OpenAI turn buffer, whose bytes are consumed
+    # by input_audio_buffer.commit.
+    personaplex_audio_buffer: bytearray = field(default_factory=bytearray)
+    personaplex_prefill: Any | None = None
+    personaplex_frame_seq: int = 0
+    personaplex_epoch: int = 0
+    personaplex_prefill_slots: int | None = None
+    personaplex_session_started: bool = False
     active_response: ActiveResponse | None = None
 
     def find_item_index(self, item_id: str) -> int | None:

@@ -1,4 +1,4 @@
-# PersonaPlex deploy: talker -> code2wav (Mimi) via shared-memory chunk streaming.
+# PersonaPlex deploy: talker -> code2wav (Mimi) via shared-memory payloads.
 #
 # PersonaPlex is a Moshi finetune (full-duplex S2S), served offline as a 2-stage
 # audio->audio pipeline that reuses the Qwen3-TTS staged deploy layout. Fields
@@ -6,18 +6,20 @@
 # vllm_omni/config/stage_config.py).
 #
 # Notable choices for this model:
-#   * Stage 0 (talker) keeps a small max_num_batched_tokens for async-chunk
-#     first-chunk latency (not correctness).
+#   * The replay frontend submits one ordinary request per 80 ms frame. The
+#     full-payload processor retains the logical frame history and returns the
+#     flattened codec prefix needed by Stage 1.
 #   * Stage 1 (code2wav) wraps the external Mimi codec. Each codec frame is
 #     8 active codebooks (cb 0..7) -> 1920 PCM samples @ 24 kHz / 12.5 Hz.
 #   * Stage 0 runs cudagraph by default; Stage 1 (Mimi) is eager because the
 #     external decoder performs host-to-device copies that cannot be captured.
 pipeline: personaplex
-session_mode: duplex
-duplex_session:
-  max_sessions: 2
 
-async_chunk: true
+# The realtime replay path must select the full-payload producer and the
+# token-only Stage 1 input processor. The async-chunk producer remains in the
+# PersonaPlex pipeline for native duplex compatibility, but is not selected for
+# this deployment mode.
+async_chunk: false
 
 connectors:
   connector_of_shared_memory:
@@ -82,9 +84,3 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
-
-platforms:
-  npu:
-    stages:
-      - stage_id: 0
-        enforce_eager: false

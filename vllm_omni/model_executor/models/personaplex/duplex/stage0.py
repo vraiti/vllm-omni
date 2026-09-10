@@ -48,6 +48,9 @@ class PersonaPlexStage0SessionState:
     prepared: PersonaPlexStage0PreparedAppend | None = None
     last_seq: int = 0
     request_ids: set[str] = field(default_factory=set)
+    frame_history: list[Any] = field(default_factory=list)
+    retain_session: bool = False
+    close_after_request: bool = False
     codec: Any | None = None
 
 
@@ -141,6 +144,7 @@ class PersonaPlexStage0DuplexRuntime:
         *,
         prompt_len: int,
         request_id: str | None = None,
+        prefill: Any | None = None,
     ) -> PersonaPlexStage0PreparedAppend:
         import torch
 
@@ -186,7 +190,11 @@ class PersonaPlexStage0DuplexRuntime:
 
         runtime_config = duplex.get("runtime_config")
         runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
-        first_append = state.last_seq == 0
+        state.retain_session = state.retain_session or bool(
+            duplex.get("retain_session") is True or runtime_config.get("personaplex_replay") is True
+        )
+        state.close_after_request = state.close_after_request or duplex.get("close_session") is True
+        first_append = state.last_seq == 0 and prefill is None
         device, dtype = self._model_device_dtype()
         silence = torch.tensor(SILENCE_TOKENS, dtype=torch.long, device=device)
         sine = torch.tensor(SINE_TOKENS, dtype=torch.long, device=device)
@@ -225,7 +233,7 @@ class PersonaPlexStage0DuplexRuntime:
             user_d0=user_d0,
             user_d1=user_d1,
         )
-        if first_append:
+        if first_append and prefill is None:
             voice = runtime_config.get("personaplex_voice_prompt", "NATF2.pt")
             persona = runtime_config.get("personaplex_persona", "")
             if not isinstance(voice, str) or not voice:
@@ -268,8 +276,28 @@ class PersonaPlexStage0DuplexRuntime:
             )
             state.prefill_slots = int(prefill_embeds.shape[0])
             full_embeds = torch.cat([prefill_embeds, live_embed.to(dtype=dtype)], dim=0)
-        else:
+        elif prefill is None:
+            if state.retain_session and not state.close_after_request:
+                raise ValueError("PersonaPlex replay append is missing the previous Stage 0 prefill")
             full_embeds = live_embed.to(dtype=dtype)
+        else:
+            if not isinstance(prefill, torch.Tensor):
+                prefill = torch.as_tensor(prefill)
+            if prefill.ndim != 2 or prefill.shape[0] <= 0:
+                raise ValueError(
+                    "PersonaPlex replay prefill must be a non-empty rank-2 embedding tensor, "
+                    f"got shape={tuple(prefill.shape)}"
+                )
+            if state.prefill_slots <= 0:
+                configured_slots = runtime_config.get("personaplex_prefill_slots")
+                try:
+                    state.prefill_slots = max(0, int(configured_slots))
+                except (TypeError, ValueError):
+                    state.prefill_slots = 0
+            full_embeds = torch.cat(
+                [prefill.to(device=device, dtype=dtype), live_embed.to(dtype=dtype)],
+                dim=0,
+            )
 
         prepared_len = int(full_embeds.shape[0])
         prompt_offset = int(prompt_len) - prepared_len
@@ -290,12 +318,20 @@ class PersonaPlexStage0DuplexRuntime:
             "duplex": {
                 "stage0_prepared": True,
                 "prefill_applied": first_append,
+                "data_plane": True,
+                "retain_session": state.retain_session,
+                "close_session": state.close_after_request,
                 "session_id": session_id,
                 "incarnation": incarnation,
                 "epoch": epoch,
                 "seq": seq,
             },
         }
+        if state.retain_session:
+            # The API-side replay context is intentionally model-ready. The
+            # next ordinary request can prepend this tensor to its new live
+            # frame without relying on a resumable scheduler KV block.
+            info_update["embed"] = {"prefill": full_embeds.detach().cpu()}
         prepared = PersonaPlexStage0PreparedAppend(
             input_ids=input_ids,
             inputs_embeds=full_embeds,
@@ -315,8 +351,8 @@ class PersonaPlexStage0DuplexRuntime:
         request_id: str,
         text_token: Any,
         agent_codes: Any,
-    ) -> None:
-        """Commit one sampled temporal frame for the next live append."""
+    ) -> Any:
+        """Commit and return one logical ``frame_t`` for replay/codec stages."""
         import torch
 
         key = self.request_sessions.get(request_id)
@@ -326,7 +362,9 @@ class PersonaPlexStage0DuplexRuntime:
         if state is None or state.prepared_identity is None:
             raise RuntimeError(f"PersonaPlex Stage 0 request has no prepared append: {request_id}")
         if state.sampled_identity == state.prepared_identity:
-            return
+            if not state.frame_history:
+                raise RuntimeError("PersonaPlex Stage 0 sampled frame history is unexpectedly empty")
+            return state.frame_history[-1]
 
         text = torch.as_tensor(text_token, device=self._model_device_dtype()[0], dtype=torch.long).reshape(-1)
         codes = torch.as_tensor(agent_codes, device=text.device, dtype=torch.long).reshape(-1)
@@ -352,6 +390,20 @@ class PersonaPlexStage0DuplexRuntime:
         state.last_text_token = text.detach()
         state.sampled_identity = state.prepared_identity
 
+        user_codes = prepared.user_codes[-1].reshape(-1).to(device=effective_codes.device, dtype=torch.long)
+        if user_codes.numel() < 8:
+            raise RuntimeError("PersonaPlex Stage 0 prepared user frame has fewer than 8 codebooks")
+        frame = (
+            torch.cat(
+                [text[:1], effective_codes[:8], user_codes[:8]],
+                dim=0,
+            )
+            .detach()
+            .to(device="cpu", dtype=torch.long)
+        )
+        state.frame_history.append(frame)
+        return frame
+
     def close_request(self, request_id: str) -> None:
         key = self.request_sessions.pop(request_id, None)
         if key is None:
@@ -360,7 +412,7 @@ class PersonaPlexStage0DuplexRuntime:
         if state is None:
             return
         state.request_ids.discard(request_id)
-        if not state.request_ids:
+        if not state.request_ids and (not state.retain_session or state.close_after_request):
             self.close_session(*key)
 
     def close_session(self, session_id: str, incarnation: int) -> None:
