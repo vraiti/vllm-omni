@@ -8,7 +8,6 @@
 #     "livekit-agents[openai,turn-detector,silero]>=1.6.10",
 # ]
 # ///
-import asyncio
 import logging
 import os
 
@@ -90,30 +89,30 @@ async def _get_first_model() -> str:
     return model_id
 
 
-async def _republish_ready_state(session: AgentSession, room) -> None:
-    """Retry the initial ready-state update for clients joining concurrently.
+async def _publish_initializing_state(room) -> None:
+    """Publish a state transition before ``AgentSession.start``.
 
-    AgentSession publishes ``lk.agent.state=listening`` during ``start``.  The
-    LiveKit React client can discover the agent participant before its
-    attribute-change listener is installed, so retry the state briefly while
-    the session is still listening.  This is deliberately limited to startup
-    and does not interfere with semantic VAD or later state transitions.
+    ``AgentSession`` emits its internal ``initializing`` transition before
+    ``RoomIO`` subscribes to state changes, so that transition is not normally
+    sent as a participant attribute.  Publish it explicitly after joining the
+    room so the React client observes ``initializing`` before the framework
+    publishes ``listening``.
     """
 
-    for delay in (0.25, 1.0):
-        await asyncio.sleep(delay)
-        if session.agent_state != "listening":
-            return
-
-        try:
-            await room.local_participant.set_attributes({"lk.agent.state": "listening"})
-        except Exception:
-            logger.warning("unable to republish the agent ready state", exc_info=True)
-            return
+    try:
+        await room.local_participant.set_attributes({"lk.agent.state": "initializing"})
+    except Exception:
+        logger.warning("unable to publish the agent initializing state", exc_info=True)
 
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
+    # Join before doing model discovery so the client sees a real
+    # initializing -> listening attribute transition.  AgentSession.start()
+    # is safe to call after this because JobContext.connect() is idempotent.
+    await ctx.connect()
+    await _publish_initializing_state(ctx.room)
+
     model_name = await _get_first_model()
     logger.info("Using vLLM-Omni model %s", model_name)
 
@@ -148,8 +147,6 @@ async def entrypoint(ctx: JobContext):
         VAD_MODE,
         VLLM_BASE_URL,
     )
-
-    await _republish_ready_state(session, ctx.room)
 
 
 if __name__ == "__main__":
