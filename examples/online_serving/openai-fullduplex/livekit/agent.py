@@ -8,6 +8,7 @@
 #     "livekit-agents[openai,turn-detector,silero]>=1.6.10",
 # ]
 # ///
+import asyncio
 import logging
 import os
 
@@ -66,6 +67,28 @@ class VoiceAssistant(Agent):
         )
 
 
+async def _republish_ready_state(session: AgentSession, room) -> None:
+    """Retry the initial ready-state update for clients joining concurrently.
+
+    AgentSession publishes ``lk.agent.state=listening`` during ``start``.  The
+    LiveKit React client can discover the agent participant before its
+    attribute-change listener is installed, so retry the state briefly while
+    the session is still listening.  This is deliberately limited to startup
+    and does not interfere with semantic VAD or later state transitions.
+    """
+
+    for delay in (0.25, 1.0):
+        await asyncio.sleep(delay)
+        if session.agent_state != "listening":
+            return
+
+        try:
+            await room.local_participant.set_attributes({"lk.agent.state": "listening"})
+        except Exception:
+            logger.warning("unable to republish the agent ready state", exc_info=True)
+            return
+
+
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
     # Omni serves one model, so an empty model lets the server select it.
@@ -100,6 +123,8 @@ async def entrypoint(ctx: JobContext):
         VAD_MODE,
         VLLM_BASE_URL,
     )
+
+    await _republish_ready_state(session, ctx.room)
 
 
 if __name__ == "__main__":
