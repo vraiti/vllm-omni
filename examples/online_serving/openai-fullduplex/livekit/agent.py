@@ -12,6 +12,8 @@ import asyncio
 import logging
 import os
 
+import aiohttp
+
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -67,6 +69,27 @@ class VoiceAssistant(Agent):
         )
 
 
+async def _get_first_model() -> str:
+    """Resolve the model name exposed by the vLLM-Omni server."""
+
+    models_url = f"{VLLM_BASE_URL}/models"
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as http:
+        async with http.get(models_url) as response:
+            response.raise_for_status()
+            payload = await response.json()
+
+    models = payload.get("data")
+    if not isinstance(models, list) or not models:
+        raise RuntimeError(f"vLLM-Omni returned no models from {models_url}")
+
+    model_id = models[0].get("id") if isinstance(models[0], dict) else None
+    if not isinstance(model_id, str) or not model_id:
+        raise RuntimeError(f"vLLM-Omni returned an invalid first model from {models_url}")
+
+    return model_id
+
+
 async def _republish_ready_state(session: AgentSession, room) -> None:
     """Retry the initial ready-state update for clients joining concurrently.
 
@@ -91,10 +114,12 @@ async def _republish_ready_state(session: AgentSession, room) -> None:
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
-    # Omni serves one model, so an empty model lets the server select it.
+    model_name = await _get_first_model()
+    logger.info("Using vLLM-Omni model %s", model_name)
+
     model = RealtimeModel(
         base_url=VLLM_BASE_URL,
-        model="",
+        model=model_name,
         api_key="unused",
     )
 
