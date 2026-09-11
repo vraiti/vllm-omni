@@ -567,7 +567,7 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
 
 
 @pytest.mark.asyncio
-async def test_realtime_route_uses_pipeline_openai_flag_for_openai_handler(monkeypatch) -> None:
+async def test_realtime_route_uses_openai_capabilities_for_openai_handler(monkeypatch) -> None:
     calls: list[str] = []
 
     class _DuplexHandler:
@@ -579,7 +579,10 @@ async def test_realtime_route_uses_pipeline_openai_flag_for_openai_handler(monke
             calls.append("openai")
 
     class _Engine:
-        realtime_use_openai = True
+        openai_realtime_capabilities = {
+            "default_vad": "client",
+            "supported_vad": ["client"],
+        }
 
         async def get_tokenizer(self):
             return object()
@@ -600,7 +603,7 @@ async def test_realtime_route_uses_pipeline_openai_flag_for_openai_handler(monke
 
 
 @pytest.mark.asyncio
-async def test_realtime_route_rejects_without_pipeline_openai_flag() -> None:
+async def test_realtime_route_rejects_without_openai_capabilities() -> None:
     class _Socket:
         def __init__(self) -> None:
             self.payload = None
@@ -618,7 +621,7 @@ async def test_realtime_route_rejects_without_pipeline_openai_flag() -> None:
     websocket = _Socket()
     websocket.app = SimpleNamespace(
         state=SimpleNamespace(
-            engine_client=SimpleNamespace(realtime_use_openai=False),
+            engine_client=SimpleNamespace(openai_realtime_capabilities={}),
             openai_serving_duplex=None,
         )
     )

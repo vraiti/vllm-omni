@@ -23,7 +23,10 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
     model_type="qwen3_omni_moe",
     default_deploy_config_name="qwen3_omni_moe.yaml",
     model_arch="Qwen3OmniMoeForConditionalGeneration",
-    realtime_use_openai=True,
+    openai_realtime_capabilities={
+        "default_vad": "client",
+        "supported_vad": ["client"],
+    },
     endpoint_restrictions=(
         EndpointRestriction(
             OmniServingCapability.COMPLETIONS,

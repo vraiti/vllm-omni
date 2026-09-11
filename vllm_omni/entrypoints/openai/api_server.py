@@ -1874,7 +1874,12 @@ async def realtime_websocket(websocket: WebSocket):
         await serving_duplex.handle_realtime_session(websocket)
         return
 
-    if not getattr(getattr(state, "engine_client", None), "realtime_use_openai", False):
+    realtime_capabilities = getattr(
+        getattr(state, "engine_client", None),
+        "openai_realtime_capabilities",
+        None,
+    )
+    if not isinstance(realtime_capabilities, dict) or not realtime_capabilities:
         await _reject_realtime_websocket(websocket, "The Realtime API is not supported for this model")
         return
 

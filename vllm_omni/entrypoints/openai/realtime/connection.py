@@ -92,9 +92,12 @@ class OpenAIFullDuplexConnection:
         self.engine = engine
         self.model_name = model_name
         self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
+        capabilities = getattr(engine, "openai_realtime_capabilities", {})
+        self._realtime_capabilities = dict(capabilities) if isinstance(capabilities, dict) else {}
 
         self.session = AudioFullDuplexSessionState()
         self.session.config.model = model_name
+        self._apply_default_vad()
 
         self._connected = True
         self._response_task: asyncio.Task | None = None
@@ -175,6 +178,32 @@ class OpenAIFullDuplexConnection:
             ):
                 return True
         return False
+
+    def _supported_vad(self) -> set[str]:
+        supported = self._realtime_capabilities.get("supported_vad", [])
+        if not isinstance(supported, (list, tuple, set)):
+            return set()
+        return {mode for mode in supported if mode in {"client", "semantic"}}
+
+    def _default_vad(self) -> str | None:
+        default = self._realtime_capabilities.get("default_vad")
+        return default if isinstance(default, str) and default in self._supported_vad() else None
+
+    def _default_turn_detection(self) -> dict[str, str] | None:
+        if self._default_vad() == "semantic":
+            return {"type": "semantic_vad"}
+        return None
+
+    def _apply_default_vad(self) -> None:
+        if self._default_vad() is None:
+            return
+
+        config = self.session.config.model_dump()
+        audio = config.get("audio")
+        audio_input = audio.get("input") if isinstance(audio, dict) else None
+        if isinstance(audio_input, dict):
+            audio_input["turn_detection"] = self._default_turn_detection()
+            self.session.config = types.RealtimeSessionCreateRequest.model_validate(config)
 
     def _personaplex_voice(self) -> str:
         audio = getattr(self.session.config, "audio", None)
@@ -480,13 +509,20 @@ class OpenAIFullDuplexConnection:
         if audio is not None:
             inp = audio.get("input")
             if inp is not None:
+                supported_vad = self._supported_vad()
+                default_turn_detection = self._default_turn_detection()
                 inp.pop("transcription", None)
                 inp.pop("noise_reduction", None)
                 if not self._is_pcm16_24khz_format(inp.get("format")):
                     inp.pop("format", None)
                 td = inp.get("turn_detection")
-                if isinstance(td, dict) and td.get("type") in ("server_vad", "semantic_vad"):
-                    inp["turn_detection"] = None
+                if isinstance(td, dict):
+                    if td.get("type") == "semantic_vad" and "semantic" not in supported_vad:
+                        inp["turn_detection"] = default_turn_detection
+                    elif td.get("type") == "server_vad":
+                        inp["turn_detection"] = default_turn_detection
+                elif "client" not in supported_vad:
+                    inp["turn_detection"] = default_turn_detection
 
             out = audio.get("output")
             if out is not None:
