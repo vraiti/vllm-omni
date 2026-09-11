@@ -31,6 +31,7 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
     # Pipeline-level default; the code2wav stage overrides per-stage below.
     model_arch="PersonaPlexTalkerForConditionalGeneration",
     default_deploy_config_name="personaplex.yaml",
+    realtime_use_openai=True,
     duplex_runtime_extension=(
         "vllm_omni.model_executor.models.personaplex.duplex.runtime_extension.PersonaPlexDuplexRuntimeExtension"
     ),

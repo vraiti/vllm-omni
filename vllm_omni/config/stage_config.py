@@ -309,6 +309,8 @@ class PipelineConfig:
     diffusers_class_name: str | None = None
     diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # Enable the OpenAI-compatible Realtime endpoint for this pipeline.
+    realtime_use_openai: bool = False
     # Optional model-owned duplex planner loaded by the stable engine runtime.
     duplex_runtime_extension: str | None = None
     # Optional model-owned Serving adapter loaded only when the Realtime duplex

@@ -543,7 +543,6 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
         ("/v1/audio/speech/stream", {"type": "error", "message": "Streaming speech is not available"}),
         ("/v1/video/chat/stream", {"type": "error", "message": "Streaming video chat is not available"}),
         ("/v1/realtime/video", {"type": "error", "message": "Streaming video generation is not available"}),
-        ("/v1/realtime", {"type": "error", "error": "Realtime API is not available", "code": "unsupported"}),
         (
             "/v1/realtime/robot/openpi",
             {"type": "error", "error": "Robot policy not available", "code": "unsupported"},
@@ -568,45 +567,68 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("duplex_query", "expected_handler"),
-    [
-        (None, "duplex"),
-        ("1", "duplex"),
-        ("true", "duplex"),
-        ("on", "duplex"),
-        ("0", "legacy"),
-        ("false", "legacy"),
-    ],
-)
-async def test_realtime_route_defaults_to_configured_duplex_handler(
-    monkeypatch, duplex_query: str | None, expected_handler: str
-) -> None:
+async def test_realtime_route_uses_pipeline_openai_flag_for_openai_handler(monkeypatch) -> None:
     calls: list[str] = []
 
     class _DuplexHandler:
         async def handle_realtime_session(self, _websocket) -> None:
             calls.append("duplex")
 
-    class _LegacyConnection:
+    class _OpenAIConnection:
         async def handle_connection(self) -> None:
-            calls.append("legacy")
+            calls.append("openai")
 
-    monkeypatch.setattr(api_server, "RealtimeConnection", lambda _websocket, _serving: _LegacyConnection())
-    query_params = {} if duplex_query is None else {"duplex": duplex_query}
-    websocket = SimpleNamespace(
-        app=SimpleNamespace(
-            state=SimpleNamespace(
-                openai_serving_duplex=_DuplexHandler(),
-                openai_serving_realtime=object(),
-            )
-        ),
-        query_params=query_params,
+    class _Engine:
+        realtime_use_openai = True
+
+        async def get_tokenizer(self):
+            return object()
+
+    monkeypatch.setattr(api_server, "OpenAIFullDuplexConnection", lambda **_kwargs: _OpenAIConnection())
+    state = SimpleNamespace(
+        engine_client=_Engine(),
+        openai_serving_duplex=_DuplexHandler(),
+        openai_serving_models=SimpleNamespace(base_model_paths=[SimpleNamespace(name="test-model")]),
+        args=SimpleNamespace(tool_call_parser=None, enable_auto_tool_choice=False),
     )
+
+    for query_params, expected in (({}, "openai"), ({"duplex": "0"}, "openai"), ({"duplex": "1"}, "duplex")):
+        calls.clear()
+        websocket = SimpleNamespace(app=SimpleNamespace(state=state), query_params=query_params)
+        await api_server.realtime_websocket(websocket)
+        assert calls == [expected]
+
+
+@pytest.mark.asyncio
+async def test_realtime_route_rejects_without_pipeline_openai_flag() -> None:
+    class _Socket:
+        def __init__(self) -> None:
+            self.payload = None
+            self.closed = False
+
+        async def accept(self) -> None:
+            pass
+
+        async def send_json(self, payload) -> None:
+            self.payload = payload
+
+        async def close(self, **_kwargs) -> None:
+            self.closed = True
+
+    websocket = _Socket()
+    websocket.app = SimpleNamespace(
+        state=SimpleNamespace(
+            engine_client=SimpleNamespace(realtime_use_openai=False),
+            openai_serving_duplex=None,
+        )
+    )
+    websocket.query_params = {}
 
     await api_server.realtime_websocket(websocket)
 
-    assert calls == [expected_handler]
+    assert websocket.payload["error"]["code"] == "unsupported_model"
+    assert websocket.payload["error"]["message"] == "The Realtime API is not supported for this model"
+    assert websocket.closed is True
 
 
 def test_health_without_engine_returns_stable_unhealthy_response() -> None:

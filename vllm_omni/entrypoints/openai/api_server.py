@@ -188,22 +188,6 @@ CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
 CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
 profiler_router = APIRouter()
 
-_QWEN3_OMNI_REALTIME_ARCH = "Qwen3OmniMoeForConditionalGeneration"
-_QWEN3_OMNI_REALTIME_STAGES = {"thinker", "talker", "code2wav"}
-
-
-def _supports_qwen3_omni_realtime(stage_configs: Any) -> bool:
-    def stage_arg(stage: Any, name: str) -> Any:
-        engine_args = getattr(stage, "engine_args", None)
-        return engine_args.get(name) if isinstance(engine_args, Mapping) else getattr(engine_args, name, None)
-
-    stages = stage_configs or ()
-    return (
-        len(stages) == len(_QWEN3_OMNI_REALTIME_STAGES)
-        and all(stage_arg(stage, "model_arch") == _QWEN3_OMNI_REALTIME_ARCH for stage in stages)
-        and {stage_arg(stage, "model_stage") for stage in stages} == _QWEN3_OMNI_REALTIME_STAGES
-    )
-
 
 async def _reject_realtime_websocket(websocket: WebSocket, message: str) -> None:
     await websocket.accept()
@@ -1890,8 +1874,8 @@ async def realtime_websocket(websocket: WebSocket):
         await serving_duplex.handle_realtime_session(websocket)
         return
 
-    if not _supports_qwen3_omni_realtime(getattr(state, "stage_configs", None)):
-        await _reject_realtime_websocket(websocket, "The Realtime API is only supported for Qwen3-Omni")
+    if not getattr(getattr(state, "engine_client", None), "realtime_use_openai", False):
+        await _reject_realtime_websocket(websocket, "The Realtime API is not supported for this model")
         return
 
     model_name = state.openai_serving_models.base_model_paths[0].name
