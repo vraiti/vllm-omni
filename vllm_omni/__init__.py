@@ -12,36 +12,123 @@ Architecture:
   processing
 """
 
+import asyncio
 import inspect
 import os
 import sys
+import threading
 
 _TRACE_PACKAGE_ROOT = os.path.realpath(os.path.dirname(__file__))
-_TRACE_LOG_PATH = "/tmp/logs/trace.log"
-_TRACE_LOG = None
+_TRACE_LOG_DIRECTORY = "/tmp/logs/traces"
+_TRACE_LOGS = {}
 _TRACE_LOG_DISABLED = False
 
 
-def _trace_repr(value):
+def _trace_is_tensor(value):
+    try:
+        return any(cls.__module__ == "torch" and cls.__name__ == "Tensor" for cls in type(value).__mro__)
+    except Exception:
+        return False
+
+
+def _trace_tensor_repr(value):
+    try:
+        return f"<torch.Tensor size={tuple(value.size())}>"
+    except Exception:
+        try:
+            return f"<torch.Tensor size={tuple(value.shape)}>"
+        except Exception:
+            return "<torch.Tensor size=<unavailable>>"
+
+
+def _trace_repr(value, seen=None):
+    if _trace_is_tensor(value):
+        return _trace_tensor_repr(value)
+
+    if seen is None:
+        seen = set()
+
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in seen:
+            return "<recursive>"
+        seen.add(value_id)
+        try:
+            items = [f"{_trace_repr(key, seen)}: {_trace_repr(item, seen)}" for key, item in value.items()]
+            return "{" + ", ".join(items) + "}"
+        finally:
+            seen.remove(value_id)
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        value_id = id(value)
+        if value_id in seen:
+            return "<recursive>"
+        seen.add(value_id)
+        try:
+            items = [_trace_repr(item, seen) for item in value]
+            if isinstance(value, list):
+                return "[" + ", ".join(items) + "]"
+            if isinstance(value, tuple):
+                suffix = "," if len(items) == 1 else ""
+                return "(" + ", ".join(items) + suffix + ")"
+            if isinstance(value, frozenset):
+                return "frozenset({" + ", ".join(items) + "})"
+            return "{" + ", ".join(items) + "}"
+        finally:
+            seen.remove(value_id)
+
     try:
         return repr(value)
     except Exception as exc:  # pragma: no cover - defensive logging fallback
         return f"<unrepresentable {type(value).__name__}: {exc}>"
 
 
+def _trace_is_scoped_frame(frame):
+    function_name = frame.f_code.co_name
+    if function_name.startswith("<") and function_name.endswith(">"):
+        return False
+
+    filename = os.path.realpath(frame.f_code.co_filename)
+    return filename == _TRACE_PACKAGE_ROOT or filename.startswith(_TRACE_PACKAGE_ROOT + os.sep)
+
+
+def _trace_scope_depth(frame):
+    depth = 0
+    current_frame = frame
+    while current_frame is not None:
+        if _trace_is_scoped_frame(current_frame):
+            depth += 1
+        current_frame = current_frame.f_back
+    return depth
+
+
+def _trace_log_path():
+    thread_id = threading.get_ident()
+    process_id = os.getpid()
+    path = f"{thread_id}-{process_id}"
+
+    try:
+        task = asyncio.current_task()
+    except (AttributeError, RuntimeError):
+        task = None
+
+    if task is not None:
+        try:
+            coroutine_id = id(task.get_coro())
+        except Exception:
+            coroutine_id = id(task)
+        path += f"-co{coroutine_id}"
+
+    return os.path.join(_TRACE_LOG_DIRECTORY, path + ".log")
+
+
 def _trace_call(frame, event, _arg):
-    global _TRACE_LOG, _TRACE_LOG_DISABLED
+    global _TRACE_LOG_DISABLED
 
     if event != "call":
         return _trace_call
 
-    code = frame.f_code
-    function_name = code.co_name
-    if function_name.startswith("<") and function_name.endswith(">"):
-        return _trace_call
-
-    filename = os.path.realpath(code.co_filename)
-    if not (filename == _TRACE_PACKAGE_ROOT or filename.startswith(_TRACE_PACKAGE_ROOT + os.sep)):
+    if not _trace_is_scoped_frame(frame):
         return _trace_call
 
     if _TRACE_LOG_DISABLED:
@@ -58,22 +145,27 @@ def _trace_call(frame, event, _arg):
             name = arg_info.keywords
             arguments.append(f"**{name}={_trace_repr(local_values.get(name))}")
 
-        module_name = frame.f_globals.get("__name__", "<unknown>")
-        qualified_name = getattr(code, "co_qualname", function_name)
-        message = f"{filename}:{frame.f_lineno} {module_name}.{qualified_name}({', '.join(arguments)})"
+        filename = os.path.realpath(frame.f_code.co_filename)
+        function_name = frame.f_code.co_name
+        qualified_name = getattr(frame.f_code, "co_qualname", function_name)
+        argument_text = "\n\t".join(arguments)
+        message = f"({_trace_scope_depth(frame)}) {filename}:{qualified_name}({argument_text})"
 
-        if _TRACE_LOG is None:
-            os.makedirs(os.path.dirname(_TRACE_LOG_PATH), exist_ok=True)
-            _TRACE_LOG = open(_TRACE_LOG_PATH, "a", encoding="utf-8", buffering=1)
-        print(message, file=_TRACE_LOG, flush=True)
+        log_path = _trace_log_path()
+        log = _TRACE_LOGS.get(log_path)
+        if log is None:
+            os.makedirs(_TRACE_LOG_DIRECTORY, exist_ok=True)
+            log = open(log_path, "a", encoding="utf-8", buffering=1)
+            _TRACE_LOGS[log_path] = log
+        print(message, file=log, flush=True)
     except Exception:  # pragma: no cover - tracing must not affect execution
         _TRACE_LOG_DISABLED = True
-        if _TRACE_LOG is not None:
+        for log in _TRACE_LOGS.values():
             try:
-                _TRACE_LOG.close()
+                log.close()
             except Exception:
                 pass
-            _TRACE_LOG = None
+        _TRACE_LOGS.clear()
 
     return _trace_call
 
