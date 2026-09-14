@@ -1,19 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
-import base64
 import binascii
 import json
 import time
 import warnings
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pybase64 as base64
 from fastapi import WebSocket, WebSocketDisconnect
 from openai.types import realtime as types
 from pydantic import TypeAdapter
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionToolsParam
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedToolChoiceParam,
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+)
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams, StructuredOutputsParams
 from vllm.tool_parsers import ToolParserManager
@@ -29,16 +37,25 @@ from vllm_omni.entrypoints.openai.realtime.session import (
     _gen_id,
     merge_session_config,
 )
+from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
 
 _CLIENT_EVENT_ADAPTER = TypeAdapter(types.RealtimeClientEvent)
 
+# Qwen3-Omni's Realtime contract is mono signed PCM16 at 24 kHz. PCM16 is the
+# sample width; 24 kHz is the sample rate.
 SAMPLE_RATE_HZ = 24000
 BYTES_PER_SAMPLE_PCM16 = 2
+PERSONAPLEX_FRAME_SAMPLES = 1920
+PERSONAPLEX_FRAME_BYTES = PERSONAPLEX_FRAME_SAMPLES * BYTES_PER_SAMPLE_PCM16
+# Application safety caps for one append and the complete pending input turn.
 MAX_AUDIO_APPEND_BYTES = 15 * 1024 * 1024
 MAX_INPUT_AUDIO_BUFFER_BYTES = 64 * 1024 * 1024
 
+# The Qwen3-Omni chat template uses these literal special tokens for audio.
+# The generic chat-template interface does not expose that placeholder as
+# metadata, so it cannot be inferred reliably from the Realtime event schema.
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
 # Empirically calibrated for Qwen3-Omni from 8,808 ms / 23 thinker tokens.
@@ -46,16 +63,6 @@ QWEN3_OMNI_MS_PER_TOKEN = 383.0
 
 AUTO_TRUNCATION_TRIGGER_RATIO = 0.8
 AUTO_TRUNCATION_TARGET_RATIO = 0.5
-
-
-@dataclass
-class _ToolParserRequest:
-    """Fields consumed by vLLM tool parsers."""
-
-    tools: list[dict] = field(default_factory=list)
-    tool_choice: str = "auto"
-    include_reasoning: bool = False
-    skip_special_tokens: bool = True
 
 
 @dataclass(slots=True)
@@ -77,6 +84,7 @@ class OpenAIFullDuplexConnection:
         websocket: WebSocket,
         engine: AsyncOmni,
         model_name: str,
+        tokenizer: Any,
         tool_call_parser: str | None = None,
         enable_auto_tool_choice: bool = False,
     ):
@@ -84,16 +92,19 @@ class OpenAIFullDuplexConnection:
         self.engine = engine
         self.model_name = model_name
         self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
+        capabilities = getattr(engine, "openai_realtime_capabilities", {})
+        self._realtime_capabilities = dict(capabilities) if isinstance(capabilities, dict) else {}
 
         self.session = AudioFullDuplexSessionState()
         self.session.config.model = model_name
+        self._apply_default_vad()
 
         self._connected = True
         self._response_task: asyncio.Task | None = None
         self._response_cancel_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
 
-        self._tokenizer: Any = None
+        self._tokenizer = self._resolve_tokenizer(tokenizer)
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                          #
@@ -105,7 +116,6 @@ class OpenAIFullDuplexConnection:
             logger.info("[realtime] connection opened, session_id=%s", self.session.session_id)
             await self._send_session_created()
             await self._send_conversation_created()
-            self._tokenizer = await self._resolve_tokenizer()
 
             while self._connected:
                 try:
@@ -130,49 +140,334 @@ class OpenAIFullDuplexConnection:
     async def _cleanup(self):
         self._connected = False
         await self._cancel_active_response()
+        if self._is_personaplex():
+            await self._release_personaplex_session()
         logger.info("[realtime] connection closed, session_id=%s", self.session.session_id)
 
-    async def _resolve_tokenizer(self) -> Any:
-        tokenizer = await self.engine.get_tokenizer()
+    def _resolve_tokenizer(self, tokenizer: Any) -> Any:
         if getattr(tokenizer, "chat_template", None):
+            return tokenizer
+
+        input_processor = getattr(self.engine, "input_processor", None)
+        if input_processor is None:
             return tokenizer
         try:
             from vllm.transformers_utils.processor import cached_processor_from_config
 
-            preprocessor = await self.engine.get_input_preprocessor()
-            model_config = preprocessor.model_config
-            processor = cached_processor_from_config(model_config)
+            processor = cached_processor_from_config(input_processor.model_config)
             if getattr(processor, "apply_chat_template", None):
                 return processor
         except Exception:
             logger.warning("Could not load processor for chat templating")
         return tokenizer
 
+    def _is_personaplex(self) -> bool:
+        """Whether this connection should use the replayable PersonaPlex path."""
+        if "personaplex" in self.model_name.lower():
+            return True
+        inner_engine = getattr(self.engine, "engine", None)
+        for config in getattr(inner_engine, "stage_vllm_configs", ()):
+            model_config = getattr(config, "model_config", None)
+            hf_config = getattr(model_config, "hf_config", None)
+            model_type = getattr(hf_config, "model_type", "")
+            if isinstance(model_type, str) and model_type.lower() == "personaplex":
+                return True
+            model_arch = getattr(hf_config, "architectures", None)
+            if isinstance(model_arch, (list, tuple)) and any(
+                "personaplex" in str(value).lower() for value in model_arch
+            ):
+                return True
+        return False
+
+    def _supported_vad(self) -> set[str]:
+        supported = self._realtime_capabilities.get("supported_vad", [])
+        if not isinstance(supported, (list, tuple, set)):
+            return set()
+        return {mode for mode in supported if mode in {"client", "semantic"}}
+
+    def _default_vad(self) -> str | None:
+        default = self._realtime_capabilities.get("default_vad")
+        return default if isinstance(default, str) and default in self._supported_vad() else None
+
+    def _default_turn_detection(self) -> dict[str, str] | None:
+        if self._default_vad() == "semantic":
+            return {"type": "semantic_vad"}
+        return None
+
+    def _apply_default_vad(self) -> None:
+        if self._default_vad() is None:
+            return
+
+        config = self.session.config.model_dump()
+        audio = config.get("audio")
+        audio_input = audio.get("input") if isinstance(audio, dict) else None
+        if isinstance(audio_input, dict):
+            audio_input["turn_detection"] = self._default_turn_detection()
+            self.session.config = types.RealtimeSessionCreateRequest.model_validate(config)
+
+    def _personaplex_voice(self) -> str:
+        audio = getattr(self.session.config, "audio", None)
+        output = getattr(audio, "output", None) if audio is not None else None
+        voice = getattr(output, "voice", None) if output is not None else None
+        # PersonaPlex ships voice bundles as *.pt files. OpenAI's generic voice
+        # names are not PersonaPlex bundle names, so use the model's canonical
+        # default unless the client selected a PersonaPlex bundle explicitly.
+        if (
+            isinstance(voice, str)
+            and voice.endswith(".pt")
+            and "/" not in voice
+            and "\\" not in voice
+            and voice not in {".", ".."}
+        ):
+            return voice
+        return "NATF2.pt"
+
+    def _personaplex_model_path(self) -> str:
+        model_path = getattr(self.engine, "model", None) or self.model_name
+        return str(model_path)
+
+    def _personaplex_persona(self, response: _ResolvedResponse | None = None) -> str:
+        from vllm_omni.model_executor.models.personaplex.duplex.config import DEFAULT_PERSONA
+
+        if response is not None and response.instructions is not None:
+            return str(response.instructions or DEFAULT_PERSONA)
+        return str(getattr(self.session.config, "instructions", None) or DEFAULT_PERSONA)
+
+    def _personaplex_prefill_slots(self, response: _ResolvedResponse | None = None) -> int:
+        cached = self.session.personaplex_prefill_slots
+        if cached is not None:
+            return cached
+        from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
+            personaplex_prefill_slots,
+        )
+
+        slots = personaplex_prefill_slots(
+            self._personaplex_model_path(),
+            self._personaplex_voice(),
+            self._personaplex_persona(response),
+        )
+        self.session.personaplex_prefill_slots = int(slots)
+        return int(slots)
+
+    @staticmethod
+    def _tensor_like_prefill(value: Any) -> Any | None:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            for item in reversed(value):
+                result = OpenAIFullDuplexConnection._tensor_like_prefill(item)
+                if result is not None:
+                    return result
+            return None
+        if not hasattr(value, "detach") or not hasattr(value, "shape"):
+            return None
+        try:
+            if value.numel() == 0:
+                return None
+            return value.detach().to(device="cpu").contiguous()
+        except (AttributeError, RuntimeError, TypeError):
+            return None
+
+    @classmethod
+    def _extract_personaplex_prefill(cls, output: Any) -> Any | None:
+        multimodal = getattr(output, "multimodal_output", None)
+        if not isinstance(multimodal, Mapping):
+            return None
+        embed = multimodal.get("embed")
+        prefill = embed.get("prefill") if isinstance(embed, Mapping) else None
+        if prefill is None:
+            prefill = multimodal.get("embed.prefill")
+        return cls._tensor_like_prefill(prefill)
+
+    def _personaplex_prompt(
+        self,
+        frame_pcm16: bytes,
+        response: _ResolvedResponse,
+        *,
+        close_session: bool = False,
+        seq: int | None = None,
+    ) -> OmniTokensPrompt:
+        import numpy as np
+
+        if len(frame_pcm16) != PERSONAPLEX_FRAME_BYTES:
+            raise ValueError(
+                "PersonaPlex requests require exactly one 80 ms PCM frame "
+                f"({PERSONAPLEX_FRAME_BYTES} bytes), got {len(frame_pcm16)}"
+            )
+        self.session.personaplex_session_started = True
+        frame_f32 = np.frombuffer(frame_pcm16, dtype="<i2").astype(np.float32) / 32768.0
+        frame_f32 = np.ascontiguousarray(frame_f32, dtype="<f4")
+        voice = self._personaplex_voice()
+        persona = self._personaplex_persona(response)
+        prefill = self.session.personaplex_prefill
+        prefill_slots = self._personaplex_prefill_slots(response)
+        if close_session and prefill is None:
+            # A failed/cancelled first frame may have allocated Stage 0 state
+            # before its prefill reached the API. The close marker only needs a
+            # single live frame to release that state.
+            context_len = 1
+        else:
+            context_len = int(prefill.shape[0]) + 1 if prefill is not None else prefill_slots + 1
+        frame_seq = self.session.personaplex_frame_seq + 1 if seq is None else seq
+        payload = {
+            "format": "pcm_f32le",
+            "sample_rate_hz": SAMPLE_RATE_HZ,
+            "audio": base64.b64encode(frame_f32.tobytes()).decode("ascii"),
+        }
+        additional_information: dict[str, Any] = {
+            "duplex": {
+                "data_plane": True,
+                "retain_session": True,
+                "close_session": close_session,
+                "session_id": self.session.session_id,
+                "incarnation": 0,
+                "epoch": self.session.personaplex_epoch,
+                "seq": frame_seq,
+                "payload": payload,
+                "runtime_config": {
+                    "personaplex_replay": True,
+                    "personaplex_prefill_slots": prefill_slots,
+                    "personaplex_voice_prompt": voice,
+                    "personaplex_persona": persona,
+                },
+            },
+            "duplex_prompt_len": context_len,
+            "meta": {
+                "request_id": self.session.session_id,
+                "chunk_seq": frame_seq,
+                "cache_epoch": self.session.personaplex_epoch,
+                "codec_streaming": not close_session,
+            },
+        }
+        if prefill is not None:
+            additional_information["embed"] = {"prefill": prefill}
+        return OmniTokensPrompt(
+            prompt_token_ids=[0] * context_len,
+            additional_information=additional_information,
+            multi_modal_data=None,
+            mm_processor_kwargs=None,
+        )
+
+    def _personaplex_sampling_params(self) -> list[Any]:
+        """Clone defaults and make Stage 0 produce exactly one frame."""
+        sampling_params_list = [
+            sp.clone() if isinstance(sp, SamplingParams) else sp for sp in self.engine.default_sampling_params_list
+        ]
+        stage0_configured = False
+        for sp in sampling_params_list:
+            if not isinstance(sp, SamplingParams):
+                continue
+            sp.output_kind = RequestOutputKind.DELTA
+            if not stage0_configured:
+                sp.max_tokens = 1
+                stage0_configured = True
+        return sampling_params_list
+
+    async def _release_personaplex_session(self) -> None:
+        """Release retained model-side replay state after the WebSocket closes."""
+        session = self.session
+        if not session.personaplex_session_started:
+            return
+
+        response = _ResolvedResponse(
+            input=None,
+            instructions=getattr(session.config, "instructions", None),
+            modalities=["audio"],
+            max_output_tokens=1,
+            tools=None,
+            tool_choice=None,
+            metadata=None,
+        )
+        # If a request was cancelled after Stage 0 prepared its append, its
+        # internal last_seq can be one ahead of the API-visible sequence. A
+        # gap is valid; a duplicate sequence is not.
+        close_seq = session.personaplex_frame_seq + 2
+        prompt = self._personaplex_prompt(
+            b"\x00" * PERSONAPLEX_FRAME_BYTES,
+            response,
+            close_session=True,
+            seq=close_seq,
+        )
+        request_id = f"rt-{session.session_id}-pplex-close"
+        gen = None
+        try:
+            gen = self.engine.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=self._personaplex_sampling_params(),
+                output_modalities=["audio"],
+            )
+            async for _ in gen:
+                pass
+        except Exception:
+            logger.warning(
+                "Could not release PersonaPlex model state for session %s",
+                session.session_id,
+                exc_info=True,
+            )
+        finally:
+            aclose = getattr(gen, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    logger.debug(
+                        "Error closing PersonaPlex release generator for %s",
+                        session.session_id,
+                        exc_info=True,
+                    )
+
+    def _personaplex_input_frames(self) -> list[bytes]:
+        """Drain complete PCM16 frames, padding one final partial frame."""
+        buffer = self.session.personaplex_audio_buffer
+        if not buffer:
+            return []
+        frame_count, remainder = divmod(len(buffer), PERSONAPLEX_FRAME_BYTES)
+        if remainder:
+            frame_count += 1
+        raw = bytes(buffer)
+        buffer.clear()
+        frames = [
+            raw[offset : offset + PERSONAPLEX_FRAME_BYTES]
+            for offset in range(0, frame_count * PERSONAPLEX_FRAME_BYTES, PERSONAPLEX_FRAME_BYTES)
+        ]
+        if len(frames[-1]) < PERSONAPLEX_FRAME_BYTES:
+            frames[-1] += b"\x00" * (PERSONAPLEX_FRAME_BYTES - len(frames[-1]))
+        return frames
+
     # ------------------------------------------------------------------ #
     #  Event dispatch                                                     #
     # ------------------------------------------------------------------ #
 
     async def _dispatch_event(self, event: types.RealtimeClientEvent):
-        handlers = {
-            types.SessionUpdateEvent: self._handle_session_update,
-            types.InputAudioBufferAppendEvent: self._handle_audio_append,
-            types.InputAudioBufferCommitEvent: self._handle_audio_commit,
-            types.InputAudioBufferClearEvent: self._handle_audio_clear,
-            types.ResponseCreateEvent: self._handle_response_create,
-            types.ResponseCancelEvent: self._handle_response_cancel,
-            types.ConversationItemCreateEvent: self._handle_item_create,
-            types.ConversationItemDeleteEvent: self._handle_item_delete,
-            types.ConversationItemRetrieveEvent: self._handle_item_retrieve,
-            types.ConversationItemTruncateEvent: self._handle_item_truncate,
-        }
-        handler = handlers.get(type(event))
-        if handler is None:
-            await self._send_error(
-                f"Unknown event type: {event.type}",
-                "invalid_event",
-                event_id=event.event_id,
-            )
-            return
+        match event:
+            case types.SessionUpdateEvent():
+                handler = self._handle_session_update
+            case types.InputAudioBufferAppendEvent():
+                handler = self._handle_audio_append
+            case types.InputAudioBufferCommitEvent():
+                handler = self._handle_audio_commit
+            case types.InputAudioBufferClearEvent():
+                handler = self._handle_audio_clear
+            case types.ResponseCreateEvent():
+                handler = self._handle_response_create
+            case types.ResponseCancelEvent():
+                handler = self._handle_response_cancel
+            case types.ConversationItemCreateEvent():
+                handler = self._handle_item_create
+            case types.ConversationItemDeleteEvent():
+                handler = self._handle_item_delete
+            case types.ConversationItemRetrieveEvent():
+                handler = self._handle_item_retrieve
+            case types.ConversationItemTruncateEvent():
+                handler = self._handle_item_truncate
+            case _:
+                await self._send_error(
+                    f"Unknown event type: {event.type}",
+                    "invalid_event",
+                    event_id=event.event_id,
+                )
+                return
         try:
             await handler(event)
         except Exception:
@@ -214,19 +509,26 @@ class OpenAIFullDuplexConnection:
         if audio is not None:
             inp = audio.get("input")
             if inp is not None:
+                supported_vad = self._supported_vad()
+                default_turn_detection = self._default_turn_detection()
                 inp.pop("transcription", None)
                 inp.pop("noise_reduction", None)
-                if not self._is_pcm24_format(inp.get("format")):
+                if not self._is_pcm16_24khz_format(inp.get("format")):
                     inp.pop("format", None)
                 td = inp.get("turn_detection")
-                if isinstance(td, dict) and td.get("type") in ("server_vad", "semantic_vad"):
-                    inp["turn_detection"] = None
+                if isinstance(td, dict):
+                    if td.get("type") == "semantic_vad" and "semantic" not in supported_vad:
+                        inp["turn_detection"] = default_turn_detection
+                    elif td.get("type") == "server_vad":
+                        inp["turn_detection"] = default_turn_detection
+                elif "client" not in supported_vad:
+                    inp["turn_detection"] = default_turn_detection
 
             out = audio.get("output")
             if out is not None:
                 if out.get("speed") not in (None, 1):
                     out.pop("speed", None)
-                if not self._is_pcm24_format(out.get("format")):
+                if not self._is_pcm16_24khz_format(out.get("format")):
                     out.pop("format", None)
 
         return types.RealtimeSessionCreateRequest.model_validate(data)
@@ -237,7 +539,7 @@ class OpenAIFullDuplexConnection:
             return None
         audio_input = getattr(audio, "input", None)
         if audio_input is not None:
-            fields = getattr(audio_input, "model_fields_set", set())
+            fields: set[str] = getattr(audio_input, "model_fields_set", set())
             if "transcription" in fields and audio_input.transcription is not None:
                 return "Input audio transcription"
             if "noise_reduction" in fields and audio_input.noise_reduction is not None:
@@ -250,18 +552,18 @@ class OpenAIFullDuplexConnection:
         return None
 
     @staticmethod
-    def _is_pcm24_format(audio_format: Any) -> bool:
+    def _is_pcm16_24khz_format(audio_format: Any) -> bool:
         if audio_format is None:
             return True
         if isinstance(audio_format, str):
             return audio_format in ("audio/pcm", "pcm16")
         if isinstance(audio_format, dict):
             format_type = audio_format.get("type")
-            rate = audio_format.get("rate", 24000)
+            rate = audio_format.get("rate", SAMPLE_RATE_HZ)
         else:
             format_type = getattr(audio_format, "type", None)
-            rate = getattr(audio_format, "rate", 24000)
-        return format_type in ("audio/pcm", "pcm16") and rate == 24000
+            rate = getattr(audio_format, "rate", SAMPLE_RATE_HZ)
+        return format_type in ("audio/pcm", "pcm16") and rate == SAMPLE_RATE_HZ
 
     @staticmethod
     def _uses_mcp(config: Any) -> bool:
@@ -285,28 +587,23 @@ class OpenAIFullDuplexConnection:
     # ------------------------------------------------------------------ #
 
     async def _handle_audio_append(self, event: types.InputAudioBufferAppendEvent):
-        now = time.monotonic()
-        last = getattr(self, "_last_append_wall_time", None)
-        if last is not None:
-            gap = now - last
-            if gap > 0.5:
-                logger.warning(
-                    "[realtime] input_audio_buffer.append gap of %.2fs (receive loop may have stalled)",
-                    gap,
-                )
-        self._last_append_wall_time = now
-
         if not event.audio:
             return
         try:
             audio_bytes = self._decode_pcm16(event.audio)
-            if len(self.session.input_audio_buffer) + len(audio_bytes) > MAX_INPUT_AUDIO_BUFFER_BYTES:
+            pending_bytes = max(
+                len(self.session.input_audio_buffer),
+                len(self.session.personaplex_audio_buffer),
+            )
+            if pending_bytes + len(audio_bytes) > MAX_INPUT_AUDIO_BUFFER_BYTES:
                 limit_mib = MAX_INPUT_AUDIO_BUFFER_BYTES // (1024 * 1024)
                 raise ValueError(f"Input audio buffer exceeds the {limit_mib} MiB limit")
         except ValueError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
             return
         self.session.input_audio_buffer.extend(audio_bytes)
+        if self._is_personaplex():
+            self.session.personaplex_audio_buffer.extend(audio_bytes)
 
     @staticmethod
     def _decode_pcm16(audio: str, max_bytes: int = MAX_AUDIO_APPEND_BYTES) -> bytes:
@@ -322,8 +619,10 @@ class OpenAIFullDuplexConnection:
             raise ValueError("PCM audio data must contain complete 16-bit samples")
         return decoded
 
-    def _commit_audio_buffer(self) -> types.RealtimeConversationItemUserMessage | None:
-        """Commit buffered audio as a user conversation item."""
+    async def _commit_audio_buffer(
+        self,
+    ) -> types.RealtimeConversationItemUserMessage | None:
+        """Commit buffered audio and announce the conversation item."""
         s = self.session
         if len(s.input_audio_buffer) == 0:
             return None
@@ -337,15 +636,6 @@ class OpenAIFullDuplexConnection:
         )
         s.insert_item(item)
         s.input_audio_buffer.clear()
-        return item
-
-    async def _commit_audio_buffer_and_announce(
-        self,
-    ) -> types.RealtimeConversationItemUserMessage | None:
-        """Commit buffered audio and emit its events."""
-        item = self._commit_audio_buffer()
-        if item is None:
-            return None
         idx = self.session.find_item_index(item.id)
         previous_item_id = self.session.items[idx - 1].id if idx else None
         await self._send_event(
@@ -371,10 +661,11 @@ class OpenAIFullDuplexConnection:
             )
             return
 
-        await self._commit_audio_buffer_and_announce()
+        await self._commit_audio_buffer()
 
     async def _handle_audio_clear(self, event: types.InputAudioBufferClearEvent):
         self.session.input_audio_buffer.clear()
+        self.session.personaplex_audio_buffer.clear()
         await self._send_event(
             types.InputAudioBufferClearedEvent(
                 event_id=_gen_id("evt"),
@@ -421,8 +712,8 @@ class OpenAIFullDuplexConnection:
             if unsupported is not None:
                 raise ValueError(f"{unsupported} is not supported")
             output = getattr(audio, "output", None) if audio is not None else None
-            if output is not None and not self._is_pcm24_format(getattr(output, "format", None)):
-                raise ValueError("Only 24 kHz PCM output audio is supported")
+            if output is not None and not self._is_pcm16_24khz_format(getattr(output, "format", None)):
+                raise ValueError("Only 24 kHz PCM16 output audio is supported")
 
         if tools and tool_choice != "none" and self._tool_call_parser_name is None:
             raise ValueError("Function tools require --enable-auto-tool-choice and --tool-call-parser")
@@ -473,10 +764,8 @@ class OpenAIFullDuplexConnection:
         truncation = s.config.truncation or "auto"
         ratio = 1.0
         custom_limit = None
-        if truncation == "disabled":
-            mode = "disabled"
-        elif truncation == "auto":
-            mode = "auto"
+        if isinstance(truncation, str):
+            mode = "disabled" if truncation == "disabled" else "auto"
         else:
             mode = "retention_ratio"
             ratio = truncation.retention_ratio
@@ -497,7 +786,7 @@ class OpenAIFullDuplexConnection:
             target = limit
 
         persistent = response.input is None
-        items = s.items if persistent else response.input
+        items: list[Any] = s.items if response.input is None else response.input
         total = await self._estimate_total_tokens(
             response.tools,
             instructions=response.instructions,
@@ -572,7 +861,7 @@ class OpenAIFullDuplexConnection:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
             return
 
-        if not await self._maybe_truncate_history(response):
+        if not self._is_personaplex() and not await self._maybe_truncate_history(response):
             await self._send_error(
                 "The response input exceeds the model's input token limit",
                 "invalid_request_error",
@@ -668,7 +957,315 @@ class OpenAIFullDuplexConnection:
         except Exception:
             logger.debug("Failed to send failure response.done for %s", response_id, exc_info=True)
 
+    async def _run_personaplex_response(
+        self,
+        response_id: str,
+        response: _ResolvedResponse,
+        s: AudioFullDuplexSessionState,
+        active: ActiveResponse,
+    ) -> None:
+        """Run one ordinary pipeline request for each queued PersonaPlex frame.
+
+        PersonaPlex's state is replayed in the prompt rather than held by a
+        resumable scheduler request.  Stage 0 returns the updated model-ready
+        embedding prefix through ``embed.prefill``; the next iteration stores
+        that prefix in the session and submits it again with the next PCM
+        frame.  Stage 1 keeps its codec prefix keyed by the stable session id
+        carried in the payload metadata.
+        """
+        previous_item_id = s.items[-1].id if s.items else None
+        is_audio = "audio" in response.modalities
+        item_id = _gen_id("item")
+        active.item_id = item_id
+        output_index = 0
+        content_index = 0
+        part_type = "audio" if is_audio else "text"
+        item_obj = types.RealtimeConversationItemAssistantMessage(
+            type="message",
+            role="assistant",
+            id=item_id,
+            status="in_progress",
+            content=[],
+        )
+
+        try:
+            s.insert_item(item_obj, previous_item_id=previous_item_id or "root")
+        except ValueError:
+            logger.warning(
+                "[realtime] previous item '%s' vanished while starting PersonaPlex response %s; appending instead",
+                previous_item_id,
+                response_id,
+            )
+            s.insert_item(item_obj)
+        s.item_in_progress[item_id] = True
+
+        await self._send_event(
+            types.ResponseOutputItemAddedEvent(
+                event_id=_gen_id("evt"),
+                type="response.output_item.added",
+                response_id=response_id,
+                output_index=output_index,
+                item=item_obj,  # type: ignore[arg-type]
+            )
+        )
+        await self._send_event(
+            types.ResponseContentPartAddedEvent(
+                event_id=_gen_id("evt"),
+                type="response.content_part.added",
+                response_id=response_id,
+                item_id=item_id,
+                output_index=output_index,
+                content_index=content_index,
+                part={"type": part_type, "text": "", "audio": "", "transcript": ""},  # type: ignore[arg-type]
+            )
+        )
+
+        full_text = ""
+        full_transcript = ""
+        full_token_ids: list[int] = []
+        total_audio_samples = 0
+        usage = ResponseUsage()
+        cancelled = False
+
+        # Stage 0 is frame-synchronous: one submitted PCM frame must produce
+        # exactly one sampled text token.
+        sampling_params_list = self._personaplex_sampling_params()
+
+        frames = self._personaplex_input_frames()
+        try:
+            for frame in frames:
+                if not self._connected or self._response_cancel_event.is_set():
+                    cancelled = True
+                    break
+
+                seq = s.personaplex_frame_seq + 1
+                active.request_id = f"rt-{response_id}-pplex-{seq}"
+                prompt = self._personaplex_prompt(frame, response)
+                gen = self.engine.generate(
+                    prompt=prompt,
+                    request_id=active.request_id,
+                    sampling_params_list=sampling_params_list,
+                    # PersonaPlex's final stage is the Mimi decoder. Request it
+                    # even when the client asked for a text-only response so
+                    # the model's codec/replay state advances consistently.
+                    output_modalities=["audio"],
+                )
+                generator_cancelled = False
+                try:
+                    async for output in gen:
+                        if not self._connected or self._response_cancel_event.is_set():
+                            cancelled = True
+                            break
+
+                        prefill = self._extract_personaplex_prefill(output)
+                        if prefill is not None:
+                            s.personaplex_prefill = prefill
+
+                        output_type = getattr(output, "final_output_type", "audio")
+                        if output_type == "audio":
+                            for chunk in self._extract_audio_deltas(output):
+                                total_audio_samples += int(chunk.shape[0])
+                                if not is_audio:
+                                    continue
+                                await self._send_event(
+                                    types.ResponseAudioDeltaEvent(
+                                        event_id=_gen_id("evt"),
+                                        type="response.output_audio.delta",
+                                        response_id=response_id,
+                                        item_id=item_id,
+                                        output_index=output_index,
+                                        content_index=content_index,
+                                        delta=self._pcm16_b64(chunk),
+                                    )
+                                )
+                            continue
+
+                        outputs = getattr(output, "outputs", None) or []
+                        if outputs:
+                            first_out = outputs[0]
+                            delta_text = getattr(first_out, "text", "") or ""
+                            delta_token_ids = list(getattr(first_out, "token_ids", None) or [])
+                            full_text += delta_text
+                            full_transcript += delta_text
+                            full_token_ids.extend(delta_token_ids)
+                            usage.output_tokens += len(delta_token_ids)
+                            prompt_token_ids = getattr(output, "prompt_token_ids", None) or []
+                            usage.input_tokens = max(usage.input_tokens, len(prompt_token_ids))
+                            if delta_text:
+                                if is_audio:
+                                    await self._send_event(
+                                        types.ResponseAudioTranscriptDeltaEvent(
+                                            event_id=_gen_id("evt"),
+                                            type="response.output_audio_transcript.delta",
+                                            response_id=response_id,
+                                            item_id=item_id,
+                                            output_index=output_index,
+                                            content_index=content_index,
+                                            delta=delta_text,
+                                        )
+                                    )
+                                else:
+                                    await self._send_event(
+                                        types.ResponseTextDeltaEvent(
+                                            event_id=_gen_id("evt"),
+                                            type="response.output_text.delta",
+                                            response_id=response_id,
+                                            item_id=item_id,
+                                            output_index=output_index,
+                                            content_index=content_index,
+                                            delta=delta_text,
+                                        )
+                                    )
+                except asyncio.CancelledError:
+                    cancelled = True
+                    generator_cancelled = True
+                finally:
+                    aclose = getattr(gen, "aclose", None)
+                    if aclose is not None:
+                        try:
+                            await aclose()
+                        except Exception:
+                            logger.debug(
+                                "Error closing PersonaPlex generator for %s",
+                                active.request_id,
+                                exc_info=True,
+                            )
+
+                if generator_cancelled or cancelled:
+                    break
+                s.personaplex_frame_seq = seq
+        except asyncio.CancelledError:
+            cancelled = True
+
+        if self._response_cancel_event.is_set():
+            cancelled = True
+        status = "cancelled" if cancelled else "completed"
+
+        if is_audio:
+            await self._send_event(
+                types.ResponseAudioDoneEvent(
+                    event_id=_gen_id("evt"),
+                    type="response.output_audio.done",
+                    response_id=response_id,
+                    item_id=item_id,
+                    output_index=output_index,
+                    content_index=content_index,
+                )
+            )
+            await self._send_event(
+                types.ResponseAudioTranscriptDoneEvent(
+                    event_id=_gen_id("evt"),
+                    type="response.output_audio_transcript.done",
+                    response_id=response_id,
+                    item_id=item_id,
+                    output_index=output_index,
+                    content_index=content_index,
+                    transcript=full_transcript,
+                )
+            )
+        else:
+            await self._send_event(
+                types.ResponseTextDoneEvent(
+                    event_id=_gen_id("evt"),
+                    type="response.output_text.done",
+                    response_id=response_id,
+                    item_id=item_id,
+                    output_index=output_index,
+                    content_index=content_index,
+                    text=full_text,
+                )
+            )
+
+        item_obj = types.RealtimeConversationItemAssistantMessage(
+            type="message",
+            role="assistant",
+            id=item_id,
+            status="completed" if not cancelled else "incomplete",
+            content=(
+                [{"type": "output_audio", "transcript": full_transcript}]  # type: ignore[list-item]
+                if is_audio
+                else [{"type": "output_text", "text": full_text}]  # type: ignore[list-item]
+            ),
+        )
+        await self._send_event(
+            types.ResponseContentPartDoneEvent(
+                event_id=_gen_id("evt"),
+                type="response.content_part.done",
+                response_id=response_id,
+                item_id=item_id,
+                output_index=output_index,
+                content_index=content_index,
+                part={"type": part_type, "text": full_text, "transcript": full_transcript},  # type: ignore[arg-type]
+            )
+        )
+        await self._send_event(
+            types.ResponseOutputItemDoneEvent(
+                event_id=_gen_id("evt"),
+                type="response.output_item.done",
+                response_id=response_id,
+                output_index=output_index,
+                item=item_obj,  # type: ignore[arg-type]
+            )
+        )
+
+        history_item = item_obj
+        if cancelled:
+            history_item = types.RealtimeConversationItemAssistantMessage(
+                type="message",
+                role="assistant",
+                id=item_id,
+                status="incomplete",
+                content=(
+                    [{"type": "output_audio", "transcript": ""}]  # type: ignore[list-item]
+                    if is_audio
+                    else [{"type": "output_text", "text": ""}]  # type: ignore[list-item]
+                ),
+            )
+
+        if s.find_item_index(item_id) is not None:
+            pending_ms = s.pending_truncations_ms.get(item_id)
+            s.replace_item(history_item)
+            s.item_duration_ms[item_id] = total_audio_samples / SAMPLE_RATE_HZ * 1000
+            s.item_token_ids[item_id] = full_token_ids
+            s.item_in_progress.pop(item_id, None)
+            await self._send_conversation_item_added_and_done(history_item, previous_item_id)
+            if not cancelled and pending_ms is not None:
+                await self._do_item_truncate(
+                    types.ConversationItemTruncateEvent(
+                        event_id=_gen_id("evt"),
+                        type="conversation.item.truncate",
+                        item_id=item_id,
+                        content_index=0,
+                        audio_end_ms=pending_ms,
+                    )
+                )
+
+        usage.total_tokens = usage.input_tokens + usage.output_tokens
+        status_details = {"type": "cancelled", "reason": "client_cancelled"} if cancelled else None
+        await self._send_event(
+            types.ResponseDoneEvent(
+                event_id=_gen_id("evt"),
+                type="response.done",
+                response=self._response_object(
+                    response_id,
+                    response,
+                    status,
+                    status_details=status_details,
+                    output=[item_obj],
+                    usage={
+                        "total_tokens": usage.total_tokens,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                    },
+                ),
+            )
+        )
+
     async def _run_response_inner(self, response_id, response, s, active):
+        if self._is_personaplex():
+            await self._run_personaplex_response(response_id, response, s, active)
+            return
+
         previous_item_id = s.items[-1].id if s.items else None
         modalities = response.modalities
         is_audio = "audio" in modalities
@@ -690,8 +1287,15 @@ class OpenAIFullDuplexConnection:
             tool_parser_cls = ToolParserManager.get_tool_parser(self._tool_call_parser_name)
             strict_tools = [ChatCompletionToolsParam(**t) for t in self._convert_tools(tools, strict=True)]
             tool_parser = tool_parser_cls(self._tokenizer, tools=strict_tools)
+            parser_request = ChatCompletionRequest(
+                messages=[],
+                tools=strict_tools,
+                tool_choice=self._convert_tool_choice(tool_choice),
+                include_reasoning=False,
+                skip_special_tokens=True,
+            )
             structure_tag = tool_parser.get_structural_tag(
-                _ToolParserRequest(tools=strict_tools, tool_choice=tool_choice or "auto"),
+                parser_request,
                 reasoning=False,
             )
             if structure_tag is not None:
@@ -929,7 +1533,7 @@ class OpenAIFullDuplexConnection:
                                 previous_token_ids,
                                 current_token_ids,
                                 delta_token_ids,
-                                request=_ToolParserRequest(tools=converted_tools, tool_choice=tool_choice or "auto"),
+                                request=parser_request,
                             )
                         previous_text = current_text
                         previous_token_ids = current_token_ids
@@ -1276,7 +1880,7 @@ class OpenAIFullDuplexConnection:
 
         await self._send_conversation_item_added_and_done(item, prev_id)
 
-    def _validate_input_item(self, item: Any) -> None:
+    def _validate_input_item(self, item: types.ConversationItem) -> None:
         for part in getattr(item, "content", None) or []:
             part_type = getattr(part, "type", None)
             if part_type == "input_image":
@@ -1497,6 +2101,25 @@ class OpenAIFullDuplexConnection:
                 function["strict"] = True
             converted.append({"type": "function", "function": function})
         return converted
+
+    @staticmethod
+    def _convert_tool_choice(
+        tool_choice: Any,
+    ) -> str | ChatCompletionNamedToolChoiceParam:
+        if isinstance(tool_choice, str):
+            return tool_choice
+        if isinstance(tool_choice, dict):
+            choice_type = tool_choice.get("type")
+            name = tool_choice.get("name")
+        else:
+            choice_type = getattr(tool_choice, "type", None)
+            name = getattr(tool_choice, "name", None)
+        if choice_type == "function" and name:
+            return ChatCompletionNamedToolChoiceParam(
+                type="function",
+                function={"name": name},
+            )
+        return "auto"
 
     def _assistant_item_text(self, item: types.RealtimeConversationItemAssistantMessage) -> str:
         """Return the assistant item's stored transcript or text."""

@@ -103,6 +103,8 @@ class PersonaPlexCode2Wav(nn.Module):
         self._mimi_device: torch.device | None = None
         self._request_codes: dict[str, torch.Tensor] = {}
         self._request_codec_slots: dict[str, int] = {}
+        self._request_aliases: dict[str, str] = {}
+        self._persistent_request_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -178,9 +180,16 @@ class PersonaPlexCode2Wav(nn.Module):
         empty = torch.zeros((0,), dtype=torch.float32)
 
         if input_ids is None or input_ids.numel() == 0:
+            runtime_count = len(runtime_additional_information or [])
+            request_ids = kwargs.get("request_ids")
+            request_count = len(request_ids) if isinstance(request_ids, (list, tuple)) else 0
+            count = max(runtime_count, request_count, 1)
+            state_ids = self._resolve_request_ids(count, request_ids, runtime_additional_information)
+            self._remember_request_aliases(request_ids, state_ids, runtime_additional_information)
+            prefill = self._prefills_from_runtime(runtime_additional_information, count)
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+                multimodal_outputs=self._multimodal_output([empty] * count, [sr_tensor] * count, prefill),
             )
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
@@ -189,6 +198,12 @@ class PersonaPlexCode2Wav(nn.Module):
         state_ids = self._resolve_request_ids(
             num_req,
             kwargs.get("request_ids"),
+            runtime_additional_information,
+        )
+
+        self._remember_request_aliases(
+            kwargs.get("request_ids"),
+            state_ids,
             runtime_additional_information,
         )
 
@@ -232,8 +247,77 @@ class PersonaPlexCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs=self._multimodal_output(
+                audios,
+                srs,
+                self._prefills_from_runtime(runtime_additional_information, num_req),
+            ),
         )
+
+    @staticmethod
+    def _prefill_from_runtime_info(runtime_info: Mapping[str, Any] | None) -> torch.Tensor | None:
+        if not isinstance(runtime_info, Mapping):
+            return None
+        embed = runtime_info.get("embed")
+        prefill = embed.get("prefill") if isinstance(embed, Mapping) else None
+        if prefill is None:
+            prefill = runtime_info.get("embed.prefill")
+        if isinstance(prefill, torch.Tensor) and prefill.numel() > 0:
+            return prefill.detach().to(device="cpu")
+        if isinstance(prefill, (list, tuple)):
+            for item in reversed(prefill):
+                if isinstance(item, torch.Tensor) and item.numel() > 0:
+                    return item.detach().to(device="cpu")
+        return None
+
+    @classmethod
+    def _prefills_from_runtime(
+        cls,
+        runtime_additional_information: list[dict[str, Any]] | None,
+        count: int | None = None,
+    ) -> list[torch.Tensor | None]:
+        infos = runtime_additional_information or []
+        size = max(count or len(infos), 1)
+        return [cls._prefill_from_runtime_info(infos[i] if i < len(infos) else None) for i in range(size)]
+
+    @staticmethod
+    def _multimodal_output(
+        audios: list[torch.Tensor],
+        srs: list[torch.Tensor],
+        prefills: list[torch.Tensor | None],
+    ) -> dict[str, Any]:
+        output: dict[str, Any] = {"model_outputs": audios, "sr": srs}
+        if any(prefill is not None for prefill in prefills):
+            # The generation runner requires batch-aligned tensor lists. Empty
+            # tensors stand for requests that do not carry replay state; the
+            # realtime frontend ignores them rather than treating them as a
+            # valid prefix.
+            output["embed.prefill"] = [
+                prefill if prefill is not None else torch.empty(0, dtype=torch.float32) for prefill in prefills
+            ]
+        return output
+
+    def _remember_request_aliases(
+        self,
+        request_ids: object,
+        state_ids: list[str | None],
+        runtime_additional_information: list[dict[str, Any]] | None,
+    ) -> None:
+        if not isinstance(request_ids, (list, tuple)):
+            return
+        infos = runtime_additional_information or []
+        for index, internal_id in enumerate(request_ids):
+            if index >= len(state_ids) or state_ids[index] is None:
+                continue
+            internal = str(internal_id)
+            stable = str(state_ids[index])
+            self._request_aliases[internal] = stable
+            info = infos[index] if index < len(infos) else None
+            meta = info.get("meta") if isinstance(info, Mapping) else None
+            if isinstance(meta, Mapping) and meta.get("codec_streaming") is True:
+                self._persistent_request_ids.add(stable)
+            elif isinstance(meta, Mapping) and meta.get("codec_streaming") is False:
+                self._persistent_request_ids.discard(stable)
 
     @staticmethod
     def _resolve_request_ids(
@@ -247,7 +331,19 @@ class PersonaPlexCode2Wav(nn.Module):
                     "PersonaPlex Code2Wav request id count does not match inputs: "
                     f"request_ids={len(request_ids)}, inputs={count}"
                 )
-            return [str(request_id) for request_id in request_ids]
+            infos = runtime_additional_information or []
+            resolved: list[str | None] = []
+            for index, request_id in enumerate(request_ids):
+                info = infos[index] if index < len(infos) else None
+                stable_id = None
+                if isinstance(info, Mapping):
+                    stable_id = info.get("request_id")
+                    if stable_id is None:
+                        meta = info.get("meta")
+                        if isinstance(meta, Mapping):
+                            stable_id = meta.get("request_id")
+                resolved.append(str(stable_id if stable_id is not None else request_id))
+            return resolved
 
         infos = runtime_additional_information or []
         resolved: list[str | None] = []
@@ -337,7 +433,10 @@ class PersonaPlexCode2Wav(nn.Module):
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:
-            state_id = str(request_id)
+            internal_id = str(request_id)
+            state_id = self._request_aliases.pop(internal_id, internal_id)
+            if state_id in self._persistent_request_ids:
+                continue
             self._request_codes.pop(state_id, None)
             slot = self._request_codec_slots.pop(state_id, None)
             codecs = self._mimi_codecs()

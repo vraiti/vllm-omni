@@ -1,0 +1,69 @@
+name: vllm-omni-livekit
+
+# All three services run with network_mode: host, so they share the host's
+# network namespace directly rather than a compose bridge network. That
+# means: no service-name DNS (the agent reaches LiveKit via localhost, not
+# livekit:7880); port publishing (`ports:`) is unsupported and dropped, so
+# each service binds its configured port straight to the host -- change the
+# port by reconfiguring the service itself (livekit.yaml for the LiveKit
+# server, PORT for the frontend), not via a compose port mapping; and
+# host.docker.internal/extra_hosts is unnecessary since the container's
+# localhost already is the host's.
+
+services:
+  livekit:
+    build:
+      context: .
+      dockerfile: Dockerfile.livekit
+      args:
+        LIVEKIT_REF: ${LIVEKIT_REF:-v1.10.1}
+    network_mode: host
+    command:
+      - --config
+      - /etc/livekit.yaml
+      - --dev
+      - --node-ip
+      - ${LIVEKIT_NODE_IP:-127.0.0.1}
+    volumes:
+      # :Z relabels the bind mount for this container's exclusive use, which
+      # podman's SELinux enforcement (unlike Docker's) requires to let the
+      # non-root `livekit` user in the image read it -- without it the
+      # server fails with "open /etc/livekit.yaml: permission denied" under
+      # an enforcing SELinux policy (confirmed on this host).
+      - ./livekit.yaml:/etc/livekit.yaml:ro,Z
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        FRONTEND_REF: ${FRONTEND_REF:-main}
+    network_mode: host
+    environment:
+      NODE_ENV: development
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      LIVEKIT_URL: ${LIVEKIT_PUBLIC_URL:-ws://localhost:7880}
+      AGENT_NAME: ${AGENT_NAME:-}
+      PORT: ${FRONTEND_PORT:-3000}
+    depends_on:
+      - livekit
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    network_mode: host
+    environment:
+      VLLM_OMNI_HOST: ${VLLM_OMNI_HOST:-localhost}
+      LIVEKIT_URL: ws://localhost:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      # "client": agent-side turn detector, works with any model. "semantic":
+      # server-side VAD, only if the model behind vLLM-Omni supports it.
+      VAD_MODE: ${VAD_MODE:-client}
+    depends_on:
+      - livekit
+    restart: unless-stopped

@@ -309,6 +309,10 @@ class PipelineConfig:
     diffusers_class_name: str | None = None
     diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # OpenAI-compatible Realtime endpoint capabilities for this pipeline.
+    # ``default_vad`` is the recommended turn-detection mode, while
+    # ``supported_vad`` lists the modes the endpoint can honor.
+    openai_realtime_capabilities: dict[str, Any] = field(default_factory=dict)
     # Optional model-owned duplex planner loaded by the stable engine runtime.
     duplex_runtime_extension: str | None = None
     # Optional model-owned Serving adapter loaded only when the Realtime duplex

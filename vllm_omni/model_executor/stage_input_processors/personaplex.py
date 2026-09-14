@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Talker -> Code2Wav input processors for PersonaPlex.
 
-The talker (stage 0) emits, per frame, the ``dep_q`` depformer audio codes under
-``("codes","audio")``. Only the leading ``num_active_codebooks`` (the agent's
-``cb 0..7``) are decoded to PCM by Mimi; the trailing codebooks are the user
-stream and are not vocoded. These processors take the accumulated per-frame agent
-codes ``[F, dep_q]``, keep ``cb 0..7``, and flatten them codebook-major
-(``[8 * F]``) — the exact layout :class:`PersonaPlexCode2Wav` consumes.
+The talker (stage 0) emits, per frame, a logical ``frame_t`` under
+``("codes","audio")``: ``[text, agent_code[0:8], user_code[0:8]]``. Only the
+agent rows are decoded to PCM by Mimi; the text and user rows are retained so
+the replay frontend and the one-frame acoustic delay have an unambiguous
+history. These processors take the accumulated logical frames ``[F, 17]``,
+keep agent ``cb 0..7``, and flatten them codebook-major (``[8 * F]``) — the
+exact layout :class:`PersonaPlexCode2Wav` consumes. The older raw
+``[F, dep_q]`` shape remains accepted by the async-chunk compatibility path.
 
 Mirrors the Qwen3-TTS processors (sync ``full_payload`` + ``token_only``; an
 async-chunk variant for the streaming path), but with PersonaPlex's agent-codebook
@@ -16,12 +18,14 @@ slice instead of Qwen3-TTS's residual layout.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 
 from vllm_omni.data_entry_keys import (
     CodesStruct,
+    EmbeddingsStruct,
     MetaStruct,
     OmniPayloadStruct,
 )
@@ -29,11 +33,94 @@ from vllm_omni.data_entry_keys import (
 _NUM_ACTIVE_CODEBOOKS = 8  # agent cb 0..7 (the PCM-bearing rows)
 
 
-def _empty_finished_payload() -> OmniPayloadStruct:
-    return OmniPayloadStruct(
-        codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+def _empty_finished_payload(
+    *,
+    prefill: torch.Tensor | None = None,
+    request_id: str | None = None,
+    chunk_seq: int | None = None,
+    cache_epoch: int | None = None,
+    codec_streaming: bool | None = None,
+) -> OmniPayloadStruct:
+    # A prefill-only handoff still needs to wake the generation stage. Keep a
+    # single malformed codec placeholder in that case; Code2Wav recognizes
+    # the non-divisible length and skips decoding, while still returning the
+    # embedded replay prefix. A genuinely empty handoff remains empty.
+    audio = (
+        torch.zeros(1, dtype=torch.long)
+        if isinstance(prefill, torch.Tensor) and prefill.numel() > 0
+        else torch.empty(0, dtype=torch.long)
     )
+    return OmniPayloadStruct(
+        embed=EmbeddingsStruct(prefill=prefill) if isinstance(prefill, torch.Tensor) else None,
+        codes=CodesStruct(audio=audio),
+        meta=MetaStruct(
+            finished=torch.tensor(True, dtype=torch.bool),
+            request_id=request_id,
+            chunk_seq=chunk_seq,
+            cache_epoch=cache_epoch,
+            codec_streaming=(request_id is not None if codec_streaming is None else codec_streaming),
+        ),
+    )
+
+
+def _value_from_sources(sources: tuple[Any, ...], dotted: str, nested_key: str) -> Any:
+    """Read a flattened or nested field from the first payload that has it."""
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get(dotted)
+        if value is not None:
+            return value
+        root = dotted.split(".", 1)[0]
+        nested = source.get(root)
+        if isinstance(nested, dict):
+            value = nested.get(nested_key)
+            if value is not None:
+                return value
+    return None
+
+
+def _request_replay_metadata(request: Any, *sources: Any) -> tuple[str | None, int | None, int | None]:
+    all_sources = (
+        *sources,
+        getattr(request, "additional_information", None),
+        getattr(request, "additional_information_cpu", None),
+    )
+    request_id = _value_from_sources(all_sources, "meta.request_id", "request_id")
+    if request_id is None:
+        request_id = _value_from_sources(all_sources, "request_id", "request_id")
+    chunk_seq = _value_from_sources(all_sources, "meta.chunk_seq", "chunk_seq")
+    cache_epoch = _value_from_sources(all_sources, "meta.cache_epoch", "cache_epoch")
+    try:
+        chunk_seq = int(chunk_seq) if chunk_seq is not None else None
+    except (TypeError, ValueError):
+        chunk_seq = None
+    try:
+        cache_epoch = int(cache_epoch) if cache_epoch is not None else None
+    except (TypeError, ValueError):
+        cache_epoch = None
+    return (str(request_id) if request_id is not None else None, chunk_seq, cache_epoch)
+
+
+def _request_codec_streaming(request: Any, *sources: Any) -> bool:
+    request_id, _, _ = _request_replay_metadata(request, *sources)
+    all_sources = (
+        *sources,
+        getattr(request, "additional_information", None),
+        getattr(request, "additional_information_cpu", None),
+    )
+    value = _value_from_sources(all_sources, "meta.codec_streaming", "codec_streaming")
+    return request_id is not None if value is None else bool(value)
+
+
+def _request_closes_session(request: Any, *sources: Any) -> bool:
+    all_sources = (
+        *sources,
+        getattr(request, "additional_information", None),
+        getattr(request, "additional_information_cpu", None),
+    )
+    value = _value_from_sources(all_sources, "duplex.close_session", "close_session")
+    return bool(value)
 
 
 def _agent_codes_to_codebook_major(audio: torch.Tensor) -> torch.Tensor:
@@ -50,8 +137,15 @@ def _agent_codes_to_codebook_major(audio: torch.Tensor) -> torch.Tensor:
     if audio.ndim != 2 or audio.shape[0] < 2:
         return torch.empty(0, dtype=torch.long)
     audio = audio.to(torch.long)
-    k = min(_NUM_ACTIVE_CODEBOOKS, int(audio.shape[1]))
-    agent = audio[:, :k]
+    # Replay requests publish logical frame_t rows as
+    # [text, agent[0:8], user[0:8]]. Keep accepting the older raw depformer
+    # layout [agent[0:8], user[0:8]] for the native async-chunk path.
+    if audio.shape[1] >= 1 + 2 * _NUM_ACTIVE_CODEBOOKS:
+        agent = audio[:, 1 : 1 + _NUM_ACTIVE_CODEBOOKS]
+    else:
+        agent = audio[:, : min(_NUM_ACTIVE_CODEBOOKS, int(audio.shape[1]))]
+    k = min(_NUM_ACTIVE_CODEBOOKS, int(agent.shape[1]))
+    agent = agent[:, :k]
     valid = (agent >= 0).all(dim=1)
     agent = agent[valid]
     if agent.shape[0] < 2:
@@ -89,7 +183,26 @@ def talker2code2wav_token_only(
         # generated token count (one AR token == one Mimi frame). prompt was 1 frame.
         token_ids = getattr(output, "cumulative_token_ids", None) or getattr(output, "token_ids", None) or []
         n_frames = max(len(token_ids) - 1, 0)
+        output_mm = getattr(output, "multimodal_output", None)
+        if isinstance(output_mm, Mapping):
+            output_codes = output_mm.get("codes")
+            output_audio = output_codes.get("audio") if isinstance(output_codes, Mapping) else None
+            if output_audio is None:
+                output_audio = output_mm.get("codes.audio")
+            if isinstance(output_audio, torch.Tensor) and output_audio.ndim == 2:
+                n_frames = max(n_frames, int(output_audio.shape[0]) - 1)
+                # The first logical frame has no de-delayed PCM frame yet,
+                # but Stage 1 still must execute once so it can propagate the
+                # replay prefill returned by the producer. A one-token
+                # placeholder makes Code2Wav run without asking it to decode
+                # a fabricated eight-codebook frame.
         prompt_len = _NUM_ACTIVE_CODEBOOKS * n_frames
+        # PersonaPlex emits one logical frame per ordinary request. Even when
+        # the producer has only a prefill (or an empty frame), wake the
+        # generation stage with a harmless one-token placeholder so the
+        # connector payload can still carry replay state and finish.
+        if prompt_len == 0:
+            prompt_len = 1
         inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,
@@ -115,36 +228,104 @@ def talker2code2wav_full_payload(
     ("codes","audio") (talker_mtp_output_key), while accepting pooling_output
     and the legacy multimodal_output keyword as compatibility fallbacks.
     """
-    del transfer_manager, is_finished
+    del is_finished
 
-    def _codes_from(src: Any) -> torch.Tensor | None:
-        if not isinstance(src, dict):
-            return None
-        nested = src.get("codes")
-        audio = nested.get("audio") if isinstance(nested, dict) else None
-        return audio if audio is not None else src.get("codes.audio")
-
-    audio = None
-    for source in (
+    # Connector output is authoritative for the current request. The request's
+    # original prompt is retained as a fallback for metadata and legacy tests,
+    # but its replay prefill is the prefix that was submitted *before* this
+    # frame and must not shadow the newly returned Stage 0 prefix.
+    sources = (
+        pooling_output,
+        # Compatibility with the legacy producer call contract.
+        kwargs.get("multimodal_output"),
         getattr(request, "additional_information", None),
         getattr(request, "additional_information_cpu", None),
-        pooling_output,
-        # Temporary compatibility shim for the two producer call contracts.
-        # Remove after https://github.com/vllm-project/vllm-omni/issues/4872
-        # provides validated full-payload and async-chunk processor protocols.
-        kwargs.get("multimodal_output"),
-    ):
+    )
+
+    def _codes_from(src: Any) -> torch.Tensor | None:
+        if not isinstance(src, Mapping):
+            return None
+        nested = src.get("codes")
+        audio = nested.get("audio") if isinstance(nested, Mapping) else None
+        return audio if audio is not None else src.get("codes.audio")
+
+    def _prefill_from(src: Any) -> torch.Tensor | None:
+        if not isinstance(src, Mapping):
+            return None
+        nested = src.get("embed")
+        prefill = nested.get("prefill") if isinstance(nested, Mapping) else None
+        if prefill is None:
+            prefill = src.get("embed.prefill")
+        return prefill if isinstance(prefill, torch.Tensor) and prefill.numel() > 0 else None
+
+    audio = None
+    for source in sources:
         audio = _codes_from(source)
         if audio is not None:
             break
-    if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
-        return _empty_finished_payload()
-    flat = _agent_codes_to_codebook_major(audio)
-    if flat.numel() == 0:
-        return _empty_finished_payload()
+    prefill = None
+    for source in sources:
+        prefill = _prefill_from(source)
+        if prefill is not None:
+            break
+    request_id, chunk_seq, cache_epoch = _request_replay_metadata(request, *sources)
+    closes_session = _request_closes_session(request, *sources)
+    replay_key = request_id or str(getattr(request, "external_req_id", getattr(request, "request_id", "?")))
+
+    # The normal realtime frontend submits one ordinary request per user frame.
+    # The model output is one frame, while Code2Wav needs the cumulative raw
+    # frame prefix to undo the one-frame acoustic delay. Keep that logical-frame
+    # history on this PersonaPlex-specific transfer manager; no general runner
+    # or scheduler state is involved.
+    if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+        audio = audio if audio.ndim == 2 else audio.reshape(1, -1)
+        if audio.shape[1] >= 1 + _NUM_ACTIVE_CODEBOOKS and transfer_manager is not None:
+            replay_store = getattr(transfer_manager, "_personaplex_replay_frames", None)
+            if not isinstance(replay_store, dict):
+                replay_store = {}
+                setattr(transfer_manager, "_personaplex_replay_frames", replay_store)
+            state = replay_store.get(replay_key)
+            if not isinstance(state, dict) or (
+                cache_epoch is not None and state.get("cache_epoch") not in (None, cache_epoch)
+            ):
+                state = {"frames": [], "cache_epoch": cache_epoch, "last_seq": 0}
+                replay_store[replay_key] = state
+            if chunk_seq is None or chunk_seq > int(state.get("last_seq", 0)):
+                state["frames"].append(audio[-1].detach().to(device="cpu", dtype=torch.long))
+                if chunk_seq is not None:
+                    state["last_seq"] = chunk_seq
+            audio = torch.stack(state["frames"], dim=0)
+
+    flat = (
+        _agent_codes_to_codebook_major(audio)
+        if isinstance(audio, torch.Tensor) and audio.numel() > 0
+        else torch.empty(0, dtype=torch.long)
+    )
+    codec_streaming = _request_codec_streaming(request, *sources)
+    if closes_session and transfer_manager is not None:
+        replay_store = getattr(transfer_manager, "_personaplex_replay_frames", None)
+        if isinstance(replay_store, dict):
+            replay_store.pop(replay_key, None)
+    if flat.numel() == 0 and prefill is None:
+        return _empty_finished_payload(
+            request_id=request_id,
+            chunk_seq=chunk_seq,
+            cache_epoch=cache_epoch,
+            codec_streaming=codec_streaming,
+        )
+    meta_kwargs: dict[str, Any] = {
+        "finished": torch.tensor(True, dtype=torch.bool),
+        "request_id": request_id,
+        "chunk_seq": chunk_seq,
+        "cache_epoch": cache_epoch,
+        "codec_streaming": codec_streaming,
+    }
+    if flat.numel() > 0:
+        meta_kwargs["next_stage_prompt_len"] = int(flat.numel())
     return OmniPayloadStruct(
+        embed=EmbeddingsStruct(prefill=prefill.detach().to(device="cpu")) if prefill is not None else None,
         codes=CodesStruct(audio=flat),
-        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+        meta=MetaStruct(**meta_kwargs),
     )
 
 

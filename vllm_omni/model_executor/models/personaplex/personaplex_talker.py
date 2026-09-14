@@ -22,6 +22,8 @@ Per-frame protocol (OmniGPUModelRunner, gpu_model_runner.py):
 3. ``talker_mtp`` (batched, stateless) runs the depformer to predict the agent
    codes and finishes the next frame's ``inputs_embeds``; the codes are stored
    under ``talker_mtp_output_key=("codes","audio")`` for the Mimi code2wav stage.
+   The replay-only post-sample hook emits the complete logical
+   ``frame_t=[text, agent_code[0:8], user_code[0:8]]`` instead.
 
 Phase 1 is turn-based: the user-audio rows (9..16) come from a precomputed Mimi
 encode of the input WAV (built in ``preprocess``); live duplex is Phase 2.
@@ -164,17 +166,37 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         hidden = model_outputs
         info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
         audio_codes_list: list[torch.Tensor] = []
+        prefills: list[torch.Tensor] = []
+        has_prefill = False
         for info in info_dicts:
             if not isinstance(info, dict):
+                prefills.append(torch.empty(0, dtype=torch.float32))
                 continue
             ac = info.get("codes", {}).get("audio")
             if isinstance(ac, torch.Tensor):
                 audio_codes_list.append(ac)
+            embed = info.get("embed")
+            prefill = embed.get("prefill") if isinstance(embed, dict) else None
+            if isinstance(prefill, torch.Tensor) and prefill.numel() > 0:
+                prefills.append(prefill)
+                has_prefill = True
+            else:
+                # Multimodal output lists are batch-aligned and must contain a
+                # tensor at every request index. An empty tensor represents a
+                # native/non-replay request without exposing a fabricated
+                # replay prefix.
+                prefills.append(torch.empty(0, dtype=torch.float32))
+        output: dict[str, Any] = {}
         if not audio_codes_list:
-            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+            if has_prefill:
+                output["embed"] = {"prefill": prefills}
+            return OmniOutput(text_hidden_states=hidden, multimodal_outputs=output)
         audio_codes = torch.cat(audio_codes_list, dim=0)
         hidden = hidden[: int(audio_codes.shape[0])]
-        return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": audio_codes}})
+        output["codes"] = {"audio": audio_codes}
+        if has_prefill:
+            output["embed"] = {"prefill": prefills}
+        return OmniOutput(text_hidden_states=hidden, multimodal_outputs=output)
 
     # ------------------------------------------------------------------
     # Per-frame omni AR protocol: preprocess (stateful) + talker_mtp (batched)
@@ -327,6 +349,9 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                 duplex,
                 prompt_len=prompt_len,
                 request_id=(str(info_dict["request_id"]) if isinstance(info_dict.get("request_id"), str) else None),
+                prefill=(
+                    info_dict.get("embed", {}).get("prefill") if isinstance(info_dict.get("embed"), dict) else None
+                ),
             )
             offset_raw = info_dict.get("duplex_token_offset", 0)
             try:
@@ -528,13 +553,28 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             ),
         ).to(torch.long)
         runtime = self._duplex_stage0_runtime()
+        frame_t: list[torch.Tensor] = []
         for row, request_id in enumerate(req_ids):
-            runtime.record_sample(
+            frame = runtime.record_sample(
                 request_id=request_id,
                 text_token=text_token[row],
                 agent_codes=codes[row],
             )
-        return codes
+            if not isinstance(frame, torch.Tensor):
+                # Keep the hook usable with lightweight test doubles and older
+                # runtimes: the production runtime always returns the complete
+                # frame, including the encoded user codebooks.
+                user_codes = req_infos[row].get("pplex_user_codes")
+                if isinstance(user_codes, torch.Tensor) and user_codes.ndim == 2 and user_codes.shape[0] > 0:
+                    user_codes = user_codes[-1]
+                else:
+                    user_codes = torch.zeros(8, dtype=torch.long, device=codes.device)
+                frame = torch.cat(
+                    [text_token[row : row + 1], codes[row, :8], user_codes.reshape(-1)[:8].to(codes.device)],
+                    dim=0,
+                )
+            frame_t.append(frame.reshape(-1).to(device=codes.device, dtype=torch.long))
+        return torch.stack(frame_t, dim=0)
 
     # ------------------------------------------------------------------
     # Weight loading
