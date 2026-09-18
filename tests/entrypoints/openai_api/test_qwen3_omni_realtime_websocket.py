@@ -509,9 +509,19 @@ class TestQwen3OmniRealtimeWebSocket:
         )
 
         assert len(answers) == 3, answers
-        assert "assistant" in answers[0].lower(), answers
-        assert "paris" in answers[1].lower(), answers
-        assert "paris" in answers[2].lower(), answers
+        # Stage 0 sampling uses top_k=1 (effectively greedy), so these
+        # responses are deterministic given fixed weights/inputs.
+        assert answers[0] == (
+            "Hello! I'm Qwen-Omni, a multimodal large-scale language model developed by "
+            "Alibaba's Tongyi Lab. How can I assist you?"
+        ), answers
+        assert answers[1] == "The capital of France is Paris.", answers
+        assert answers[2] == (
+            "As of the most recent data, the population of Paris (the city proper) is "
+            "approximately 2.1 million people. However, if you include the larger "
+            "metropolitan area known as *Île-de-France*, the population exceeds 12 "
+            "million, making it the largest urban area in the European Union."
+        ), answers
 
     @pytest.mark.advanced_model
     @pytest.mark.omni
