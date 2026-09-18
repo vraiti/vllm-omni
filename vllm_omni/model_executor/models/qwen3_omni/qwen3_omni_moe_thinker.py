@@ -1009,6 +1009,9 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
             aftercnn_lens=audio_output_lengths,
         )
         audio_features = audio_outputs if isinstance(audio_outputs, torch.Tensor) else audio_outputs.last_hidden_state
+        if not torch.cuda.is_current_stream_capturing():  # PYTEST_DEBUG
+            _dbg_f = audio_features.float()  # PYTEST_DEBUG
+            print(f"PYTEST_DEBUG thinker.py audio_tower in_shape={tuple(input_features.shape)} in_dtype={input_features.dtype} tower_dtype={self.audio_tower.dtype} feat_lens={audio_feature_lengths.tolist()} out_lens={audio_output_lengths.tolist()} out_shape={tuple(audio_features.shape)} mean={_dbg_f.mean().item():.6f} std={_dbg_f.std().item():.6f} norm={_dbg_f.norm().item():.4f} nan={torch.isnan(_dbg_f).sum().item()} row0_head={_dbg_f[0, :4].tolist()}", flush=True)  # PYTEST_DEBUG
         return audio_features.split(audio_output_lengths.tolist())
 
 
@@ -1387,6 +1390,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if intermediate_tensors is not None:
             inputs_embeds = None
 
+        if not torch.cuda.is_current_stream_capturing() and positions.shape[-1] > 1:  # PYTEST_DEBUG (prefill steps only)
+            _dbg_pos = positions if positions.dim() == 2 else positions.unsqueeze(0)  # PYTEST_DEBUG
+            _dbg_emb = "" if inputs_embeds is None else f" embeds_shape={tuple(inputs_embeds.shape)} embeds_dtype={inputs_embeds.dtype} embeds_mean={inputs_embeds.float().mean().item():.6f} embeds_std={inputs_embeds.float().std().item():.6f} embeds_nan={torch.isnan(inputs_embeds).sum().item()}"  # PYTEST_DEBUG
+            print(f"PYTEST_DEBUG thinker.py forward n_tokens={positions.shape[-1]} input_ids_head={input_ids[:8].tolist() if input_ids is not None else None} positions_shape={tuple(positions.shape)} pos_head={_dbg_pos[:, :6].tolist()} pos_tail={_dbg_pos[:, -6:].tolist()}{_dbg_emb}", flush=True)  # PYTEST_DEBUG
+
         if self.use_deepstack and inputs_embeds is not None and get_pp_group().is_first_rank:
             deepstack_input_embeds = self._get_deepstack_input_embeds(inputs_embeds.size(0))
         else:
@@ -1418,11 +1426,19 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             return hidden_states
         return hidden_states, captured_hidden_states
 
+    _pytest_debug_logits_calls = 0  # PYTEST_DEBUG
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        return self.language_model.compute_logits(hidden_states)
+        logits = self.language_model.compute_logits(hidden_states)  # PYTEST_DEBUG (was: return ...)
+        if logits is not None and not torch.cuda.is_current_stream_capturing() and type(self)._pytest_debug_logits_calls < 64:  # PYTEST_DEBUG
+            type(self)._pytest_debug_logits_calls += 1  # PYTEST_DEBUG
+            _dbg_lp = torch.log_softmax(logits[0].float(), dim=-1)  # PYTEST_DEBUG
+            _dbg_top = torch.topk(_dbg_lp, 5)  # PYTEST_DEBUG
+            print(f"PYTEST_DEBUG thinker.py compute_logits call={type(self)._pytest_debug_logits_calls} n_rows={logits.shape[0]} row0_top5_ids={_dbg_top.indices.tolist()} row0_top5_logprobs={[round(v, 4) for v in _dbg_top.values.tolist()]} nan={torch.isnan(logits).sum().item()}", flush=True)  # PYTEST_DEBUG
+        return logits  # PYTEST_DEBUG
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
