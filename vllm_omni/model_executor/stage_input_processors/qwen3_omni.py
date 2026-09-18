@@ -280,7 +280,6 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     output_token_ids = request.output_token_ids
     # Convert ConstantList to regular list for OmniSerializer serialization
     output_token_ids = _ensure_list(output_token_ids)
-    print(f"PYTEST_DEBUG qwen3_omni.py thinker2talker_streaming req={request_id} is_finished={is_finished} output_token_ids={output_token_ids}")  # PYTEST_DEBUG
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
@@ -447,7 +446,6 @@ def thinker2talker_async_chunk(
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
-    print(f"PYTEST_DEBUG qwen3_omni.py thinker2talker_async_chunk req={request_id} chunk_id={chunk_id} is_finished={is_finished} resumable={getattr(request, 'resumable', None)}")  # PYTEST_DEBUG
     if not isinstance(multimodal_output, Mapping):
         logger.debug("thinker2talker_async_chunk: skip non-dict multimodal_output for req=%s", request_id)
         return None

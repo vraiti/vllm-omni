@@ -1294,7 +1294,6 @@ def _finalize_engine_args_dict(
     engine_args_dict["sampling_extra_args_keys"] = sampling_extra_args_keys
 
     _maybe_set_qwen3_omni_moe_backend(engine_args_dict)
-    print(f"PYTEST_DEBUG stage_init_utils.py finalized engine_args stage_id={stage_id} stage_type={stage_type} engine_args={engine_args_dict!r}", flush=True)  # PYTEST_DEBUG
     return engine_args_dict
 
 

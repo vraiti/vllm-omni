@@ -107,12 +107,7 @@ realtime_async_chunk_1gpu_server_params = [
                 "--enable-auto-tool-choice",
                 "--tool-call-parser",
                 "hermes",
-                "--enable-log-requests",
-                "--enable-log-outputs",
             ],
-            # Verbose engine/orchestrator/duplex-pipeline logging for
-            # debugging the degenerate-output failure on this scenario.
-            env_dict={"VLLM_LOGGING_LEVEL": "DEBUG"},
             # This config colocates all three stages on one GPU. The stage-CLI
             # flow launches each stage as an independent process with no
             # cross-process memory-profiling lock (unlike ``vllm serve --omni

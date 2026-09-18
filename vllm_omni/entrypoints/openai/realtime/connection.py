@@ -213,7 +213,6 @@ class OpenAIFullDuplexConnection:
             await self._send_error(str(exc), "unsupported_audio_format", event_id=event.event_id)
             return
         s.config = merge_session_config(s.config, cfg)
-        print(f"PYTEST_DEBUG connection.py session.update received={cfg.model_dump(exclude_unset=True)!r} merged={s.config.model_dump(exclude_unset=True)!r}", flush=True)  # PYTEST_DEBUG
         await self._send_session_updated()
 
     def _sanitize_session_config(self, cfg: Any) -> types.RealtimeSessionCreateRequest:
@@ -912,10 +911,6 @@ class OpenAIFullDuplexConnection:
                         sp.structured_outputs = StructuredOutputsParams(structural_tag=structural_tag_json)
                     thinker_params_configured = True
 
-        for _dbg_i, _dbg_sp in enumerate(sampling_params_list):  # PYTEST_DEBUG
-            print(f"PYTEST_DEBUG connection.py generate req={active.request_id} stage={_dbg_i} sampling_params={_dbg_sp!r}", flush=True)  # PYTEST_DEBUG
-        print(f"PYTEST_DEBUG connection.py generate req={active.request_id} modalities={modalities!r} n_prompt_tokens={len(prompt.get('prompt_token_ids', []))} n_audio={len(prompt.get('multi_modal_data', {}).get('audio', []))}", flush=True)  # PYTEST_DEBUG
-
         gen = self.engine.generate(
             prompt=prompt,
             request_id=active.request_id,
@@ -970,7 +965,6 @@ class OpenAIFullDuplexConnection:
                         limit_reached = True
                     delta_text = first_out.text or ""
                     delta_token_ids = list(first_out.token_ids)
-                    print(f"PYTEST_DEBUG connection.py thinker delta_text={delta_text!r} delta_token_ids={delta_token_ids} finish_reason={finish_reason_value}")  # PYTEST_DEBUG
                     usage.output_tokens += len(delta_token_ids)
                     # Raw thinker token stream, in talker-consumption order --
                     # this is what _qwen3_omni_truncate_transcript correlates
@@ -1709,14 +1703,6 @@ class OpenAIFullDuplexConnection:
         text = self._tokenizer.apply_chat_template(messages, **chat_template_kwargs)
         raw_tok = getattr(self._tokenizer, "tokenizer", self._tokenizer)
         token_ids = raw_tok.encode(text, add_special_tokens=False)
-
-        import hashlib as _dbg_hashlib  # PYTEST_DEBUG
-
-        print(f"PYTEST_DEBUG connection.py build_prompt messages={messages!r} tools={converted_tools!r}", flush=True)  # PYTEST_DEBUG
-        print(f"PYTEST_DEBUG connection.py build_prompt rendered_text={text!r}", flush=True)  # PYTEST_DEBUG
-        print(f"PYTEST_DEBUG connection.py build_prompt n_tokens={len(token_ids)} token_sha1={_dbg_hashlib.sha1(np.asarray(token_ids, dtype=np.int64).tobytes()).hexdigest()} head={token_ids[:16]} tail={token_ids[-16:]}", flush=True)  # PYTEST_DEBUG
-        for _dbg_i, (_dbg_a, _dbg_sr) in enumerate(audio_arrays):  # PYTEST_DEBUG
-            print(f"PYTEST_DEBUG connection.py build_prompt audio[{_dbg_i}] n_samples={_dbg_a.shape[0]} sr={_dbg_sr} dur_s={_dbg_a.shape[0] / _dbg_sr:.3f} dtype={_dbg_a.dtype} min={float(_dbg_a.min()):.5f} max={float(_dbg_a.max()):.5f} rms={float(np.sqrt(np.mean(_dbg_a.astype(np.float64) ** 2))):.6f} pcm_sha1={_dbg_hashlib.sha1(_dbg_a.tobytes()).hexdigest()}", flush=True)  # PYTEST_DEBUG
 
         prompt_data = TokensPrompt(prompt_token_ids=token_ids)
         if audio_arrays:

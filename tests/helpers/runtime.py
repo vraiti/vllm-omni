@@ -607,17 +607,6 @@ class OmniServerStageCli(OmniServer):
                 print(f"\n=== stage {stage_id} replica {replica_id} log TAIL ({log_path}) ===", flush=True)
                 print("".join(tail_chunk).rstrip("\n"), flush=True)
             print(f"=== end stage {stage_id} replica {replica_id} log ===\n", flush=True)
-            # PYTEST_DEBUG: the head/tail truncation above elides one-shot debug
-            # prints (session.update, build_prompt, engine args) that land in the
-            # middle of the file, and high-frequency per-token prints in the tail
-            # can drown them out even when they land there. Pull every
-            # PYTEST_DEBUG-tagged line out of the full file separately so nothing
-            # is lost to truncation.
-            debug_lines = [line for line in lines if "PYTEST_DEBUG" in line]  # PYTEST_DEBUG
-            if debug_lines:  # PYTEST_DEBUG
-                print(f"\n=== stage {stage_id} replica {replica_id} PYTEST_DEBUG lines ({log_path}) ===", flush=True)  # PYTEST_DEBUG
-                print("".join(debug_lines).rstrip("\n"), flush=True)  # PYTEST_DEBUG
-                print(f"=== end stage {stage_id} replica {replica_id} PYTEST_DEBUG lines ===\n", flush=True)  # PYTEST_DEBUG
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._dump_stage_logs_for_debug()
