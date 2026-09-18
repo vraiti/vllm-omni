@@ -98,12 +98,21 @@ realtime_async_chunk_1gpu_server_params = [
             model=MODEL,
             stage_config_path=get_deploy_config_path("qwen3_omni_moe_1gpu.yaml"),
             use_stage_cli=True,
-            # vllm-omni-aux/utils/deploy.py always adds these for model_key
-            # "qwen3-omni" (DEFAULT_TOOL_CALL_PARSER). The replayed session's
-            # session.update sets tool_choice="auto" with tools=[]; without a
-            # configured parser, tool-call markup the model emits has nowhere
-            # to be intercepted and can leak into the transcript stream.
-            server_args=["--async-chunk", "--enable-auto-tool-choice", "--tool-call-parser", "hermes"],
+            # The replayed session's session.update sets tool_choice="auto"
+            # with tools=[]; without a configured tool-call parser, tool-call
+            # markup the model emits has nowhere to be intercepted and can
+            # leak into the transcript stream.
+            server_args=[
+                "--async-chunk",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "hermes",
+                "--enable-log-requests",
+                "--enable-log-outputs",
+            ],
+            # Verbose engine/orchestrator/duplex-pipeline logging for
+            # debugging the degenerate-output failure on this scenario.
+            env_dict={"VLLM_LOGGING_LEVEL": "DEBUG"},
             # This config colocates all three stages on one GPU. The stage-CLI
             # flow launches each stage as an independent process with no
             # cross-process memory-profiling lock (unlike ``vllm serve --omni
@@ -335,6 +344,7 @@ async def _run_client_vad_replay(
         f"ws://{host}:{port}/v1/realtime?model={model}",
         max_size=64 * 1024 * 1024,
     ) as ws:
+        t0 = asyncio.get_running_loop().time()
 
         async def receive_responses() -> None:
             async for message in ws:
@@ -342,12 +352,15 @@ async def _run_client_vad_replay(
                     continue
                 event = json.loads(message)
                 event_type = event.get("type")
+                elapsed = asyncio.get_running_loop().time() - t0
                 if event_type == "error":
                     errors.append(event)
+                    print(f"  [{elapsed:7.3f}s] <- {event_type} {event.get('error', event)}")
                 elif event_type == "response.created":
                     response_id = event["response"]["id"]
                     response_order.append(response_id)
                     answers_by_response_id[response_id] = ""
+                    print(f"  [{elapsed:7.3f}s] <- {event_type} response_id={response_id}")
                 elif event_type in {
                     "response.audio_transcript.delta",
                     "response.output_audio_transcript.delta",
@@ -355,13 +368,18 @@ async def _run_client_vad_replay(
                     "transcription.delta",
                 }:
                     response_id = event.get("response_id")
+                    delta = event.get("delta", "")
+                    print(f"  [{elapsed:7.3f}s] <- {event_type} response_id={response_id} delta={delta!r}")
                     if response_id in answers_by_response_id:
-                        answers_by_response_id[response_id] += event.get("delta", "")
+                        answers_by_response_id[response_id] += delta
                 elif event_type == "response.done":
                     response = event["response"]
                     response_id = response["id"]
                     text = answers_by_response_id.get(response_id, "")
                     completed_answers[response_id] = text or _output_text(response)
+                    print(f"  [{elapsed:7.3f}s] <- {event_type} response_id={response_id} status={response.get('status')}")
+                else:
+                    print(f"  [{elapsed:7.3f}s] <- {event_type}")
 
         receiver = asyncio.create_task(receive_responses())
         capture_start = records[0]["ts"]
@@ -379,6 +397,7 @@ async def _run_client_vad_replay(
                 # replay client uploads its optional reference-audio asset.
                 if "__VOICE__" in json.dumps(message):
                     continue
+                print(f"  [{asyncio.get_running_loop().time() - t0:7.3f}s] -> {message.get('type', '?')}")
                 await ws.send(json.dumps(message))
 
             await asyncio.sleep(wait_s)
