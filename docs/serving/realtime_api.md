@@ -43,8 +43,8 @@ event is base64-encoded raw PCM16.
 | Client to server | `input_audio_buffer.commit` with `final: true` | Marks the end of input |
 | Server to client | `transcription.delta` | Carries incremental response text |
 | Server to client | `transcription.done` | Carries final text and token usage |
-| Server to client | `response.audio.delta` | Carries incremental PCM16 response audio |
-| Server to client | `response.audio.done` | Marks the end of response audio |
+| Server to client | `response.output_audio.delta` | Carries incremental PCM16 response audio |
+| Server to client | `response.output_audio.done` | Marks the end of response audio |
 | Server to client | `error` | Reports an invalid event, model, or audio payload |
 
 A minimal client sends events in this order:
@@ -60,10 +60,16 @@ The initial non-final commit intentionally starts generation before all audio
 has arrived. Continue sending `input_audio_buffer.append` events while the
 engine is consuming the stream.
 
+This turn-based streaming path is distinct from the model-native full-duplex
+lane. For the buffered OpenAI Realtime connection, `response.create` instead
+builds a prompt from the audio committed before that request; audio appended
+while generation is running is used by the next response rather than being
+fed into the current generation.
+
 ## Audio Handling
 
 - Input is mono PCM16 at 16 kHz for the Qwen3-Omni example.
-- `response.audio.delta.audio` contains base64-encoded PCM16 bytes.
+- `response.output_audio.delta.audio` contains base64-encoded PCM16 bytes.
 - Read `sample_rate_hz` from each audio event instead of assuming an output
   rate. Qwen3-Omni output is typically 24 kHz.
 - Concatenate audio deltas in receive order to construct the output waveform.

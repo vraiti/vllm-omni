@@ -3,12 +3,19 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
 from openai.types import realtime as types
+
+MAX_HISTORY_BYTES = 64 * 1024 * 1024
+
+
+class HistoryLimitError(ValueError):
+    """Raised when adding an item would exceed the session history limit."""
 
 
 def _gen_id(prefix: str) -> str:
@@ -29,6 +36,7 @@ class ActiveResponse:
     response_id: str
     request_id: str
     item_id: str | None = None
+    terminal_event_sent: bool = False
 
 
 def _default_config() -> types.RealtimeSessionCreateRequest:
@@ -84,19 +92,9 @@ class AudioFullDuplexSessionState:
     item_duration_ms: dict[str, float] = field(default_factory=dict)
     item_token_ids: dict[str, list[int]] = field(default_factory=dict)
     item_in_progress: dict[str, bool] = field(default_factory=dict)
-    pending_truncations_ms: dict[str, int] = field(default_factory=dict)
+    pending_truncations_ms: dict[str, types.ConversationItemTruncateEvent] = field(default_factory=dict)
 
     input_audio_buffer: bytearray = field(default_factory=bytearray)
-    # PersonaPlex is served through ordinary AsyncOmni requests rather than a
-    # resumable scheduler request.  Keep its replay payload and frame-aligned
-    # PCM queue separate from the OpenAI turn buffer, whose bytes are consumed
-    # by input_audio_buffer.commit.
-    personaplex_audio_buffer: bytearray = field(default_factory=bytearray)
-    personaplex_prefill: Any | None = None
-    personaplex_frame_seq: int = 0
-    personaplex_epoch: int = 0
-    personaplex_prefill_slots: int | None = None
-    personaplex_session_started: bool = False
     active_response: ActiveResponse | None = None
 
     def find_item_index(self, item_id: str) -> int | None:
@@ -108,6 +106,25 @@ class AudioFullDuplexSessionState:
     def find_item(self, item_id: str) -> Any | None:
         idx = self.find_item_index(item_id)
         return self.items[idx] if idx is not None else None
+
+    @staticmethod
+    def _jsonable_item(item: Any) -> Any:
+        if hasattr(item, "model_dump"):
+            return item.model_dump(mode="json", exclude_none=True)
+        return item
+
+    def _history_size(self, items: list[Any] | None = None) -> int:
+        history = self.items if items is None else items
+        serialized = json.dumps(
+            [self._jsonable_item(item) for item in history],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return len(serialized.encode("utf-8"))
+
+    def _ensure_history_capacity(self, items: list[Any]) -> None:
+        if self._history_size(items) > MAX_HISTORY_BYTES:
+            raise HistoryLimitError(f"Conversation history exceeds the {MAX_HISTORY_BYTES} byte limit")
 
     def insert_item(self, item: Any, previous_item_id: str | None = None) -> int:
         if item.id is not None:
@@ -132,6 +149,9 @@ class AudioFullDuplexSessionState:
                 raise ValueError(f"previous_item_id '{previous_item_id}' not found")
             pos = idx + 1
 
+        candidate = [*self.items]
+        candidate.insert(pos, item)
+        self._ensure_history_capacity(candidate)
         self.items.insert(pos, item)
         return pos
 
@@ -145,6 +165,9 @@ class AudioFullDuplexSessionState:
             item.object = "realtime.item"
         if item.status is None:
             item.status = "completed"
+        candidate = [*self.items]
+        candidate[idx] = item
+        self._ensure_history_capacity(candidate)
         self.items[idx] = item
         return idx
 

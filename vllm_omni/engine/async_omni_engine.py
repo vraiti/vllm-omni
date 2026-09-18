@@ -1001,9 +1001,6 @@ class AsyncOmniEngine:
     ) -> None:
         """Initialize engine-wide settings resolved from pipeline metadata."""
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
-        self.openai_realtime_capabilities = (
-            dict(pipeline_config.openai_realtime_capabilities) if pipeline_config is not None else {}
-        )
         self._duplex_runtime_extension_path = (
             pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
         )
