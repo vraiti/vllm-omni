@@ -98,7 +98,12 @@ realtime_async_chunk_1gpu_server_params = [
             model=MODEL,
             stage_config_path=get_deploy_config_path("qwen3_omni_moe_1gpu.yaml"),
             use_stage_cli=True,
-            server_args=["--async-chunk"],
+            # vllm-omni-aux/utils/deploy.py always adds these for model_key
+            # "qwen3-omni" (DEFAULT_TOOL_CALL_PARSER). The replayed session's
+            # session.update sets tool_choice="auto" with tools=[]; without a
+            # configured parser, tool-call markup the model emits has nowhere
+            # to be intercepted and can leak into the transcript stream.
+            server_args=["--async-chunk", "--enable-auto-tool-choice", "--tool-call-parser", "hermes"],
             # This config colocates all three stages on one GPU. The stage-CLI
             # flow launches each stage as an independent process with no
             # cross-process memory-profiling lock (unlike ``vllm serve --omni
