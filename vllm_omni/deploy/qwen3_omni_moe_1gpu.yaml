@@ -14,7 +14,7 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_model_len: 8196
+    max_model_len: 4096
     max_num_batched_tokens: 8196
     max_num_seqs: 128
     gpu_memory_utilization: 0.7
@@ -30,7 +30,7 @@ stages:
       repetition_penalty: 1.05
 
   - stage_id: 1
-    max_model_len: 8196
+    max_model_len: 4096
     max_num_batched_tokens: 8196
     max_num_seqs: 4
     gpu_memory_utilization: 0.15
@@ -47,7 +47,7 @@ stages:
       repetition_penalty: 1.05
 
   - stage_id: 2
-    max_model_len: 8196
+    max_model_len: 4096
     max_num_batched_tokens: 8196
     max_num_seqs: 4
     gpu_memory_utilization: 0.05
