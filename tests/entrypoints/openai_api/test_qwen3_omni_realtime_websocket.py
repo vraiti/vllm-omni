@@ -99,6 +99,13 @@ realtime_async_chunk_1gpu_server_params = [
             stage_config_path=get_deploy_config_path("qwen3_omni_moe_1gpu.yaml"),
             use_stage_cli=True,
             server_args=["--async-chunk"],
+            # This config colocates all three stages on one GPU. The stage-CLI
+            # flow launches each stage as an independent process with no
+            # cross-process memory-profiling lock (unlike ``vllm serve --omni
+            # --deploy``), so firing them a couple seconds apart lets stage 1
+            # profile GPU memory before stage 0's own footprint is committed
+            # and OOM. Serialize the launches instead.
+            sequential_stage_launch=True,
         ),
         id="async_chunk_1gpu",
     ),
