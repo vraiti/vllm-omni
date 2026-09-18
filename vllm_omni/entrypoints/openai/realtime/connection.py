@@ -965,6 +965,7 @@ class OpenAIFullDuplexConnection:
                         limit_reached = True
                     delta_text = first_out.text or ""
                     delta_token_ids = list(first_out.token_ids)
+                    print(f"PYTEST_DEBUG connection.py thinker delta_text={delta_text!r} delta_token_ids={delta_token_ids} finish_reason={finish_reason_value}")  # PYTEST_DEBUG
                     usage.output_tokens += len(delta_token_ids)
                     # Raw thinker token stream, in talker-consumption order --
                     # this is what _qwen3_omni_truncate_transcript correlates
