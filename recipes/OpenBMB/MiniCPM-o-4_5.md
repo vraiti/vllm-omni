@@ -388,3 +388,23 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 - **Async chunking**: enabled in all deploy configs. Talker sends
   25-code chunks with three-code left context to Code2Wav through
   `SharedMemoryConnector`; terminal chunks flush held lookahead state.
+
+## Live sessions (`/v1/live/sessions`)
+
+Serves the OpenAI Live API (`vad: native`: 1 s audio units, the model decides when to listen or speak). Two processes (no VAD service); see
+[`docs/serving/live_sessions_api.md`](../../docs/serving/live_sessions_api.md)
+for the protocol and deploy keys.
+
+```bash
+# ASR service (plain vLLM, not --omni); leave GPU memory for it in the model's overlay
+vllm serve openai/whisper-large-v3-turbo --port 15152 --gpu-memory-utilization 0.08
+
+vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code --port 8000 \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_live.yaml
+```
+
+Voice: `default`. The overlay switches to the turn-based engine (`session_mode: turn`) and installs
+`MiniCPMODuplexLogitsProcessor` on stage 0 for Live requests only. No VAD service is needed.
+
+Status: implemented; end-to-end validation on GPU with the LiveKit example
+(`examples/online_serving/live_sessions/livekit/`) is pending.

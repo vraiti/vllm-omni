@@ -17,6 +17,7 @@ The inter-stage input processors named below live in
 the talker<->code2wav seam; they are built by the lead alongside the talker.
 """
 
+from vllm_omni.config.live_session import LiveSessionConfig, UnsupportedFeatures
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -38,6 +39,17 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
         "vllm_omni.model_executor.models.personaplex.duplex.serving_adapter.PersonaPlexServingRuntimeAdapter"
     ),
     duplex_control_enabled=True,
+    live_session_config=LiveSessionConfig(
+        vad="native",
+        audio_buffer_ms=80,
+        live_session_processor=(
+            "vllm_omni.model_executor.models.personaplex.live.processor:PersonaPlexLiveSessionProcessor"
+        ),
+        unsupported_features=UnsupportedFeatures(
+            events=("session.instructions.append", "response.item.create", "response.create"),
+            session_configs=("delegation.responses.tools",),
+        ),
+    ),
     stages=(
         StagePipelineConfig(
             stage_id=0,

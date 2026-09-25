@@ -245,3 +245,27 @@ vllm bench serve \
 - `/v1/realtime` is unsupported while `async_chunk` is enabled.
 - The default deploy uses `SharedMemoryConnector`; this is for single-host
   stage wiring.
+
+## Live sessions (`/v1/live/sessions`)
+
+Serves the OpenAI Live API (`vad: external`: Silero VAD service turns, 1x paced output, server-side barge-in truncation). Three processes; see
+[`docs/serving/live_sessions_api.md`](../../docs/serving/live_sessions_api.md)
+for the protocol and deploy keys.
+
+```bash
+# VAD service (CPU), see docs/serving/live_sessions_api.md#vad-service for endpointing flags
+python -m vllm_omni.entrypoints.live_vad_service --port 15151
+
+# ASR service (plain vLLM, not --omni); leave GPU memory for it in the model's overlay
+vllm serve openai/whisper-large-v3-turbo --port 15152 --gpu-memory-utilization 0.08
+
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
+  --deploy-config vllm_omni/deploy/qwen3_omni_live.yaml
+```
+
+Voices: `chelsie`, `ethan`, `aiden`. Tool calls use the hermes format through `delegation.responses.tools`.
+The overlay inherits the 2-GPU layout of `qwen3_omni_moe.yaml`; adjust `devices` and
+`gpu_memory_utilization` per stage for other layouts.
+
+Status: implemented; end-to-end validation on GPU with the LiveKit example
+(`examples/online_serving/live_sessions/livekit/`) is pending.

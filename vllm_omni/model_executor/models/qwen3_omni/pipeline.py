@@ -10,6 +10,7 @@ Stage 2: Code2Wav — RVQ codes → audio waveform
 from transformers import Qwen3OmniMoeConfig
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
+from vllm_omni.config.live_session import LiveSessionConfig
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -25,6 +26,12 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
     duplex_plugin="vllm_omni.model_executor.models.qwen3_omni.duplex.plugin.Qwen3OmniDuplexPlugin",
     default_deploy_config_name="qwen3_omni_moe.yaml",
     model_arch="Qwen3OmniMoeForConditionalGeneration",
+    live_session_config=LiveSessionConfig(
+        vad="external",
+        live_session_processor=(
+            "vllm_omni.model_executor.models.qwen3_omni.live.processor:Qwen3OmniLiveSessionProcessor"
+        ),
+    ),
     endpoint_restrictions=(
         EndpointRestriction(
             OmniServingCapability.COMPLETIONS,

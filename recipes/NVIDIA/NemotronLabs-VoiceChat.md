@@ -262,3 +262,9 @@ sessions fall back to eager stepping.
   client-owned: the server emits function-call events, accepts a validated
   `function_call_output`, and resumes the live model with the returned result;
   it does not execute arbitrary tools itself.
+
+## Live sessions (`/v1/live/sessions`)
+
+Not supported: the thinker is frame-locked (one text token per 80 ms frame,
+`ignore_eos`), and there is no turn-based generation profile for the external-VAD
+Live path. See [`docs/serving/live_sessions_api.md`](../../docs/serving/live_sessions_api.md).

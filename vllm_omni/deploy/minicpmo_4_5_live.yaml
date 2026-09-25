@@ -1,0 +1,12 @@
+# MiniCPM-o 4.5 on OpenAI Live (/v1/live/sessions): native VAD. One resumable
+# request per session is appended to every second of user audio; the model's
+# duplex grammar is enforced by the Live logits processor declared in the
+# pipeline. Whisper supplies input transcripts.
+base_config: minicpmo_4_5.yaml
+session_mode: turn
+
+live_session_config:
+  session_lifetime_s: 1800
+  native_vad:
+    audio_transcription_interval_ms: 10000
+  asr_service_url: http://localhost:15152

@@ -1,0 +1,20 @@
+# Qwen3-Omni on OpenAI Live (/v1/live/sessions): turn-based engine driven by
+# the external Silero VAD service, with Whisper for transcripts and output
+# timestamps. See recipes/Qwen/Qwen3-Omni.md#live-sessions for the three
+# process launch.
+base_config: qwen3_omni_moe.yaml
+session_mode: turn
+
+live_session_config:
+  session_lifetime_s: 1800
+  external_vad:
+    output_audio_delta_size_ms: 500
+    vad_service_url: ws://localhost:15151
+  asr_service_url: http://localhost:15152
+
+stages:
+  - stage_id: 0
+    # Each user turn is one audio item. Re-rendered history beyond this many
+    # audio turns falls back to their transcripts.
+    limit_mm_per_prompt:
+      audio: 32

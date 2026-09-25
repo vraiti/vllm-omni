@@ -1,0 +1,13 @@
+# PersonaPlex on OpenAI Live (/v1/live/sessions): native VAD. Every 80 ms
+# input frame is one streaming update of the session's resumable request,
+# carried to the talker's stage-0 duplex runtime (streaming Mimi encode,
+# voice/persona prefill, depformer teacher forcing). Whisper supplies input
+# transcripts.
+base_config: personaplex.yaml
+session_mode: turn
+
+live_session_config:
+  session_lifetime_s: 1800
+  native_vad:
+    audio_transcription_interval_ms: 10000
+  asr_service_url: http://localhost:15152

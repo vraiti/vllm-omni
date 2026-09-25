@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
+from vllm_omni.config.live_session import LiveSessionConfig, LiveSessionDeployConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -331,6 +332,9 @@ class PipelineConfig:
     duplex_runtime_extension: str | None = None
     duplex_serving_adapter: str | None = None
     duplex_control_enabled: bool = False
+    # OpenAI Live (``/v1/live/sessions``) capabilities. Served only when the
+    # deploy config also carries a ``live_session_config`` object.
+    live_session_config: LiveSessionConfig | None = None
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
@@ -378,6 +382,11 @@ class PipelineConfig:
         # pipeline without one can never emit a result, so every request hangs.
         if not any(s.final_output for s in self.stages):
             errors.append("No terminal stage (stage with final_output=True)")
+        if self.live_session_config is not None:
+            errors.extend(self.live_session_config.get_validation_errors())
+            for stage_id in self.live_session_config.logits_processor:
+                if stage_id not in stage_id_set:
+                    errors.append(f"live_session_config.logits_processor references non-existent stage {stage_id}")
         return errors
 
 
@@ -583,6 +592,8 @@ class DeployConfig:
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
+    # Enables /v1/live/sessions when present.
+    live_session_config: LiveSessionDeployConfig | None = None
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -810,6 +821,11 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "model_runner": model_runner,
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
+        "live_session_config": (
+            LiveSessionDeployConfig.from_dict(raw_dict["live_session_config"])
+            if raw_dict.get("live_session_config") is not None
+            else None
+        ),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -988,6 +1004,29 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
 PIPELINE_WIDE_ENGINE_FIELDS = _PIPELINE_WIDE_ENGINE_FIELDS
 
 
+def _add_live_session_logits_processor(
+    engine_args: dict[str, Any],
+    ps: StagePipelineConfig,
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+) -> None:
+    """Fold the model's Live logits processor into the stage's engine args.
+
+    Only on Live deployments, so chat deployments of the same model keep their
+    sampling untouched.
+    """
+    live = pipeline.live_session_config
+    if deploy.live_session_config is None or live is None:
+        return
+    fqcn = live.logits_processor.get(ps.stage_id)
+    if not fqcn:
+        return
+    processors = list(engine_args.get("logits_processors") or [])
+    if fqcn not in processors:
+        processors.append(fqcn)
+    engine_args["logits_processors"] = processors
+
+
 def _build_engine_args(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
@@ -1037,6 +1076,7 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
+    _add_live_session_logits_processor(engine_args, ps, pipeline, deploy)
     engine_args["async_chunk"] = resolve_stage_async_chunk(deploy, ds)
     engine_args["session_mode"] = deploy.session_mode
     if deploy.session_mode == "duplex":

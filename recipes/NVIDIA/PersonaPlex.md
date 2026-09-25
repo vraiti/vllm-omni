@@ -152,3 +152,24 @@ python tests/e2e/online_serving/personaplex_realtime_duplex.py \
   engine speed. On localhost it is smooth.
 - Sliding window is 3000 frames (~4 min). The ring KV recycles beyond that;
   very long sessions keep running with a rolling context.
+
+## Live sessions (`/v1/live/sessions`)
+
+Serves the OpenAI Live API (`vad: native`: 80 ms frames through the stage-0 duplex runtime). Two processes (no VAD service); see
+[`docs/serving/live_sessions_api.md`](../../docs/serving/live_sessions_api.md)
+for the protocol and deploy keys.
+
+```bash
+# ASR service (plain vLLM, not --omni); leave GPU memory for it in the model's overlay
+vllm serve openai/whisper-large-v3-turbo --port 15152 --gpu-memory-utilization 0.08
+
+vllm serve /path/to/personaplex-7b-v1 --omni --port 8000 \
+  --deploy-config vllm_omni/deploy/personaplex_live.yaml
+```
+
+Use a local checkpoint directory: voices and the tokenizer are read from it.
+Voices are the bundled voice prompts (`NATF2`, ...); `instructions` is the persona. No VAD service is needed.
+Output transcripts are not produced (the talker's text stream is not a final output).
+
+Status: implemented; end-to-end validation on GPU with the LiveKit example
+(`examples/online_serving/live_sessions/livekit/`) is pending.

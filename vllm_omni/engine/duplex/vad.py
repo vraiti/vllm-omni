@@ -186,7 +186,7 @@ class TorchSileroBackend:
             raise ServerVADUnavailableError(
                 "server_vad needs either a local Silero ONNX artifact (see "
                 "duplex_session.server_vad_model_path) or the optional 'silero-vad' "
-                "package; install vllm-omni[server-vad]"
+                "package (pip install silero-vad)"
             ) from exc
         self._torch = torch
         self._model = load_silero_vad(onnx=False)
