@@ -64,11 +64,9 @@ def _reference_audio(model_path: str, sample_rate: int) -> np.ndarray:
 class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
     input_sample_rate: ClassVar[int] = 16_000
     output_sample_rate: ClassVar[int] = 24_000
-    # Official streaming_generate defaults.
+    # Official streaming_generate max_new_speak_tokens_per_chunk. Sampling
+    # stays the deploy config's (greedy) so sessions are deterministic.
     max_unit_tokens: ClassVar[int] = 20
-    temperature: ClassVar[float] = 0.7
-    top_p: ClassVar[float] = 0.8
-    top_k: ClassVar[int] = 100
     # Units a resubmission keeps; plus the reference clip, within limit_mm_per_prompt audio (64).
     max_audio_units: ClassVar[int] = 60
 
@@ -117,9 +115,12 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
         if len(params) > 1 and hasattr(params[1], "clone"):
             # The Talker's per-unit codec budget comes with each handoff
             # (llm2tts); the deploy YAML's offline min_tokens would pad every
-            # ~1 s unit.
+            # ~1 s unit. Greedy codec sampling keeps sessions deterministic.
             params[1] = params[1].clone()
             params[1].min_tokens = 0
+            params[1].temperature = 0.0
+            params[1].top_p = 1.0
+            params[1].top_k = -1
         return params
 
     def stage0_sampling_params(self, state: LiveSessionState, base: Any) -> Any:
@@ -127,9 +128,6 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
         stops = [self.listen_id, self.chunk_eos_id, self.chunk_tts_eos_id]
         params.stop_token_ids = list(dict.fromkeys([*(params.stop_token_ids or []), *stops]))
         params.max_tokens = self.max_unit_tokens
-        params.temperature = self.temperature
-        params.top_p = self.top_p
-        params.top_k = self.top_k
         params.extra_args = {
             **(params.extra_args or {}),
             "minicpmo_live": {
