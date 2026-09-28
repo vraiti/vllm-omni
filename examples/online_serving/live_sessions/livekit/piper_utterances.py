@@ -6,7 +6,8 @@
     pip install piper-tts
     python piper_utterances.py            # writes fixtures/*.wav (24 kHz mono PCM16)
 
-The fixtures are committed; rerun only to change them.
+The fixtures are not committed (the repo ignores *.wav): run this once before
+``headless.py``. It only needs a CPU, so it can run while the servers start.
 """
 
 from __future__ import annotations
