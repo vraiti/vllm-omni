@@ -821,11 +821,25 @@ def llm2tts(
                 "mm_output_keys": sorted(str(k) for k in mm_output) if isinstance(mm_output, Mapping) else None,
                 "text": thinker_text[:200],
             }
+            # Derived segment (hypothesis): n computed output tokens this unit.
+            _dbg_rows = _dbg_latent.shape[0] if getattr(_dbg_latent, "shape", None) is not None else None
+            if _dbg_rows is not None and _dbg_prompt is not None and _dbg_cum is not None:
+                _dbg_n = int(_dbg_rows) - len(_dbg_prompt)
+                _dbg_seg = list(_dbg_cum)[-(_dbg_n + 1) :] if _dbg_n >= 0 else None
+                _dbg_record["segment_n"] = _dbg_n
+                _dbg_record["segment_ids"] = _dbg_seg
+                _dbg_decode = getattr(_streaming_context, "source_token_decoder", None)
+                if callable(_dbg_decode) and _dbg_seg:
+                    _dbg_record["segment_text"] = _dbg_decode(_dbg_seg)
             _dbg_os.makedirs("/tmp/logs", exist_ok=True)
             with open("/tmp/logs/llm2tts-debug.jsonl", "a") as _dbg_file:
                 _dbg_file.write(_dbg_json.dumps(_dbg_record, default=str) + "\n")
         except Exception as _dbg_exc:  # never let debugging break the bridge
             logger.warning("llm2tts debug record failed: %r", _dbg_exc)
+        # DEBUG(live-sessions) HACK: never forward Live requests to the Talker,
+        # so it cannot crash and the session reaches speaking units. Temporary.
+        if str(getattr(llm_output, "request_id", "")).startswith("live-"):
+            continue
         native_turn_start = False
         if _has_native_duplex_prompt_metadata(mm_output):
             # The thinker's resumable duplex request reports cumulative
