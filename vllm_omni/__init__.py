@@ -81,14 +81,11 @@ def _install_call_trace() -> None:
     thread's stack, the called function included; time is the wall clock
     (Unix seconds) at the call. Generator/coroutine frames are logged on
     their first start only. Installed on every thread; each process that
-    imports vllm_omni traces itself. SIGUSR1 appends every thread's Python
-    stack to /tmp/logs/call-trace/stacks_<pid>.log.
+    imports vllm_omni traces itself.
     """
     import dis
-    import faulthandler
     import inspect
     import os
-    import signal
     import sys
     import threading
     import time
@@ -204,17 +201,6 @@ def _install_call_trace() -> None:
     else:
         threading.settrace(trace)
         sys.settrace(trace)
-
-    # SIGUSR1 dumps every thread's full Python stack (not just vllm_omni) to
-    # stacks_<pid>.log, to see what a call is waiting on inside torch/vLLM.
-    def register_stack_dump():
-        stacks = open(f"{directory}/stacks_{os.getpid()}.log", "w", buffering=1)
-        stacks_files.append(stacks)  # keep the file open while registered
-        faulthandler.register(signal.SIGUSR1, file=stacks, all_threads=True)
-
-    stacks_files: list = []
-    register_stack_dump()
-    os.register_at_fork(after_in_child=register_stack_dump)
 
 
 import os as _os  # noqa: E402
