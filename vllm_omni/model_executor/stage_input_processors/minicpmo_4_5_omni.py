@@ -257,6 +257,12 @@ def tts2code2wav_async_chunk(
         segment_text_utf8 = None
     turn_end = bool(_coerce_int(output_meta.get("turn_end")))
     duplex_turn_key = (duplex_epoch, duplex_turn_id)
+    # /v1/live/sessions: the request spans the whole session. Each unit's
+    # segment end flushes its audio; only a turn end closes the stream, and
+    # the next turn starts a fresh codec stream (official MiniCPMODuplex
+    # resets Token2Wav per turn).
+    live = bool(_coerce_int(output_meta.get("minicpmo_live")))
+    live_turn_end = live and bool(_coerce_int(output_meta.get("live_turn_end")))
 
     request_payload = getattr(transfer_manager, "request_payload", None)
     if request_payload is None:
@@ -332,7 +338,10 @@ def tts2code2wav_async_chunk(
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
     flush_pending = finished
-    last_chunk = bool(flush_pending and (not native_duplex or turn_end))
+    if live:
+        last_chunk = bool(flush_pending and live_turn_end)
+    else:
+        last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:
         return None
 
@@ -372,7 +381,7 @@ def tts2code2wav_async_chunk(
         # zero length tells Code2Wav to discard the placeholder.
         output_codes = [0]
 
-    if last_chunk and not native_duplex:
+    if last_chunk and not native_duplex and not live:
         record["retired_internal_ids"].add(internal_id)
         _drop_codec_state(transfer_manager, request_id)
 
@@ -411,7 +420,7 @@ def tts2code2wav_async_chunk(
             duplex_turn_id=duplex_turn_id,
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
-            turn_end=turn_end and last_chunk,
+            turn_end=(live_turn_end if live else turn_end) and last_chunk,
             replace_runtime_additional_information=True,
             ref_audio_sr=ref_audio_sr,
         ),
@@ -419,6 +428,10 @@ def tts2code2wav_async_chunk(
     )
     if last_chunk and native_duplex:
         record["last_terminal_turn"] = duplex_turn_key
+        record["cache_epoch"] = int(record["cache_epoch"]) + 1
+        record["chunk_seq"] = 0
+        _drop_codec_state(transfer_manager, request_id)
+    elif last_chunk and live:
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         _drop_codec_state(transfer_manager, request_id)

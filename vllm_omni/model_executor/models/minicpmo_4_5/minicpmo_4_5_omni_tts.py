@@ -732,6 +732,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._mask_eos_rows = mask_eos_rows
         self._penalty_histories = penalty_histories
         meta_outputs = {"finished": terminal_flags}
+        live_infos = [info.get("minicpmo_live") if isinstance(info, dict) else None for info in infos]
+        if any(isinstance(live, Mapping) for live in live_infos):
+            # /v1/live/sessions rows: tts2code2wav_async_chunk flushes each
+            # unit and resets Token2Wav at a turn end.
+            meta_outputs["minicpmo_live"] = [
+                torch.tensor(isinstance(live, Mapping), dtype=torch.bool) for live in live_infos
+            ]
+            meta_outputs["live_turn_end"] = [
+                torch.tensor(isinstance(live, Mapping) and bool(live.get("turn_end")), dtype=torch.bool)
+                for live in live_infos
+            ]
         if emit_duplex_metadata:
             meta_outputs.update(
                 {
