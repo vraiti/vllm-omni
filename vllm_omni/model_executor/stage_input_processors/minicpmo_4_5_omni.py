@@ -724,6 +724,104 @@ def _build_tts_scheduler_prompt_token_ids(
     raise ValueError("MiniCPM-o TTS stage requires at least one scheduler prompt token")
 
 
+# Official MiniCPMODuplex.streaming_generate: max_token_per_chunk = 25 + 1.
+MINICPMO45_LIVE_CODEC_TOKENS_PER_UNIT = 26
+
+
+def _minicpmo45_live_marker(prompt_item) -> Mapping | None:
+    """The /v1/live/sessions marker the Live processor puts on a request's
+    first prompt (``model_intermediate_buffer["minicpmo_live"]``)."""
+    if isinstance(prompt_item, Mapping):
+        buffer = prompt_item.get("model_intermediate_buffer")
+    else:
+        buffer = getattr(prompt_item, "model_intermediate_buffer", None)
+    marker = buffer.get("minicpmo_live") if isinstance(buffer, Mapping) else None
+    return marker if isinstance(marker, Mapping) else None
+
+
+def _minicpmo45_live_tts_input(llm_output, marker: Mapping) -> OmniTokensPrompt | None:
+    """Talker input for the unit a /v1/live/sessions stage-0 segment just
+    finished, derived from this output alone.
+
+    Every unit's sampled tokens end with exactly one stop token (listen,
+    chunk_eos, chunk_tts_eos), so the current unit is what follows the
+    previous stop in ``cumulative_token_ids``. The stop is sampled but never
+    computed, and the latent holds one row per computed position, so the
+    unit's ``k`` computed tokens are the latent's last ``k`` rows. As in the
+    official MiniCPMODuplex, a listen unit produces no speech, the unit's
+    first token does not condition the Talker, a unit ending in
+    ``<|turn_eos|>`` ends the turn, and a turn's first unit starts a fresh
+    Talker context.
+    """
+    output = llm_output.outputs[0]
+    ids = getattr(output, "cumulative_token_ids", None)
+    if ids is None:
+        ids = getattr(output, "token_ids", None)
+    ids = [int(token) for token in (ids or [])]
+    listen, turn_eos = int(marker["listen"]), int(marker["turn_eos"])
+    stops = {listen, int(marker["chunk_eos"]), int(marker["chunk_tts_eos"])}
+    stop_positions = [index for index, token in enumerate(ids) if token in stops]
+    if not ids or ids[-1] not in stops or ids[-1] == listen:
+        return None
+
+    unit_start = stop_positions[-2] + 1 if len(stop_positions) > 1 else 0
+    spoken = ids[unit_start:-1]
+    rows = None
+    if spoken:
+        mm_output = getattr(llm_output, "multimodal_output", None)
+        if not isinstance(mm_output, Mapping):
+            mm_output = getattr(output, "multimodal_output", None)
+        latent = mm_output.get("latent") if isinstance(mm_output, Mapping) else None
+        if latent is None:
+            latent = getattr(output, "hidden_states", None)
+        if latent is None:
+            raise ValueError("MiniCPM-o Live Talker handoff has no thinker latent")
+        latent = latent.detach()
+        if latent.ndim == 3 and latent.shape[0] == 1:
+            latent = latent.squeeze(0)
+        if latent.shape[0] < len(spoken):
+            raise ValueError(
+                f"MiniCPM-o Live unit has {len(spoken)} computed tokens but the latent holds {latent.shape[0]} rows"
+            )
+        rows = latent[-len(spoken) :]
+
+    turn_end = bool(spoken) and spoken[-1] == turn_eos
+    # The turn starts here unless the previous speaking unit did not end it.
+    turn_start = True
+    for position in range(len(stop_positions) - 2, -1, -1):
+        stop_index = stop_positions[position]
+        if ids[stop_index] == listen:
+            continue
+        previous_start = stop_positions[position - 1] + 1 if position > 0 else 0
+        previous_spoken = ids[previous_start:stop_index]
+        turn_start = bool(previous_spoken) and previous_spoken[-1] == turn_eos
+        break
+
+    condition_ids = spoken[1:]
+    condition_rows = rows[1:].to(torch.float32).contiguous() if rows is not None else None
+    budget = MINICPMO45_LIVE_CODEC_TOKENS_PER_UNIT
+    buffer: dict = {
+        "minicpmo_live": {
+            "token_ids": condition_ids,
+            "hidden_states": _to_transport_list(condition_rows) if condition_ids else [],
+            "turn_start": turn_start,
+            "turn_end": turn_end,
+            "codec_max": budget,
+            # Official: at least a chunk's worth of audio, except at a turn's
+            # edges (allow <1 s at its start, stop freely at its end).
+            "codec_min": 0 if turn_start or turn_end else budget,
+        }
+    }
+    if turn_start:
+        buffer["meta"] = {"replace_streaming_prompt": True}
+    return OmniTokensPrompt(
+        prompt_token_ids=[0] * (len(condition_ids) + 1),
+        model_intermediate_buffer=buffer,
+        multi_modal_data=None,
+        mm_processor_kwargs=None,
+    )
+
+
 def llm2tts(
     source_outputs,
     prompt: OmniTokensPrompt | TextPrompt = None,
@@ -742,7 +840,9 @@ def llm2tts(
 
     multi_modal_data = {}
     reference_audio_by_request_id = {}
+    live_markers = {}
     for llm_output, p in zip(llm_outputs, prompt):
+        live_markers[llm_output.request_id] = _minicpmo45_live_marker(p)
         if isinstance(p, dict):
             multi_modal_data[llm_output.request_id] = p.get("multi_modal_data", None)
         else:
@@ -750,6 +850,12 @@ def llm2tts(
         reference_audio_by_request_id[llm_output.request_id] = _extract_prompt_reference_audio(p)
 
     for llm_output in llm_outputs:
+        live_marker = live_markers.get(llm_output.request_id)
+        if live_marker is not None:
+            live_input = _minicpmo45_live_tts_input(llm_output, live_marker)
+            if live_input is not None:
+                tts_inputs.append(live_input)
+            continue
         output = llm_output.outputs[0]
         request_mm_output = getattr(llm_output, "multimodal_output", None)
         completion_mm_output = getattr(output, "multimodal_output", None)
@@ -784,62 +890,6 @@ def llm2tts(
         # buffer overflows.
         llm_output_ids = list(llm_output_ids)
         thinker_text = getattr(output, "text", "") or ""
-        # DEBUG(live-sessions): record what llm2tts receives per call. Temporary.
-        try:
-            import json as _dbg_json
-            import os as _dbg_os
-
-            def _dbg_len(value):
-                try:
-                    return len(value)
-                except TypeError:
-                    return None
-
-            def _dbg_shape(value):
-                shape = getattr(value, "shape", None)
-                return list(shape) if shape is not None else None
-
-            _dbg_raw = getattr(output, "token_ids", None)
-            _dbg_cum = getattr(output, "cumulative_token_ids", None)
-            _dbg_prompt = getattr(llm_output, "prompt_token_ids", None)
-            _dbg_latent = mm_output.get("latent") if isinstance(mm_output, Mapping) else None
-            _dbg_record = {
-                "pid": _dbg_os.getpid(),
-                "request_id": str(getattr(llm_output, "request_id", None)),
-                "streaming_enabled": getattr(_streaming_context, "enabled", None),
-                "llm_output_finished": getattr(llm_output, "finished", None),
-                "output_finish_reason": getattr(output, "finish_reason", None),
-                "prompt_len": _dbg_len(_dbg_prompt),
-                "token_ids_len": _dbg_len(_dbg_raw),
-                "cumulative_len": _dbg_len(_dbg_cum),
-                "token_ids_head": list(_dbg_raw)[:8] if _dbg_raw is not None else None,
-                "token_ids_tail": list(_dbg_raw)[-8:] if _dbg_raw is not None else None,
-                "cumulative_tail": list(_dbg_cum)[-8:] if _dbg_cum is not None else None,
-                "prompt_tail": list(_dbg_prompt)[-8:] if _dbg_prompt is not None else None,
-                "latent_shape": _dbg_shape(_dbg_latent),
-                "output_hidden_shape": _dbg_shape(getattr(output, "hidden_states", None)),
-                "mm_output_keys": sorted(str(k) for k in mm_output) if isinstance(mm_output, Mapping) else None,
-                "text": thinker_text[:200],
-            }
-            # Derived segment (hypothesis): n computed output tokens this unit.
-            _dbg_rows = _dbg_latent.shape[0] if getattr(_dbg_latent, "shape", None) is not None else None
-            if _dbg_rows is not None and _dbg_prompt is not None and _dbg_cum is not None:
-                _dbg_n = int(_dbg_rows) - len(_dbg_prompt)
-                _dbg_seg = list(_dbg_cum)[-(_dbg_n + 1) :] if _dbg_n >= 0 else None
-                _dbg_record["segment_n"] = _dbg_n
-                _dbg_record["segment_ids"] = _dbg_seg
-                _dbg_decode = getattr(_streaming_context, "source_token_decoder", None)
-                if callable(_dbg_decode) and _dbg_seg:
-                    _dbg_record["segment_text"] = _dbg_decode(_dbg_seg)
-            _dbg_os.makedirs("/tmp/logs", exist_ok=True)
-            with open("/tmp/logs/llm2tts-debug.jsonl", "a") as _dbg_file:
-                _dbg_file.write(_dbg_json.dumps(_dbg_record, default=str) + "\n")
-        except Exception as _dbg_exc:  # never let debugging break the bridge
-            logger.warning("llm2tts debug record failed: %r", _dbg_exc)
-        # DEBUG(live-sessions) HACK: never forward Live requests to the Talker,
-        # so it cannot crash and the session reaches speaking units. Temporary.
-        if str(getattr(llm_output, "request_id", "")).startswith("live-"):
-            continue
         native_turn_start = False
         if _has_native_duplex_prompt_metadata(mm_output):
             # The thinker's resumable duplex request reports cumulative

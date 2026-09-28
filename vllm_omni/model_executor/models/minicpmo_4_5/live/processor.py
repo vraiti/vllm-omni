@@ -112,6 +112,16 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
             )
         return voice_id
 
+    def sampling_params_list(self, base: Any) -> list[Any]:
+        params = super().sampling_params_list(base)
+        if len(params) > 1 and hasattr(params[1], "clone"):
+            # The Talker's per-unit codec budget comes with each handoff
+            # (llm2tts); the deploy YAML's offline min_tokens would pad every
+            # ~1 s unit.
+            params[1] = params[1].clone()
+            params[1].min_tokens = 0
+        return params
+
     def stage0_sampling_params(self, state: LiveSessionState, base: Any) -> Any:
         params = super().stage0_sampling_params(state, base)
         stops = [self.listen_id, self.chunk_eos_id, self.chunk_tts_eos_id]
@@ -160,13 +170,26 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
             *encode(suffix, add_special_tokens=False),
         ]
 
-    def _prompt(self, token_ids: list[int], audio: list[np.ndarray]) -> dict[str, Any]:
+    def _prompt(self, token_ids: list[int], audio: list[np.ndarray], *, first: bool = False) -> dict[str, Any]:
         clips = [(clip, self.input_sample_rate) for clip in audio]
-        return {
+        prompt = {
             "prompt_token_ids": token_ids,
             "multi_modal_data": {"audio": clips if len(clips) > 1 else clips[0]},
             "mm_processor_kwargs": {"live_duplex_unit": True},
         }
+        if first:
+            # The orchestrator hands the request's first prompt to llm2tts on
+            # every stage-0 output: it marks the request as Live and carries
+            # the unit grammar's token ids.
+            prompt["model_intermediate_buffer"] = {
+                "minicpmo_live": {
+                    "listen": self.listen_id,
+                    "chunk_eos": self.chunk_eos_id,
+                    "chunk_tts_eos": self.chunk_tts_eos_id,
+                    "turn_eos": self.turn_eos_id,
+                }
+            }
+        return prompt
 
     def _num_tokens(self, token_ids: list[int], units: int, *, reference: bool = False) -> int:
         tokens = len(token_ids) + units * (_AUDIO_TOKENS_PER_UNIT - len(self._placeholder_ids))
@@ -191,7 +214,7 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
             head = [last_sampled_token] if last_sampled_token is not None else []
             ids = [*head, self.unit_end_id, self.unit_id, *self._placeholder_ids]
             audio = [unit.audio]
-        return RenderedPrompt(self._prompt(ids, audio), self._num_tokens(ids, 1, reference=first))
+        return RenderedPrompt(self._prompt(ids, audio, first=first), self._num_tokens(ids, 1, reference=first))
 
     def render_native_resume(self, state: LiveSessionState) -> RenderedPrompt:
         units = [item for item in state.history if isinstance(item, NativeUnitItem)]
@@ -201,7 +224,7 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
             if index < len(units) - 1:
                 ids += [*unit.token_ids, self.unit_end_id]
         audio = [self.reference_audio, *(u.audio for u in units)]
-        return RenderedPrompt(self._prompt(ids, audio), self._num_tokens(ids, len(units), reference=True))
+        return RenderedPrompt(self._prompt(ids, audio, first=True), self._num_tokens(ids, len(units), reference=True))
 
     def left_trim(self, state: LiveSessionState, keep_units: int) -> bool:
         keep_units = min(keep_units, self.max_audio_units)

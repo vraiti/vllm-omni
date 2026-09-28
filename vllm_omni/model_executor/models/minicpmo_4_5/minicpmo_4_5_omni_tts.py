@@ -294,6 +294,29 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return torch.cat([condition, audio_bos], dim=0)
         return torch.cat([condition, self._boundary_embeddings()], dim=0)
 
+    def _live_condition_embeddings(self, live: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One Live unit's Talker condition, as MiniCPMODuplex builds it
+        (``_convert_results_to_tts_input``): per spoken token its text
+        embedding plus its normalized projected thinker hidden state, then
+        ``audio_bos``. A unit with no conditioning tokens is ``audio_bos``
+        alone, and the Talker still continues the turn's audio."""
+        device = self.emb_text.weight.device
+        dtype = self.emb_text.weight.dtype
+        raw_ids, raw_hidden = live.get("token_ids"), live.get("hidden_states")
+        token_ids = torch.as_tensor([] if raw_ids is None else raw_ids, dtype=torch.long).reshape(-1)
+        hidden_states = torch.as_tensor([] if raw_hidden is None else raw_hidden, dtype=torch.float32)
+        audio_bos = self.emb_text(torch.tensor([self._tts_bos_id], device=device, dtype=torch.long))
+        if token_ids.numel() == 0:
+            return token_ids, hidden_states, audio_bos
+        if hidden_states.ndim != 2 or hidden_states.shape[0] != token_ids.shape[0]:
+            raise ValueError(
+                "MiniCPM-o Live Talker condition length mismatch: "
+                f"token_ids={tuple(token_ids.shape)} hidden_states={tuple(hidden_states.shape)}"
+            )
+        text_embeds = self.emb_text(token_ids.to(device=device))
+        hidden_embeds = F.normalize(self.projector_semantic(hidden_states.to(device=device, dtype=dtype)), p=2, dim=-1)
+        return token_ids, hidden_states, torch.cat([text_embeds + hidden_embeds, audio_bos], dim=0)
+
     def _build_streaming_recompute_embeddings(
         self,
         current_condition: torch.Tensor,
@@ -435,39 +458,50 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id = str(info_dict.get("request_id", "0"))
 
         if is_prefill or first_call:
-            token_ids, hidden_states = get_tts_handoff(info_dict)
-            # Cross-process stage transport serializes CPU tensors as lists.
-            # Normalize both local tensor handoffs and transported payloads
-            # before validating/building the Talker condition.
-            if isinstance(token_ids, (list, tuple)):
-                token_ids = torch.as_tensor(token_ids, dtype=torch.long)
-            if isinstance(hidden_states, (list, tuple)):
-                hidden_states = torch.as_tensor(hidden_states, dtype=torch.float32)
-            if not isinstance(token_ids, torch.Tensor) or not isinstance(hidden_states, torch.Tensor):
-                available = sorted(key for key in info_dict if not key.startswith("_"))
-                raise ValueError(
-                    "MiniCPM-o Talker requires tensor tts_token_ids and "
-                    "tts_hidden_states conditioning; "
-                    f"received token_ids={type(token_ids).__name__}, "
-                    f"hidden_states={type(hidden_states).__name__}, "
-                    f"available_keys={available}"
+            live = info_dict.get("minicpmo_live")
+            live_budget: tuple[int, int] | None = None
+            if isinstance(live, Mapping):
+                # /v1/live/sessions: one unit's condition and codec budget per
+                # handoff (stage_input_processors llm2tts).
+                token_ids, hidden_states, full_embeds = self._live_condition_embeddings(live)
+                live_budget = (int(live["codec_max"]), int(live["codec_min"]))
+                empty_condition = False
+                native_duplex = False
+                meta = info_dict.get("meta")
+            else:
+                token_ids, hidden_states = get_tts_handoff(info_dict)
+                # Cross-process stage transport serializes CPU tensors as lists.
+                # Normalize both local tensor handoffs and transported payloads
+                # before validating/building the Talker condition.
+                if isinstance(token_ids, (list, tuple)):
+                    token_ids = torch.as_tensor(token_ids, dtype=torch.long)
+                if isinstance(hidden_states, (list, tuple)):
+                    hidden_states = torch.as_tensor(hidden_states, dtype=torch.float32)
+                if not isinstance(token_ids, torch.Tensor) or not isinstance(hidden_states, torch.Tensor):
+                    available = sorted(key for key in info_dict if not key.startswith("_"))
+                    raise ValueError(
+                        "MiniCPM-o Talker requires tensor tts_token_ids and "
+                        "tts_hidden_states conditioning; "
+                        f"received token_ids={type(token_ids).__name__}, "
+                        f"hidden_states={type(hidden_states).__name__}, "
+                        f"available_keys={available}"
+                    )
+                # An empty condition means the thinker chose not to speak: finish the
+                # request up front so it emits zero audio codes instead of killing
+                # the stage engine.
+                empty_condition = token_ids.numel() == 0 or hidden_states.numel() == 0
+                if empty_condition:
+                    logger.warning_once(
+                        "MiniCPM-o Talker received an empty condition (request %s); this request produces no audio.",
+                        info_dict.get("request_id"),
+                    )
+                native_duplex = bool(info_dict.get("native_duplex", False))
+                meta = info_dict.get("meta")
+                full_embeds = self._build_condition_embeddings(
+                    token_ids,
+                    hidden_states,
+                    native_duplex=native_duplex,
                 )
-            # An empty condition means the thinker chose not to speak: finish the
-            # request up front so it emits zero audio codes instead of killing
-            # the stage engine.
-            empty_condition = token_ids.numel() == 0 or hidden_states.numel() == 0
-            if empty_condition:
-                logger.warning_once(
-                    "MiniCPM-o Talker received an empty condition (request %s); this request produces no audio.",
-                    info_dict.get("request_id"),
-                )
-            native_duplex = bool(info_dict.get("native_duplex", False))
-            meta = info_dict.get("meta")
-            full_embeds = self._build_condition_embeddings(
-                token_ids,
-                hidden_states,
-                native_duplex=native_duplex,
-            )
             if native_duplex:
                 full_embeds = self._build_streaming_recompute_embeddings(
                     full_embeds,
@@ -514,7 +548,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     f"tts_ids={token_ids.shape[0]} tts_hidden={hidden_states.shape[0]} "
                     f"prompt_len={info_dict.get('_omni_prompt_len')}"
                 )
-            if native_duplex:
+            if live_budget is not None:
+                max_tokens, min_tokens = live_budget
+            elif native_duplex:
                 max_tokens, min_tokens = _native_duplex_chunk_budget(meta if isinstance(meta, Mapping) else None)
             else:
                 # MiniCPMTTS.generate()'s max_new_token, clamped to what the

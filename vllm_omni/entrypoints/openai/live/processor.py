@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import importlib
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -90,6 +91,11 @@ class LiveSessionProcessor(ABC):
 
     def decode(self, token_ids: list[int]) -> str:
         return self.context.raw_tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    def sampling_params_list(self, base: Sequence[Any]) -> list[Any]:
+        """The session's per-stage sampling params (stage 0 is then adjusted
+        per append by ``stage0_sampling_params``)."""
+        return list(base)
 
     def stage0_sampling_params(self, state: LiveSessionState, base: Any) -> Any:
         """Per-append stage-0 sampling params (a clone of ``base``)."""

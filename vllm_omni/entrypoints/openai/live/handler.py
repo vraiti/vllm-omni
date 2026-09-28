@@ -373,7 +373,7 @@ class LiveSessionHandler:
         self.driver = ResumableRequestDriver(
             self.engine,
             state.id,
-            self.engine.default_sampling_params_list,
+            processor.sampling_params_list(self.engine.default_sampling_params_list),
             on_output=self._on_engine_output,
             on_error=self._on_engine_error,
         )
