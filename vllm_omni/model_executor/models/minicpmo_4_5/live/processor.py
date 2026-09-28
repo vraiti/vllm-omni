@@ -2,11 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 ``LiveSessionProcessor`` (native VAD).
 
-Renders the official duplex layout onto one resumable request::
+Renders the official duplex layout (``MiniCPMODuplex.prepare`` and
+``streaming_prefill``) onto one resumable request::
 
-    <|im_start|>system\\n{prompt}[\\n\\nprevious: {text}]<|im_end|>
+    <|im_start|>system\\n{prompt}\\n<|audio_start|>[reference voice audio]
+    [\\n\\nprevious: {text}]<|audio_end|><|im_end|>
     <unit>[audio x10]{model output up to a chunk terminator}</unit>
     <unit>[audio x10]...
+
+The reference voice is the checkpoint's ``assets/HT_ref_audio.wav``, the clip
+the model card's duplex example prepares with; every official duplex entry
+point puts one in the system prompt.
 
 Each ``audio_buffer_ms`` (1 s) window is one streaming update: the chunk
 terminator the scheduler dropped at the end of the previous segment,
@@ -17,10 +23,14 @@ terminator the scheduler dropped at the end of the previous segment,
 
 from __future__ import annotations
 
+import functools
+from pathlib import Path
 from typing import Any, ClassVar
 
 import numpy as np
+import soundfile
 
+from vllm_omni.entrypoints.openai.live.audio import resample
 from vllm_omni.entrypoints.openai.live.processor import NativeVadProcessor, RenderedPrompt
 from vllm_omni.entrypoints.openai.live.protocol import LiveProtocolError
 from vllm_omni.entrypoints.openai.live.session import (
@@ -34,8 +44,21 @@ from vllm_omni.entrypoints.openai.live.session import (
 _AUDIO_PLACEHOLDER = "(<audio>./</audio>)"
 _DEFAULT_SYSTEM_PROMPT = "Streaming Omni Conversation."
 _PREVIOUS_MARKER = "\n\nprevious: "
+_REFERENCE_AUDIO = "assets/HT_ref_audio.wav"
 # Pooled audio embeddings per 1 s unit (MiniCPMO45DuplexPolicy).
 _AUDIO_TOKENS_PER_UNIT = 10
+
+
+@functools.cache
+def _reference_audio(model_path: str, sample_rate: int) -> np.ndarray:
+    """The checkpoint's reference voice clip, mono at ``sample_rate``."""
+    model_dir = Path(model_path)
+    if not model_dir.is_dir():
+        from vllm_omni.transformers_utils.repo_utils import hf_api
+
+        model_dir = Path(hf_api().snapshot_download(model_path, allow_patterns=[_REFERENCE_AUDIO]))
+    samples, rate = soundfile.read(model_dir / _REFERENCE_AUDIO, dtype="float32", always_2d=True)
+    return resample(samples.mean(axis=1), rate, sample_rate)
 
 
 class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
@@ -46,7 +69,7 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
     temperature: ClassVar[float] = 0.7
     top_p: ClassVar[float] = 0.8
     top_k: ClassVar[int] = 100
-    # limit_mm_per_prompt audio; a resubmission keeps at most this many units.
+    # Units a resubmission keeps; plus the reference clip, within limit_mm_per_prompt audio (64).
     max_audio_units: ClassVar[int] = 60
 
     def __init__(self, context) -> None:
@@ -73,6 +96,9 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
         self.turn_ended = True
         # Text of units dropped by left-trimming, carried as "previous" context.
         self.previous_text = ""
+        self.reference_audio = _reference_audio(str(context.extra.get("model_path") or ""), self.input_sample_rate)
+        # Audio embeddings are pooled to about 10 per second (unit: 1 s -> 10).
+        self._reference_tokens = -(-self.reference_audio.size * _AUDIO_TOKENS_PER_UNIT // self.input_sample_rate)
 
     # ---- configuration -----------------------------------------------------------
 
@@ -123,10 +149,16 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
                 history.append(f"assistant: {item.text}")
         prompt = "\n\n".join(developer) or _DEFAULT_SYSTEM_PROMPT
         previous = " ".join(part for part in (*history, self.previous_text) if part)
-        if previous:
-            prompt += _PREVIOUS_MARKER + previous
-        text = f"<|im_start|>system\n{prompt}<|im_end|>"
-        return list(self.context.raw_tokenizer.encode(text, add_special_tokens=False))
+        # The reference audio sits between the markers; live_duplex_unit strips
+        # the chat format's own markers from every audio item, so write them.
+        encode = self.context.raw_tokenizer.encode
+        prefix = f"<|im_start|>system\n{prompt}\n<|audio_start|>"
+        suffix = (_PREVIOUS_MARKER + previous if previous else "") + "<|audio_end|><|im_end|>"
+        return [
+            *encode(prefix, add_special_tokens=False),
+            *self._placeholder_ids,
+            *encode(suffix, add_special_tokens=False),
+        ]
 
     def _prompt(self, token_ids: list[int], audio: list[np.ndarray]) -> dict[str, Any]:
         clips = [(clip, self.input_sample_rate) for clip in audio]
@@ -136,8 +168,11 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
             "mm_processor_kwargs": {"live_duplex_unit": True},
         }
 
-    def _num_tokens(self, token_ids: list[int], units: int) -> int:
-        return len(token_ids) + units * (_AUDIO_TOKENS_PER_UNIT - len(self._placeholder_ids))
+    def _num_tokens(self, token_ids: list[int], units: int, *, reference: bool = False) -> int:
+        tokens = len(token_ids) + units * (_AUDIO_TOKENS_PER_UNIT - len(self._placeholder_ids))
+        if reference:
+            tokens += self._reference_tokens - len(self._placeholder_ids)
+        return tokens
 
     def render_native_turn(
         self,
@@ -149,12 +184,14 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
     ) -> RenderedPrompt:
         if first:
             ids = [*self._system_ids(state), self.unit_id, *self._placeholder_ids]
+            audio = [self.reference_audio, unit.audio]
         else:
             # The previous segment's terminator was sampled but never
             # computed; feed it, close the unit, open the next one.
             head = [last_sampled_token] if last_sampled_token is not None else []
             ids = [*head, self.unit_end_id, self.unit_id, *self._placeholder_ids]
-        return RenderedPrompt(self._prompt(ids, [unit.audio]), self._num_tokens(ids, 1))
+            audio = [unit.audio]
+        return RenderedPrompt(self._prompt(ids, audio), self._num_tokens(ids, 1, reference=first))
 
     def render_native_resume(self, state: LiveSessionState) -> RenderedPrompt:
         units = [item for item in state.history if isinstance(item, NativeUnitItem)]
@@ -163,7 +200,8 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
             ids += [self.unit_id, *self._placeholder_ids]
             if index < len(units) - 1:
                 ids += [*unit.token_ids, self.unit_end_id]
-        return RenderedPrompt(self._prompt(ids, [u.audio for u in units]), self._num_tokens(ids, len(units)))
+        audio = [self.reference_audio, *(u.audio for u in units)]
+        return RenderedPrompt(self._prompt(ids, audio), self._num_tokens(ids, len(units), reference=True))
 
     def left_trim(self, state: LiveSessionState, keep_units: int) -> bool:
         keep_units = min(keep_units, self.max_audio_units)
