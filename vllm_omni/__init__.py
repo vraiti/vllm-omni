@@ -73,20 +73,22 @@ def _install_call_trace() -> None:
     """Debug call tracing, enabled by RUN_REMOTE_CALL_TRACE=1.
 
     Every call of a named vllm_omni function (qualified name without '<' or
-    '>') appends "(pid, thread, coro, depth) <module>.<qualname>" to
+    '>') appends "(pid, thread, coro, depth, time) <module>.<qualname>" to
     /tmp/logs/call-trace/call-trace_<pid>_<thread>_<coro>.log, created
     (overwriting) on first use. thread is the OS thread id; coro numbers the
     outermost coroutine on the stack (for asyncio, the task) per process, 0
     meaning no coroutine; depth is the number of Python frames on the
-    thread's stack, the called function included. Generator/coroutine frames
-    are logged on their first start only. Installed on every thread; each
-    process that imports vllm_omni traces itself.
+    thread's stack, the called function included; time is the wall clock
+    (Unix seconds) at the call. Generator/coroutine frames are logged on
+    their first start only. Installed on every thread; each process that
+    imports vllm_omni traces itself.
     """
     import dis
     import inspect
     import os
     import sys
     import threading
+    import time
     import weakref
 
     directory = "/tmp/logs/call-trace"
@@ -178,7 +180,7 @@ def _install_call_trace() -> None:
             file = files[(coro, thread)] = open(path, "w", buffering=1)
             root_name = getattr(root, "__qualname__", "?") if root is not None else "(no coroutine)"
             file.write(f"# pid={pid} thread={thread} coro={coro} root={root_name}\n")
-        file.write(f"({pid}, {thread}, {coro}, {depth}) {name}\n")
+        file.write(f"({pid}, {thread}, {coro}, {depth}, {time.time():.6f}) {name}\n")
 
     def trace(frame, event, arg):
         if event == "call":
