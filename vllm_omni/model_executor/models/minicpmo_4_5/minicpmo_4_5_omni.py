@@ -541,6 +541,32 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
                 )
 
+            # DEBUG(live-sessions): record the thinker's inputs per step, for
+            # comparing /v1/live/sessions with /v1/realtime duplex. Temporary.
+            try:
+                import json as _dbg_json
+                import os as _dbg_os
+
+                if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                    raise StopIteration  # no host syncs inside a CUDA graph capture
+                _dbg_record = {"pid": _dbg_os.getpid()}
+                if thinker_input_ids is not None:
+                    _dbg_record["input_ids"] = thinker_input_ids.reshape(-1).tolist()
+                if thinker_positions is not None:
+                    _dbg_pos = thinker_positions.reshape(-1) if thinker_positions.ndim == 1 else thinker_positions[0]
+                    _dbg_record["positions"] = [int(_dbg_pos[0]), int(_dbg_pos[-1])] if _dbg_pos.numel() else []
+                if thinker_inputs_embeds is not None:
+                    _dbg_emb = thinker_inputs_embeds.reshape(-1, thinker_inputs_embeds.shape[-1]).float()
+                    _dbg_record["embeds_norm"] = [round(v, 3) for v in _dbg_emb.norm(dim=-1).tolist()]
+                    _dbg_record["embeds_mean"] = [round(v, 5) for v in _dbg_emb.mean(dim=-1).tolist()]
+                _dbg_os.makedirs("/tmp/logs", exist_ok=True)
+                with open(f"/tmp/logs/thinker-input-debug_{_dbg_os.getpid()}.jsonl", "a") as _dbg_file:
+                    _dbg_file.write(_dbg_json.dumps(_dbg_record) + "\n")
+            except StopIteration:
+                pass
+            except Exception as _dbg_exc:  # never let debugging break the model
+                logger.warning("thinker input debug record failed: %r", _dbg_exc)
+
             # Run thinker
             thinker_output = self.thinker(
                 input_ids=thinker_input_ids,
