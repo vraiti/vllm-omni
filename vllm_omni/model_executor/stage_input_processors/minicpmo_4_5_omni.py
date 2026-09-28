@@ -784,6 +784,48 @@ def llm2tts(
         # buffer overflows.
         llm_output_ids = list(llm_output_ids)
         thinker_text = getattr(output, "text", "") or ""
+        # DEBUG(live-sessions): record what llm2tts receives per call. Temporary.
+        try:
+            import json as _dbg_json
+            import os as _dbg_os
+
+            def _dbg_len(value):
+                try:
+                    return len(value)
+                except TypeError:
+                    return None
+
+            def _dbg_shape(value):
+                shape = getattr(value, "shape", None)
+                return list(shape) if shape is not None else None
+
+            _dbg_raw = getattr(output, "token_ids", None)
+            _dbg_cum = getattr(output, "cumulative_token_ids", None)
+            _dbg_prompt = getattr(llm_output, "prompt_token_ids", None)
+            _dbg_latent = mm_output.get("latent") if isinstance(mm_output, Mapping) else None
+            _dbg_record = {
+                "pid": _dbg_os.getpid(),
+                "request_id": str(getattr(llm_output, "request_id", None)),
+                "streaming_enabled": getattr(_streaming_context, "enabled", None),
+                "llm_output_finished": getattr(llm_output, "finished", None),
+                "output_finish_reason": getattr(output, "finish_reason", None),
+                "prompt_len": _dbg_len(_dbg_prompt),
+                "token_ids_len": _dbg_len(_dbg_raw),
+                "cumulative_len": _dbg_len(_dbg_cum),
+                "token_ids_head": list(_dbg_raw)[:8] if _dbg_raw is not None else None,
+                "token_ids_tail": list(_dbg_raw)[-8:] if _dbg_raw is not None else None,
+                "cumulative_tail": list(_dbg_cum)[-8:] if _dbg_cum is not None else None,
+                "prompt_tail": list(_dbg_prompt)[-8:] if _dbg_prompt is not None else None,
+                "latent_shape": _dbg_shape(_dbg_latent),
+                "output_hidden_shape": _dbg_shape(getattr(output, "hidden_states", None)),
+                "mm_output_keys": sorted(str(k) for k in mm_output) if isinstance(mm_output, Mapping) else None,
+                "text": thinker_text[:200],
+            }
+            _dbg_os.makedirs("/tmp/logs", exist_ok=True)
+            with open("/tmp/logs/llm2tts-debug.jsonl", "a") as _dbg_file:
+                _dbg_file.write(_dbg_json.dumps(_dbg_record, default=str) + "\n")
+        except Exception as _dbg_exc:  # never let debugging break the bridge
+            logger.warning("llm2tts debug record failed: %r", _dbg_exc)
         native_turn_start = False
         if _has_native_duplex_prompt_metadata(mm_output):
             # The thinker's resumable duplex request reports cumulative
