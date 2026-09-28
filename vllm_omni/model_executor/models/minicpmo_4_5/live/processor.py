@@ -179,15 +179,15 @@ class MiniCPMO45LiveSessionProcessor(NativeVadProcessor):
         }
         if first:
             # The orchestrator hands the request's first prompt to llm2tts on
-            # every stage-0 output: it marks the request as Live and carries
-            # the unit grammar's token ids.
-            prompt["model_intermediate_buffer"] = {
-                "minicpmo_live": {
-                    "listen": self.listen_id,
-                    "chunk_eos": self.chunk_eos_id,
-                    "chunk_tts_eos": self.chunk_tts_eos_id,
-                    "turn_eos": self.turn_eos_id,
-                }
+            # every stage-0 output: this marks the request as Live and carries
+            # the unit grammar's token ids. A top-level key, not a
+            # model_intermediate_buffer entry, so no engine receives it (the
+            # async-chunk prewarm copies the first prompt's buffer downstream).
+            prompt["minicpmo_live"] = {
+                "listen": self.listen_id,
+                "chunk_eos": self.chunk_eos_id,
+                "chunk_tts_eos": self.chunk_tts_eos_id,
+                "turn_eos": self.turn_eos_id,
             }
         return prompt
 

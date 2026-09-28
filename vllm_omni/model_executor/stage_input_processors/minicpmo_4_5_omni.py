@@ -730,12 +730,8 @@ MINICPMO45_LIVE_CODEC_TOKENS_PER_UNIT = 26
 
 def _minicpmo45_live_marker(prompt_item) -> Mapping | None:
     """The /v1/live/sessions marker the Live processor puts on a request's
-    first prompt (``model_intermediate_buffer["minicpmo_live"]``)."""
-    if isinstance(prompt_item, Mapping):
-        buffer = prompt_item.get("model_intermediate_buffer")
-    else:
-        buffer = getattr(prompt_item, "model_intermediate_buffer", None)
-    marker = buffer.get("minicpmo_live") if isinstance(buffer, Mapping) else None
+    first prompt (top-level ``"minicpmo_live"``, never sent to an engine)."""
+    marker = prompt_item.get("minicpmo_live") if isinstance(prompt_item, Mapping) else None
     return marker if isinstance(marker, Mapping) else None
 
 
