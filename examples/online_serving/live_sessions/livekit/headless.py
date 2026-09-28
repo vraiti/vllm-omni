@@ -330,7 +330,10 @@ async def run(args: argparse.Namespace) -> int:
         voice=args.voice,
         responses_options={"model": args.model},
     )
-    session = AgentSession(llm=model)
+    # No AEC warmup: there is no echo to cancel, and while it runs (3 s after the
+    # agent starts speaking) LiveKit sends the model silence instead of the user,
+    # which would swallow the start of a barge-in.
+    session = AgentSession(llm=model, aec_warmup_duration=None)
     audio_in = ScriptedAudioInput(clock)
     audio_out = CaptureAudioOutput(clock)
     session.input.audio = audio_in
