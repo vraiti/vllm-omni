@@ -23,6 +23,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import psutil
 import yaml
+from filelock import FileLock, Timeout
 from vllm import TextPrompt
 from vllm.logger import init_logger
 
@@ -36,6 +37,8 @@ from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+SERVER_STARTUP_TIMEOUT_S = 1200
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -73,20 +76,6 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     raise RuntimeError(
         f"Could not obtain a free TCP port on {host!r} after {max_attempts} attempts (last error: {last_exc!r})"
     ) from last_exc
-
-
-def get_distributed_init_method(prefix: str = "torch_dist_init_") -> str:
-    """Return a ``file://`` init_method for a ``torch.distributed`` process group.
-
-    Args:
-        prefix: Prefix for the temporary rendezvous filename. Defaults to
-            ``torch_dist_init_``.
-
-    Returns:
-        An init_method string for ``torch.distributed.init_process_group``.
-    """
-    with tempfile.NamedTemporaryFile(prefix=prefix) as f:
-        return f"file://{f.name}"
 
 
 def dummy_messages_from_mix_data(
@@ -147,11 +136,7 @@ class OmniServerParams(NamedTuple):
     use_stage_cli: bool = False
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
-    # use_stage_cli only: launch each stage process only after the previous one
-    # has finished loading/profiling/warmup, instead of firing them ~2s apart.
-    # Opt in when a config colocates multiple stages on one GPU -- see
-    # OmniServerStageCli._wait_for_stage_engine_ready.
-    sequential_stage_launch: bool = False
+    startup_timeout: int = SERVER_STARTUP_TIMEOUT_S
 
 
 class OmniServer:
@@ -165,19 +150,65 @@ class OmniServer:
         port: int | None = None,
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
+        startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
     ) -> None:
         cleanup_test_environment()
+        self.startup_timeout = startup_timeout
         self.model = model
-        args = list(serve_args)
-        self.serve_args = args
-        self.log_stats = "--disable-log-stats" not in args and "--log-stats" in args
+        self.serve_args = list(serve_args)
+        self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
+        self._auto_port = port is None
+        self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
 
+    def _reserve_port(self) -> None:
+        # bind(0)/close does not reserve a port across concurrent pytest workers.
+        # Keep an advisory lock until teardown, including the long import phase
+        # before the subprocess binds its HTTP socket. Never unlink lock files:
+        # another worker may already have the same inode open.
+        for attempt in range(128):
+            if attempt:
+                self.port = get_open_port(self.host)
+            lock_path = Path(tempfile.gettempdir()) / f"vllm-omni-test-port-{os.getuid()}-{self.port}.lock"
+            lock = FileLock(lock_path)
+            try:
+                lock.acquire(timeout=0)
+            except Timeout as error:
+                if not self._auto_port:
+                    raise RuntimeError(f"HTTP test port {self.port} is already reserved") from error
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind((self.host, self.port))
+            except OSError as error:
+                lock.release()
+                if not self._auto_port or error.errno != errno.EADDRINUSE:
+                    raise
+                continue
+            self._port_lock = lock
+            return
+        raise RuntimeError("Could not reserve an HTTP test port after 128 attempts")
+
+    def _owns_listening_port(self) -> bool:
+        assert self.proc is not None
+        try:
+            parent = psutil.Process(self.proc.pid)
+            processes = [parent, *parent.children(recursive=True)]
+            return any(
+                conn.status == psutil.CONN_LISTEN and conn.laddr.port == self.port
+                for process in processes
+                for conn in process.net_connections(kind="tcp")
+            )
+        except psutil.NoSuchProcess:
+            # A child can exit between enumeration and inspecting its sockets.
+            return False
+
     def _start_server(self) -> None:
+        self._reserve_port()
         env = os.environ.copy()
         if self.env_dict is not None:
             env.update(self.env_dict)
@@ -205,15 +236,19 @@ class OmniServer:
             cwd=_omni_subprocess_cwd(),
         )
 
-        max_wait = 1200
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
+        max_wait = self.startup_timeout
+        # System clock corrections must not shorten or extend startup waits.
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < max_wait:
             ret = self.proc.poll()
             if ret is not None:
                 raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
-                if sock.connect_ex((self.host, self.port)) == 0:
+                if sock.connect_ex((self.host, self.port)) == 0 and self._owns_listening_port():
+                    ret = self.proc.poll()
+                    if ret is not None:
+                        raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
                     startup_s = time.perf_counter() - startup_t0
                     if self.log_stats:
                         print(
@@ -373,19 +408,18 @@ class OmniServer:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.proc:
-            self._kill_process_tree(self.proc.pid)
-        cleanup_test_environment()
+        try:
+            if self.proc:
+                self._kill_process_tree(self.proc.pid)
+        finally:
+            if self._port_lock is not None:
+                self._port_lock.release()
+                self._port_lock = None
+            cleanup_test_environment()
 
 
 class OmniServerStageCli(OmniServer):
     """Omni server harness that exercises the stage CLI flow."""
-
-    # Logged once by vllm.v1.engine.core.EngineCore._initialize_kv_caches after
-    # weight loading, GPU memory profiling, KV cache allocation, and warmup/graph
-    # capture all complete -- i.e. once the stage's GPU memory footprint is fully
-    # committed. Used by ``_wait_for_stage_engine_ready`` below.
-    _STAGE_READY_LOG_MARKER = "init engine (profile, create kv cache, warmup model) took"
 
     def __init__(
         self,
@@ -396,11 +430,12 @@ class OmniServerStageCli(OmniServer):
         stage_ids: list[int] | None = None,
         port: int | None = None,
         env_dict: dict[str, str] | None = None,
-        sequential_stage_launch: bool = False,
+        startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
     ) -> None:
-        super().__init__(model, serve_args or [], port=port, env_dict=env_dict, use_omni=True)
+        super().__init__(
+            model, serve_args or [], port=port, env_dict=env_dict, use_omni=True, startup_timeout=startup_timeout
+        )
         self.stage_config_path = stage_config_path
-        self.sequential_stage_launch = sequential_stage_launch
         self.master_port = get_open_port()
         resolved_cfg = resolve_deploy_yaml(stage_config_path)
         # Dump the resolved deploy config so CI logs show each stage's
@@ -497,62 +532,22 @@ class OmniServerStageCli(OmniServer):
                     f"Stage {stage_id} replica {replica_id} exited with code {ret} before API server became ready.{tail}"
                 )
 
-    def _wait_for_stage_engine_ready(self, stage_id: int, replica_id: int, timeout_s: int = 600) -> None:
-        """Block until stage (stage_id, replica_id) finishes loading/profiling/warmup.
-
-        Unlike the in-process ``StageRuntime`` path (``vllm serve --omni --deploy``),
-        which holds a per-device file lock across each stage's init so stages
-        sharing a GPU profile memory one at a time (see
-        ``vllm_omni.engine.stage_init_utils.acquire_device_locks``), the stage-CLI
-        flow launches every stage as an independent OS process with no such
-        cross-process serialization. Two stages colocated on the same device can
-        then race to profile GPU memory against each other and overcommit it. This
-        waits for the previous stage's memory footprint to be fully committed
-        (weights loaded, profiled, KV cache allocated, warmup/graph capture done)
-        before the next one starts, by polling its log for the marker vLLM logs
-        once at the end of that sequence.
-        """
-        stage_key = (stage_id, replica_id)
-        log_path = self._stage_log_paths[stage_key]
-        proc = self.stage_procs[stage_key]
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            ret = proc.poll()
-            if ret is not None:
-                raise RuntimeError(
-                    f"Stage {stage_id} replica {replica_id} exited with code {ret} "
-                    f"before finishing engine init (see {log_path})"
-                )
-            if log_path.exists():
-                with open(log_path, encoding="utf-8", errors="replace") as f:
-                    if self._STAGE_READY_LOG_MARKER in f.read():
-                        return
-            time.sleep(1)
-        raise RuntimeError(
-            f"Timed out after {timeout_s}s waiting for stage {stage_id} replica {replica_id} "
-            f"to finish engine init (see {log_path})"
-        )
-
     def _start_server(self) -> None:
         startup_t0 = time.perf_counter()
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
 
         self._launch_stage(0, headless=False, replica_id=0)
-        if self.sequential_stage_launch:
-            self._wait_for_stage_engine_ready(0, 0)
-        else:
-            time.sleep(2)
+        time.sleep(2)
         self._ensure_stage_processes_alive()
 
         for stage_id in ordered_stage_ids[1:]:
             for replica_id in range(self.stage_replica_counts.get(stage_id, 1)):
                 self._launch_stage(stage_id, headless=True, replica_id=replica_id)
-                if self.sequential_stage_launch:
-                    self._wait_for_stage_engine_ready(stage_id, replica_id)
 
-        max_wait = 1200
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
+        max_wait = self.startup_timeout
+        # System clock corrections must not shorten or extend startup waits.
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < max_wait:
             self._ensure_stage_processes_alive()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
@@ -1029,7 +1024,7 @@ def iter_omni_server(
                 server_args,
                 port=port,
                 env_dict=params.env_dict,
-                sequential_stage_launch=params.sequential_stage_launch,
+                startup_timeout=params.startup_timeout,
             ) as server:
                 if model != original_model:
                     server.model = original_model
@@ -1047,6 +1042,7 @@ def iter_omni_server(
                     port=port,
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
+                    startup_timeout=params.startup_timeout,
                 )
                 if port
                 else OmniServer(
@@ -1054,6 +1050,7 @@ def iter_omni_server(
                     server_args,
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
+                    startup_timeout=params.startup_timeout,
                 )
             ) as server:
                 if model != original_model:
@@ -1167,6 +1164,7 @@ def pi0_openpi_run_policy_session(
     prompt: str = PI0_OPENPI_DEFAULT_PROMPT,
     session_id: str | None = None,
     num_steps: int = 2,
+    num_inference_steps: int | None = None,
 ) -> dict[str, Any]:
     """Connect, read handshake metadata, send ``num_steps`` observations."""
     import uuid
@@ -1185,6 +1183,8 @@ def pi0_openpi_run_policy_session(
         actions = []
         for _ in range(num_steps):
             payload = pi0_make_dummy_obs(prompt=prompt, session_id=session_id)
+            if num_inference_steps is not None:
+                payload["sampling_params"] = {"num_inference_steps": num_inference_steps}
             payload["endpoint"] = "infer"
             conn.send(packer.pack(payload))
             actions.append(_pi0_decode_action_response(conn.recv()))

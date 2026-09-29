@@ -11,6 +11,7 @@ from fastapi import WebSocket
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
+from vllm_omni.entrypoints.duplex.warmup import DUPLEX_WARMUP_CLIENT_WAIT_S
 from vllm_omni.entrypoints.openai.realtime.connection import OpenAIFullDuplexConnection
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 
@@ -64,30 +65,10 @@ async def dispatch_generic_realtime_websocket(websocket: WebSocket) -> None:
 
 
 async def dispatch_realtime_websocket(websocket: WebSocket) -> None:
-    """Handle an OpenAI-compatible Realtime API session."""
-    # Hold real clients until the startup duplex warmup finishes (the warmup
-    # connection marks itself with vllm_omni_warmup=1 and passes through).
-    warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
-    if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
-        try:
-            await asyncio.wait_for(warmup_done.wait(), timeout=120)
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("Duplex warmup still running after 120 s; admitting the client anyway.")
-
+    """Handle Realtime sessions not already routed to the proprietary duplex
+    handler by the caller: Qwen3-Omni gets a conformant full-duplex connection,
+    everything else falls back to the generic turn-based Realtime API."""
     state = websocket.app.state
-    duplex_query = websocket.query_params.get("duplex")
-    serving_duplex = getattr(state, "openai_serving_duplex", None)
-    use_experimental_duplex = serving_duplex is not None and (
-        duplex_query is None or (isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"})
-    )
-    if use_experimental_duplex:
-        await serving_duplex.handle_realtime_session(websocket)
-        return
-
-    if isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}:
-        await reject_realtime_websocket(websocket, "The Realtime API is not available for this model")
-        return
-
     if not supports_qwen3_omni_realtime(getattr(state, "stage_configs", None)):
         await dispatch_generic_realtime_websocket(websocket)
         return
@@ -99,6 +80,18 @@ async def dispatch_realtime_websocket(websocket: WebSocket) -> None:
     if requested_model and requested_model != model_name:
         await reject_realtime_websocket(websocket, f"Model '{requested_model}' is not available")
         return
+
+    # Hold real clients until the startup duplex warmup finishes (the warmup
+    # connection marks itself with vllm_omni_warmup=1 and passes through).
+    warmup_done = getattr(state, "duplex_warmup_done", None)
+    if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
+        try:
+            await asyncio.wait_for(warmup_done.wait(), timeout=DUPLEX_WARMUP_CLIENT_WAIT_S)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning(
+                "Duplex warmup still running after %d s; admitting the client anyway.",
+                DUPLEX_WARMUP_CLIENT_WAIT_S,
+            )
 
     tokenizer = await state.engine_client.get_tokenizer()
     connection = OpenAIFullDuplexConnection(
